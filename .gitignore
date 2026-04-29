@@ -1,0 +1,9 @@
+/target/
+/.DS_Store
+*.log
+*.tmp
+
+# Local Codex auth state is intentionally never stored in this repository.
+auth.json
+accounts/
+env.conf

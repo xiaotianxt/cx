@@ -338,7 +338,7 @@ class Cx < Formula
 end
 FORMULA
 
-  if git -C "$TAP_DIR" diff --quiet -- Formula/cx.rb; then
+  if [[ -z "$(git -C "$TAP_DIR" status --porcelain -- Formula/cx.rb)" ]]; then
     log "tap already points to ${VERSION}"
   else
     git -C "$TAP_DIR" diff --check -- Formula/cx.rb

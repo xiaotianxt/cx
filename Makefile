@@ -1,4 +1,4 @@
-.PHONY: build check fmt install-local install clean
+.PHONY: build check fmt test install-local install release clean
 
 build:
 	cargo build --release
@@ -9,6 +9,9 @@ check:
 fmt:
 	cargo fmt --all
 
+test:
+	cargo test
+
 install-local: build
 	mkdir -p ~/.local/bin
 	cp target/release/cx ~/.local/bin/
@@ -17,6 +20,9 @@ install-local: build
 install: build
 	sudo cp target/release/cx /usr/local/bin/
 	@echo "已安装: /usr/local/bin/cx"
+
+release:
+	scripts/release.sh
 
 clean:
 	cargo clean

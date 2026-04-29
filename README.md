@@ -50,6 +50,20 @@ ChatGPT-Account-ID: <account_id>
 
 ## 安装
 
+### Homebrew
+
+```bash
+brew install xiaotianxt/tap/cx
+```
+
+安装开发版：
+
+```bash
+brew install --HEAD xiaotianxt/tap/cx
+```
+
+### 源码安装
+
 需要 Rust 工具链。
 
 ```bash
@@ -155,3 +169,14 @@ cargo test
 
 项目刻意保持小依赖面：CLI 用 `clap`，HTTP 用 `reqwest` blocking client，配置解析用 `toml`，
 JSON 用 `serde_json`。并发使用标准库线程，不引入异步 runtime。
+
+## 发版
+
+维护者发版：
+
+```bash
+scripts/release.sh
+```
+
+脚本会运行测试、推送 tag、等待 GitHub Actions 产出 `darwin-arm64` release asset、更新
+`xiaotianxt/homebrew-tap` 里的 `Formula/cx.rb`，并用 Homebrew 做一次安装验证。

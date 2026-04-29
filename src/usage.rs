@@ -1,5 +1,7 @@
 use std::cmp::Ordering;
 use std::time::Duration;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
 use anyhow::Result;
 use reqwest::blocking::Client;
@@ -27,12 +29,16 @@ pub struct SlotResult {
     pub status: SlotStatus,
     pub score: f64,
     pub summary: String,
-    #[serde(rename = "primaryUsedPercent")]
-    pub primary_used_percent: Option<f64>,
-    #[serde(rename = "secondaryUsedPercent")]
-    pub secondary_used_percent: Option<f64>,
+    #[serde(rename = "fiveHourUsedPercent")]
+    pub five_hour_used_percent: Option<f64>,
+    #[serde(rename = "weeklyUsedPercent")]
+    pub weekly_used_percent: Option<f64>,
     #[serde(rename = "resetAt")]
     pub reset_at: Option<i64>,
+    #[serde(rename = "fiveHourRefreshAt")]
+    pub five_hour_refresh_at: Option<i64>,
+    #[serde(rename = "weeklyRefreshAt")]
+    pub weekly_refresh_at: Option<i64>,
     #[serde(rename = "planType")]
     pub plan_type: Option<String>,
     #[serde(rename = "rateLimitReachedType")]
@@ -194,9 +200,11 @@ impl SlotResult {
             status,
             score,
             summary: summary.into(),
-            primary_used_percent: None,
-            secondary_used_percent: None,
+            five_hour_used_percent: None,
+            weekly_used_percent: None,
             reset_at: None,
+            five_hour_refresh_at: None,
+            weekly_refresh_at: None,
             plan_type: None,
             rate_limit_reached_type: None,
         }
@@ -273,11 +281,13 @@ fn usage_url(base_url: &str) -> String {
 
 fn result_from_payload(slot: &str, index: usize, payload: &Value) -> SlotResult {
     let rate_limit = payload.get("rate_limit").unwrap_or(&Value::Null);
-    let primary = rate_limit.get("primary_window").unwrap_or(&Value::Null);
-    let secondary = rate_limit.get("secondary_window").unwrap_or(&Value::Null);
-    let primary_used = used_percent(primary);
-    let secondary_used = used_percent(secondary);
-    let score = [primary_used, secondary_used]
+    let five_hour_window = rate_limit.get("primary_window").unwrap_or(&Value::Null);
+    let weekly_window = rate_limit.get("secondary_window").unwrap_or(&Value::Null);
+    let five_hour_used = used_percent(five_hour_window);
+    let weekly_used = used_percent(weekly_window);
+    let five_hour_reset_at = reset_at(five_hour_window);
+    let weekly_reset_at = reset_at(weekly_window);
+    let score = [five_hour_used, weekly_used]
         .into_iter()
         .flatten()
         .map(|used| 100.0 - used)
@@ -290,7 +300,7 @@ fn result_from_payload(slot: &str, index: usize, payload: &Value) -> SlotResult 
         .get("limit_reached")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let reset_at = reset_at(primary).or_else(|| reset_at(secondary));
+    let reset_at = five_hour_reset_at.or(weekly_reset_at);
     let plan_type = payload
         .get("plan_type")
         .and_then(Value::as_str)
@@ -303,7 +313,13 @@ fn result_from_payload(slot: &str, index: usize, payload: &Value) -> SlotResult 
             index,
             SlotStatus::Available,
             score,
-            summarize_window(primary_used, secondary_used, score),
+            summarize_window(
+                five_hour_used,
+                weekly_used,
+                five_hour_reset_at,
+                weekly_reset_at,
+                score,
+            ),
         )
     } else {
         let reason = reached_type
@@ -317,13 +333,21 @@ fn result_from_payload(slot: &str, index: usize, payload: &Value) -> SlotResult 
             score,
             format!(
                 "{reason}; {}",
-                summarize_window(primary_used, secondary_used, score)
+                summarize_window(
+                    five_hour_used,
+                    weekly_used,
+                    five_hour_reset_at,
+                    weekly_reset_at,
+                    score
+                )
             ),
         )
     };
-    result.primary_used_percent = primary_used;
-    result.secondary_used_percent = secondary_used;
+    result.five_hour_used_percent = five_hour_used;
+    result.weekly_used_percent = weekly_used;
     result.reset_at = reset_at;
+    result.five_hour_refresh_at = five_hour_reset_at;
+    result.weekly_refresh_at = weekly_reset_at;
     result.plan_type = plan_type;
     result.rate_limit_reached_type = reached_type;
     result
@@ -348,15 +372,60 @@ fn rate_limit_reached_type(payload: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-fn summarize_window(primary: Option<f64>, secondary: Option<f64>, score: f64) -> String {
+fn summarize_window(
+    five_hour: Option<f64>,
+    weekly: Option<f64>,
+    five_hour_reset_at: Option<i64>,
+    weekly_reset_at: Option<i64>,
+    score: f64,
+) -> String {
     let mut parts = vec![format!("remaining {score:.1}%")];
-    if let Some(primary) = primary {
-        parts.push(format!("primary used {primary:.1}%"));
+    if let Some(five_hour) = five_hour {
+        parts.push(window_summary("5h", five_hour, five_hour_reset_at));
     }
-    if let Some(secondary) = secondary {
-        parts.push(format!("secondary used {secondary:.1}%"));
+    if let Some(weekly) = weekly {
+        parts.push(window_summary("weekly", weekly, weekly_reset_at));
     }
     parts.join(", ")
+}
+
+fn window_summary(label: &str, used_percent: f64, refresh_at: Option<i64>) -> String {
+    let mut summary = format!("{label} used {used_percent:.1}%");
+    if let Some(refresh_at) = refresh_at.and_then(format_refresh_in) {
+        summary.push_str(&format!(" (refresh {refresh_at})"));
+    }
+    summary
+}
+
+pub(crate) fn format_refresh_in(refresh_at: i64) -> Option<String> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
+    let seconds = refresh_at.saturating_sub(now);
+    if seconds <= 0 {
+        return Some("now".to_string());
+    }
+
+    let minutes = (seconds + 59) / 60;
+    if minutes < 60 {
+        return Some(format!("in {minutes}m"));
+    }
+
+    let hours = minutes / 60;
+    let remaining_minutes = minutes % 60;
+    if hours < 24 {
+        if remaining_minutes == 0 {
+            Some(format!("in {hours}h"))
+        } else {
+            Some(format!("in {hours}h {remaining_minutes}m"))
+        }
+    } else {
+        let days = hours / 24;
+        let remaining_hours = hours % 24;
+        if remaining_hours == 0 {
+            Some(format!("in {days}d"))
+        } else {
+            Some(format!("in {days}d {remaining_hours}h"))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -372,8 +441,8 @@ mod tests {
             "rate_limit": {
                 "allowed": true,
                 "limit_reached": false,
-                "primary_window": { "used_percent": 2.0 },
-                "secondary_window": { "used_percent": 21.0 }
+                "primary_window": { "used_percent": 2.0, "reset_at": 1 },
+                "secondary_window": { "used_percent": 21.0, "reset_at": 2 }
             }
         });
 
@@ -381,6 +450,19 @@ mod tests {
 
         assert_eq!(result.status, SlotStatus::Available);
         assert_eq!(result.score, 79.0);
+        assert_eq!(
+            result.summary,
+            "remaining 79.0%, 5h used 2.0% (refresh now), weekly used 21.0% (refresh now)"
+        );
+        assert_eq!(result.reset_at, Some(1));
+        assert_eq!(result.five_hour_refresh_at, Some(1));
+        assert_eq!(result.weekly_refresh_at, Some(2));
+
+        let json = serde_json::to_value(&result).expect("serialize result");
+        assert_eq!(json.get("fiveHourUsedPercent"), Some(&json!(2.0)));
+        assert_eq!(json.get("weeklyUsedPercent"), Some(&json!(21.0)));
+        assert!(json.get("primaryUsedPercent").is_none());
+        assert!(json.get("secondaryUsedPercent").is_none());
     }
 
     #[test]

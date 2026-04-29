@@ -43,12 +43,16 @@ ChatGPT-Account-ID: <account_id>
 
 1. 并发查询 `rotation.txt` 里的所有 slot。
 2. `allowed=false` 或 `limit_reached=true` 的 slot 视为耗尽并跳过。
-3. 使用 `min(100-primary_used_percent, 100-secondary_used_percent)` 作为 score。
+3. 使用 `min(5h 剩余额度, weekly 剩余额度)` 作为 score。
 4. 选择 score 最高的 slot；分数相同则保持 `rotation.txt` 顺序。
 5. 如果所有在线检查都是临时网络错误，则回退到第一个临时失败的 slot，避免网络抖动直接阻塞工作。
 
 `credits.has_credits=false` 不会被当成耗尽。这个字段只表示没有额外 credit，真正能不能用以
 `rate_limit.allowed` 和 `rate_limit.limit_reached` 为准。
+
+`cx status` 里的 `5h` 列来自 `rate_limit.primary_window`，`weekly` 列来自
+`rate_limit.secondary_window`。如果接口返回 reset 时间，summary 会显示下一次 refresh
+还要多久。
 
 ## 安装
 

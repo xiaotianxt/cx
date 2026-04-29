@@ -2,7 +2,10 @@ use anyhow::Result;
 use serde::Serialize;
 
 use crate::paths::ManagerPaths;
+use crate::usage::format_refresh_in;
 use crate::usage::SlotResult;
+
+const BAR_WIDTH: usize = 20;
 
 #[derive(Debug, Serialize)]
 struct Report<'a> {
@@ -19,26 +22,38 @@ pub fn print_report(results: &[SlotResult], selected: Option<&str>, json: bool) 
         return Ok(());
     }
 
-    println!(
-        "{:<2} {:<16} {:<18} {:>7} {:>9} {:>9}  {}",
-        "", "slot", "status", "score", "primary", "secondary", "summary"
-    );
+    if let Some(selected) = selected {
+        println!("selected: {selected}");
+        println!();
+    }
+
     for result in results {
         let mark = if selected == Some(result.slot.as_str()) {
             "*"
         } else {
             "-"
         };
+
         println!(
-            "{:<2} {:<16} {:<18} {:>6.1}% {:>8} {:>9}  {}",
-            mark,
-            result.slot,
+            "{mark} {:<18} {:<18} score {:>5.1}%",
+            truncate(&result.slot, 18),
             result.status.as_str(),
-            result.score,
-            percent(result.primary_used_percent),
-            percent(result.secondary_used_percent),
-            result.summary
+            result.score
         );
+        print_window(
+            "5h",
+            result.five_hour_used_percent,
+            result.five_hour_refresh_at,
+        );
+        print_window(
+            "weekly",
+            result.weekly_used_percent,
+            result.weekly_refresh_at,
+        );
+        if result.five_hour_used_percent.is_none() && result.weekly_used_percent.is_none() {
+            println!("  note    {}", result.summary);
+        }
+        println!();
     }
     Ok(())
 }
@@ -80,8 +95,45 @@ pub fn print_doctor(paths: &ManagerPaths, slots: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn percent(value: Option<f64>) -> String {
-    value
-        .map(|value| format!("{value:.1}%"))
-        .unwrap_or_else(|| "-".to_string())
+fn print_window(label: &str, used_percent: Option<f64>, refresh_at: Option<i64>) {
+    let Some(used_percent) = used_percent else {
+        return;
+    };
+
+    let remaining_percent = 100.0 - used_percent.clamp(0.0, 100.0);
+    let refresh = refresh_at
+        .and_then(format_refresh_in)
+        .map(|value| format!("refresh {value}"))
+        .unwrap_or_else(|| "refresh unknown".to_string());
+
+    println!(
+        "  {:<6} [{}] {:>5.1}% left  {}",
+        label,
+        progress_bar(remaining_percent),
+        remaining_percent,
+        refresh
+    );
+}
+
+fn progress_bar(percent_remaining: f64) -> String {
+    let filled = ((percent_remaining.clamp(0.0, 100.0) / 100.0) * BAR_WIDTH as f64).round();
+    let filled = (filled as usize).min(BAR_WIDTH);
+    let empty = BAR_WIDTH - filled;
+    format!("{}{}", "█".repeat(filled), "░".repeat(empty))
+}
+
+fn truncate(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let prefix: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!(
+            "{}…",
+            prefix
+                .chars()
+                .take(max_chars.saturating_sub(1))
+                .collect::<String>()
+        )
+    } else {
+        prefix
+    }
 }

@@ -52,13 +52,17 @@ Selection logic:
 1. Read slot names from `rotation.txt`.
 2. Query every slot concurrently.
 3. Skip slots where `allowed=false` or `limit_reached=true`.
-4. Score each available slot as `min(primary remaining, secondary remaining)`.
+4. Score each available slot as `min(5h remaining, weekly remaining)`.
 5. Pick the highest score, preserving `rotation.txt` order for ties.
 6. If every live check fails due to a transient network error, fall back to the
    first transient slot so a temporary network failure does not block local work.
 
 `credits.has_credits=false` is not treated as exhaustion. The real availability
 signals are `rate_limit.allowed` and `rate_limit.limit_reached`.
+
+In `cx status`, the `5h` column comes from `rate_limit.primary_window` and the
+`weekly` column comes from `rate_limit.secondary_window`. The summary includes
+the next refresh time when the usage endpoint reports a reset timestamp.
 
 ## Install
 

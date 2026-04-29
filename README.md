@@ -1,17 +1,27 @@
 # cx
 
-cx 是一个本地 Codex 入口：负责启动 Codex、处理 stdin pipe、管理多账号 slot，并按真实用量自动选择最合适的账号。
+[Chinese README / 中文文档](README-CN.md)
 
-它把这几件事合成一个命令：
+cx is a fast local launcher for OpenAI Codex. It wraps the everyday Codex
+workflow into one command: launch Codex, pass piped stdin into the TUI, manage
+multiple local auth slots, and automatically pick the best available account by
+live usage.
 
-- `cx`：选择可用额度最高的 slot，进入 Codex。
-- `cat file | cx "总结一下"`：把 stdin 包成上下文后进入 Codex TUI。
-- `cx status`：并发查看所有 slot 的真实用量。
-- `cx add` / `cx login`：创建和登录独立 slot。
+## What It Does
 
-## 工作方式
+- `cx`: launch Codex through the slot with the most remaining usage.
+- `cat file | cx "summarize this"`: pass stdin into Codex as prompt context.
+- `cx status`: query all configured slots concurrently.
+- `cx add` / `cx login`: create and authenticate isolated Codex slots.
+- `cx select`: print the best slot name for scripts.
 
-每个 slot 是一个独立 `CODEX_HOME`：
+cx is intended for people who use Codex heavily across multiple ChatGPT
+accounts, workspaces, or model-provider configurations and want the launcher to
+choose intelligently instead of rotating blindly.
+
+## How It Works
+
+Each slot is an isolated `CODEX_HOME`:
 
 ```text
 ~/.codex/profile-manager/
@@ -29,7 +39,7 @@ cx 是一个本地 Codex 入口：负责启动 Codex、处理 stdin pipe、管�
       env.conf
 ```
 
-ChatGPT 登录型 slot 会直接请求 Codex 当前使用的用量接口：
+For ChatGPT-authenticated slots, cx calls the same usage endpoint used by Codex:
 
 ```text
 GET https://chatgpt.com/backend-api/wham/usage
@@ -37,18 +47,20 @@ Authorization: Bearer <access_token>
 ChatGPT-Account-ID: <account_id>
 ```
 
-选择策略：
+Selection logic:
 
-1. 并发查询 `rotation.txt` 里的所有 slot。
-2. `allowed=false` 或 `limit_reached=true` 的 slot 视为耗尽并跳过。
-3. 使用 `min(100-primary_used_percent, 100-secondary_used_percent)` 作为 score。
-4. 选择 score 最高的 slot；分数相同则保持 `rotation.txt` 顺序。
-5. 如果所有在线检查都是临时网络错误，则回退到第一个临时失败的 slot，避免网络抖动直接阻塞工作。
+1. Read slot names from `rotation.txt`.
+2. Query every slot concurrently.
+3. Skip slots where `allowed=false` or `limit_reached=true`.
+4. Score each available slot as `min(primary remaining, secondary remaining)`.
+5. Pick the highest score, preserving `rotation.txt` order for ties.
+6. If every live check fails due to a transient network error, fall back to the
+   first transient slot so a temporary network failure does not block local work.
 
-`credits.has_credits=false` 不会被当成耗尽。这个字段只表示没有额外 credit，真正能不能用以
-`rate_limit.allowed` 和 `rate_limit.limit_reached` 为准。
+`credits.has_credits=false` is not treated as exhaustion. The real availability
+signals are `rate_limit.allowed` and `rate_limit.limit_reached`.
 
-## 安装
+## Install
 
 ### Homebrew
 
@@ -56,15 +68,15 @@ ChatGPT-Account-ID: <account_id>
 brew install xiaotianxt/tap/cx
 ```
 
-安装开发版：
+Install the development build:
 
 ```bash
 brew install --HEAD xiaotianxt/tap/cx
 ```
 
-### 源码安装
+### From Source
 
-需要 Rust 工具链。
+Requires a Rust toolchain.
 
 ```bash
 git clone https://github.com/xiaotianxt/cx.git
@@ -72,11 +84,12 @@ cd cx
 make install-local
 ```
 
-`make install-local` 会安装 `~/.local/bin/cx`。请确认 `~/.local/bin` 在 `PATH` 中。
+`make install-local` installs `cx` to `~/.local/bin/cx`. Make sure
+`~/.local/bin` is in your `PATH`.
 
-## 常用命令
+## Usage
 
-直接进入 Codex：
+Launch Codex through the best available slot:
 
 ```bash
 cx
@@ -84,40 +97,35 @@ cx -m gpt-5.4
 cx --slot bus1 -m gpt-5.4
 ```
 
-stdin pipe：
+Pipe context into Codex:
 
 ```bash
-cat README.md | cx "指出这个项目还缺什么"
-git diff | cx "review 这个改动"
+cat README.md | cx "identify missing sections"
+git diff | cx "review this change"
 ```
 
-查看所有 slot：
+Inspect usage:
 
 ```bash
 cx status
 cx status --json
-```
-
-只输出当前最优 slot：
-
-```bash
 cx select
 ```
 
-新增一个 slot：
+Create and authenticate a slot:
 
 ```bash
 cx add bus6 --rotate
 cx login bus6
 ```
 
-从当前 `~/.codex` 复制登录态：
+Copy the current `~/.codex` auth state into a slot:
 
 ```bash
 cx add work-a --rotate --from-current
 ```
 
-新增外部 provider slot：
+Create a non-OpenAI provider slot:
 
 ```bash
 cx add deepseek --rotate \
@@ -127,39 +135,43 @@ cx add deepseek --rotate \
   --env DEEPSEEK_API_KEY=sk-...
 ```
 
-如果参数和 cx 子命令冲突，用 `--` 强制进入 Codex：
+If a Codex prompt or argument conflicts with a cx management command, use `--`
+to force launcher mode:
 
 ```bash
 cx -- status
 ```
 
-## 配置文件
+## Slot Files
 
-`overrides.conf` 每行是一条会传给 Codex 的 `-c` 配置：
+`overrides.conf` contains one Codex `-c` override per line:
 
 ```toml
 model_provider="deepseek"
 model="deepseek-v4-pro"
 ```
 
-`env.conf` 支持简单的 shell 风格环境变量：
+`env.conf` contains simple shell-style environment variables:
 
 ```bash
 export DEEPSEEK_API_KEY="sk-..."
 ```
 
-这些文件可能包含敏感信息，不要提交。
+These files may contain credentials. Do not commit slot directories,
+`auth.json`, or real `env.conf` values.
 
-## 环境变量
+## Environment Variables
 
-- `CX_PROFILE_MANAGER_DIR`：覆盖 profile-manager 目录，默认 `~/.codex/profile-manager`。
-- `CX_CODEX_BIN`：指定真实 Codex 二进制。
-- `CX_SLOT_USAGE_TIMEOUT`：每个 slot 的用量查询超时时间，单位秒。
-- `CX_SLOT_DEBUG`：启动前打印 slot 选择详情。
-- `CX_DEBUG`：打印 stdin pipe 包装调试信息。
-- `CX_BIN`：指定 cx 自身路径，主要用于测试或非标准安装。
+- `CX_PROFILE_MANAGER_DIR`: profile-manager directory. Defaults to
+  `~/.codex/profile-manager`.
+- `CX_CODEX_BIN`: path to the real Codex binary.
+- `CX_SLOT_USAGE_TIMEOUT`: per-slot usage request timeout in seconds.
+- `CX_SLOT_DEBUG`: print slot-selection details before launch.
+- `CX_DEBUG`: print stdin-wrapper diagnostics.
+- `CX_BIN`: path to the cx binary, mostly useful for tests and non-standard
+  installs.
 
-## 开发
+## Development
 
 ```bash
 make fmt
@@ -167,16 +179,18 @@ make check
 cargo test
 ```
 
-项目刻意保持小依赖面：CLI 用 `clap`，HTTP 用 `reqwest` blocking client，配置解析用 `toml`，
-JSON 用 `serde_json`。并发使用标准库线程，不引入异步 runtime。
+The project intentionally keeps dependencies small: `clap` for CLI parsing,
+blocking `reqwest` for HTTP, `toml` for config parsing, and `serde_json` for
+JSON. Slot queries use standard-library threads instead of an async runtime.
 
-## 发版
+## Release
 
-维护者发版：
+Maintainers can release with:
 
 ```bash
 scripts/release.sh
 ```
 
-脚本会运行测试、推送 tag、等待 GitHub Actions 产出 `darwin-arm64` release asset、更新
-`xiaotianxt/homebrew-tap` 里的 `Formula/cx.rb`，并用 Homebrew 做一次安装验证。
+The script runs tests, pushes a tag, waits for GitHub Actions to publish the
+`darwin-arm64` release artifact, updates `Formula/cx.rb` in
+`xiaotianxt/homebrew-tap`, and verifies the Homebrew install.

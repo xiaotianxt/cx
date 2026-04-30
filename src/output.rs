@@ -2,6 +2,9 @@ use anyhow::Result;
 use serde::Serialize;
 
 use crate::paths::ManagerPaths;
+use crate::stats;
+use crate::stats::CalibrationReport;
+use crate::stats::StatsReport;
 use crate::usage::format_refresh_in;
 use crate::usage::SlotResult;
 
@@ -95,6 +98,84 @@ pub fn print_doctor(paths: &ManagerPaths, slots: &[String]) -> Result<()> {
     Ok(())
 }
 
+pub fn print_stats(report: &StatsReport) -> Result<()> {
+    if report.json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+
+    match report.source_databases.as_slice() {
+        [single] => println!("state db: {single}"),
+        databases => println!("state dbs: {}", databases.len()),
+    }
+    println!("basis: {}", report.period_basis);
+    if let Some(source) = &report.price_source {
+        println!("prices: {source}");
+    }
+    if let Some(note) = &report.price_note {
+        println!("note: {note}");
+    }
+    println!();
+    println!(
+        "{:<8} {:>8} {:>12} {:>12} {:>12}",
+        "period", "threads", "tokens", "raw", "est. cost"
+    );
+    for period in &report.periods {
+        println!(
+            "{:<8} {:>8} {:>12} {:>12} {:>12}",
+            period.period,
+            period.threads,
+            stats::human_tokens(period.tokens),
+            period.tokens,
+            format_cost(period.estimated_cost_usd, period.unpriced_tokens)
+        );
+        if report.by_slot {
+            for slot in &period.slots {
+                println!(
+                    "  {:<18} {:>8} {:>12} {:>12}",
+                    truncate(&slot.name, 18),
+                    slot.threads,
+                    stats::human_tokens(slot.tokens),
+                    format_cost(slot.estimated_cost_usd, slot.unpriced_tokens)
+                );
+            }
+        }
+    }
+
+    if report
+        .periods
+        .iter()
+        .any(|period| period.estimated_cost_usd.is_some() && period.unpriced_tokens > 0)
+    {
+        println!();
+        println!("* est. cost excludes tokens for models without known OpenAI pricing.");
+    }
+    Ok(())
+}
+
+pub fn print_stats_calibration(report: &CalibrationReport) -> Result<()> {
+    if report.json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+
+    println!("saved: {}", report.saved_to);
+    match report.source_databases.as_slice() {
+        [single] => println!("state db: {single}"),
+        databases => println!("state dbs: {}", databases.len()),
+    }
+    println!("rollouts: {}", report.source_rollouts);
+    println!("samples: {}", report.samples);
+    println!("tokens: {}", stats::human_tokens(report.total_tokens));
+    println!(
+        "mix: {} uncached input, {} cached input, {} output",
+        format_percent(report.token_mix.uncached_input_share),
+        format_percent(report.token_mix.cached_input_share),
+        format_percent(report.token_mix.output_share)
+    );
+    Ok(())
+}
+
 fn print_window(label: &str, used_percent: Option<f64>, refresh_at: Option<i64>) {
     let Some(used_percent) = used_percent else {
         return;
@@ -136,4 +217,20 @@ fn truncate(value: &str, max_chars: usize) -> String {
     } else {
         prefix
     }
+}
+
+fn format_cost(cost: Option<f64>, unpriced_tokens: u64) -> String {
+    let Some(cost) = cost else {
+        return "-".to_string();
+    };
+    let suffix = if unpriced_tokens > 0 { "*" } else { "" };
+    if cost > 0.0 && cost < 0.005 {
+        format!("<$0.01{suffix}")
+    } else {
+        format!("${cost:.2}{suffix}")
+    }
+}
+
+fn format_percent(value: f64) -> String {
+    format!("{:.2}%", value * 100.0)
 }

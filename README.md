@@ -12,6 +12,7 @@ live usage.
 - `cx`: launch Codex through the slot with the most remaining usage.
 - `cat file | cx "summarize this"`: pass stdin into Codex as prompt context.
 - `cx status`: query all configured slots concurrently.
+- `cx stats`: summarize local Codex token usage from `state_5.sqlite`.
 - `cx add` / `cx login`: create and authenticate isolated Codex slots.
 - `cx select`: print the best slot name for scripts.
 
@@ -115,6 +116,24 @@ cx status
 cx status --json
 cx select
 ```
+
+Inspect local token consumption:
+
+```bash
+cx stats
+cx stats --by-slot
+cx stats bus3
+cx stats --json --no-price
+cx stats --calibrate
+```
+
+`cx stats` reads Codex's local `state_5.sqlite` and buckets
+`threads.tokens_used` by `threads.updated_at` for `1h`, `24h`, `today`, `week`,
+`month`, and `year`. Human output auto-scales token units. Price estimates are
+best-effort: cx fetches and caches OpenAI's public API pricing table, then uses
+the saved token mix from `cx stats --calibrate` when available. Calibration is
+explicit because it scans rollout JSONL files; normal `cx stats` only reads the
+small saved calibration file or falls back to a built-in token mix.
 
 Create and authenticate a slot:
 

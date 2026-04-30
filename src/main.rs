@@ -8,6 +8,7 @@ mod paths;
 mod run;
 mod selector;
 mod slot;
+mod stats;
 mod usage;
 
 use std::process::ExitCode;
@@ -37,7 +38,16 @@ fn entry() -> Result<()> {
     if !matches!(
         first_arg,
         Some(
-            "status" | "select" | "add" | "login" | "doctor" | "install" | "help" | "-h" | "--help"
+            "status"
+                | "stats"
+                | "select"
+                | "add"
+                | "login"
+                | "doctor"
+                | "install"
+                | "help"
+                | "-h"
+                | "--help"
         )
     ) {
         return cx::run_from_args(raw_args.into_iter().skip(1).collect());
@@ -51,6 +61,16 @@ fn entry() -> Result<()> {
             let results = selector::query_slots(&paths, &slots, args.timeout)?;
             let selected = selector::choose_result(&results).map(|result| result.slot.clone());
             output::print_report(&results, selected.as_deref(), args.json)?;
+        }
+        Command::Stats(args) => {
+            let paths = paths::ManagerPaths::new(args.manager_dir.clone())?;
+            if args.calibrate {
+                let report = stats::calibrate_mix(&paths, args)?;
+                output::print_stats_calibration(&report)?;
+            } else {
+                let report = stats::collect_report(&paths, args)?;
+                output::print_stats(&report)?;
+            }
         }
         Command::Select(args) => {
             let paths = paths::ManagerPaths::new(args.manager_dir.clone())?;

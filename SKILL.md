@@ -14,6 +14,8 @@ Use this skill when you need to operate the local Codex multi-slot workflow.
 - `cx`: run Codex through the best available slot.
 - `cat file | cx "prompt"`: wrap stdin as Codex prompt context.
 - `cx status`: show all configured slots and live usage.
+- `cx stats`: show local token usage totals from Codex state.
+- `cx stats --calibrate`: scan rollout token counts and save the price-estimate token mix.
 - `cx select`: print the best slot name.
 - `cx add <slot> --rotate`: create a slot and add it to rotation.
 - `cx login <slot>`: log into a slot-specific `CODEX_HOME`.

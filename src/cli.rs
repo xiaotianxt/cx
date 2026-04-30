@@ -25,6 +25,8 @@ pub struct Cli {
 pub enum Command {
     /// Query every slot and show current availability.
     Status(StatusArgs),
+    /// Show local Codex token usage totals from the Codex state database.
+    Stats(StatsArgs),
     /// Print the best slot name for scripting.
     Select(SelectArgs),
     /// Create or update a slot.
@@ -67,6 +69,40 @@ impl SlotQueryArgs {
 
 pub type StatusArgs = SlotQueryArgs;
 pub type SelectArgs = SlotQueryArgs;
+
+#[derive(Debug, Clone, Args)]
+pub struct StatsArgs {
+    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
+    #[arg(long)]
+    pub manager_dir: Option<PathBuf>,
+
+    /// Print JSON instead of a human table.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Break each period down by inferred slot/account.
+    #[arg(long)]
+    pub by_slot: bool,
+
+    /// Skip price fetching and price estimates.
+    #[arg(long)]
+    pub no_price: bool,
+
+    /// Force-refresh the cached OpenAI pricing table.
+    #[arg(long)]
+    pub refresh_prices: bool,
+
+    /// Scan rollout token_count events, save a calibrated price-estimate token mix, and exit.
+    #[arg(long)]
+    pub calibrate: bool,
+
+    /// Pricing page to fetch. Defaults to the official OpenAI API pricing docs.
+    #[arg(long)]
+    pub price_url: Option<String>,
+
+    /// Slot names to filter. Defaults to all known local Codex usage.
+    pub slots: Vec<String>,
+}
 
 #[derive(Debug, Clone, Args)]
 pub struct AddArgs {

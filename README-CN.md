@@ -9,6 +9,7 @@ cx 是一个本地 Codex 入口：负责启动 Codex、处理 stdin pipe、管�
 - `cx`：选择可用额度最高的 slot，进入 Codex。
 - `cat file | cx "总结一下"`：把 stdin 包成上下文后进入 Codex TUI。
 - `cx status`：并发查看所有 slot 的真实用量。
+- `cx stats`：从本地 `state_5.sqlite` 汇总 Codex token 消耗。
 - `cx add` / `cx login`：创建和登录独立 slot。
 
 ## 工作方式
@@ -109,6 +110,22 @@ cx status --json
 ```bash
 cx select
 ```
+
+查看本地 token 消耗：
+
+```bash
+cx stats
+cx stats --by-slot
+cx stats bus3
+cx stats --json --no-price
+cx stats --calibrate
+```
+
+`cx stats` 读取 Codex 本地维护的 `state_5.sqlite`，按 `threads.updated_at`
+把 `threads.tokens_used` 汇总到 `1h`、`24h`、`today`、`week`、`month`、`year`。
+人类可读输出会自动缩放 token 单位。价格估算是 best-effort：cx 会抓取并缓存 OpenAI
+公开 API pricing 表，并优先使用 `cx stats --calibrate` 保存的 token mix。校准是显式触发的，
+因为它需要扫描 rollout JSONL；普通 `cx stats` 只读取小的校准文件，或回退到内置 token mix。
 
 新增一个 slot：
 

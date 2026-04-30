@@ -46,6 +46,7 @@ complete -c cx -l cx-quiet -d "Suppress cx slot banner"
 complete -c cx -l cx-debug -d "Print slot selection details"
 complete -c cx -s m -r -a "(__cx_complete_models)" -d "Codex model"
 
+complete -c cx -n "__fish_seen_subcommand_from status" -l sort -r -a "score rotation" -d "Sort status output"
 complete -c cx -n "__fish_seen_subcommand_from status select stats login remove" -a "(__cx_complete_slots)"
 complete -c cx -n "__fish_seen_subcommand_from completions" -a "fish zsh bash"
 "#;
@@ -103,7 +104,14 @@ _cx() {
       ;;
     arg)
       case "${words[1]}" in
-        status|select|stats|login|remove)
+        status)
+          if [[ "${words[CURRENT-1]}" == "--sort" ]]; then
+            _values 'sort' score rotation
+          else
+            _cx_slots
+          fi
+          ;;
+        select|stats|login|remove)
           _cx_slots
           ;;
         completions)
@@ -134,7 +142,24 @@ _cx() {
   cur="${COMP_WORDS[COMP_CWORD]}"
   prev="${COMP_WORDS[COMP_CWORD-1]}"
 
+  for word in "${COMP_WORDS[@]:1:$COMP_CWORD-1}"; do
+    case "$word" in
+      -*)
+        ;;
+      *)
+        subcommand="$word"
+        break
+        ;;
+    esac
+  done
+
   case "$prev" in
+    --sort)
+      if [[ "$subcommand" == "status" ]]; then
+        mapfile -t COMPREPLY < <(compgen -W "score rotation" -- "$cur")
+        return 0
+      fi
+      ;;
     --slot|-s)
       mapfile -t COMPREPLY < <(compgen -W "$(__cx_complete_words slots)" -- "$cur")
       return 0
@@ -149,17 +174,6 @@ _cx() {
       ;;
   esac
 
-  for word in "${COMP_WORDS[@]:1:$COMP_CWORD-1}"; do
-    case "$word" in
-      -*)
-        ;;
-      *)
-        subcommand="$word"
-        break
-        ;;
-    esac
-  done
-
   if [[ -z "$subcommand" ]]; then
     if [[ "$cur" == -* ]]; then
       mapfile -t COMPREPLY < <(compgen -W "--slot -s --manager-dir --codex-bin --cx-quiet --cx-debug -m --help -h" -- "$cur")
@@ -170,7 +184,14 @@ _cx() {
   fi
 
   case "$subcommand" in
-    status|select|stats|login|remove)
+    status)
+      if [[ "$cur" == -* ]]; then
+        mapfile -t COMPREPLY < <(compgen -W "--sort --manager-dir --timeout --json --help -h" -- "$cur")
+      else
+        mapfile -t COMPREPLY < <(compgen -W "$(__cx_complete_words slots)" -- "$cur")
+      fi
+      ;;
+    select|stats|login|remove)
       mapfile -t COMPREPLY < <(compgen -W "$(__cx_complete_words slots)" -- "$cur")
       ;;
     completions)

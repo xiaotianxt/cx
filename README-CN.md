@@ -52,10 +52,11 @@ ChatGPT-Account-ID: <account_id>
 `credits.has_credits=false` 不会被当成耗尽。这个字段只表示没有额外 credit，真正能不能用以
 `rate_limit.allowed` 和 `rate_limit.limit_reached` 为准。
 
-`cx status` 里的 `5h` 列来自 `rate_limit.primary_window`，`weekly` 列来自
-`rate_limit.secondary_window`。如果接口返回 reset 时间，summary 会显示下一次 refresh
-还要多久。状态行也会展示脱敏账号标识：优先使用脱敏 email，并在可用时补一个短 account id
-后缀，这样能区分账号，但不会打印完整邮箱地址。
+`cx status` 默认按 score 倒序显示，分数相同则保持 `rotation.txt` 顺序。使用
+`cx status --sort rotation` 可以改为按 `rotation.txt` 或显式参数顺序显示。`5h` 列来自
+`rate_limit.primary_window`，`weekly` 列来自 `rate_limit.secondary_window`。如果接口返回
+reset 时间，summary 会显示下一次 refresh 还要多久。状态行也会展示脱敏账号标识：优先使用
+脱敏 email，并在可用时补一个短 account id 后缀，这样能区分账号，但不会打印完整邮箱地址。
 
 ## 安装
 
@@ -104,6 +105,7 @@ git diff | cx "review 这个改动"
 
 ```bash
 cx status
+cx status --sort rotation
 cx status --json
 ```
 

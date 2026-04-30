@@ -140,7 +140,7 @@ impl UsageChecker {
             headers.insert(AUTHORIZATION, value);
         }
         if let Some(account_id) = auth.account_id.as_deref() {
-            headers.insert("ChatGPT-Account-ID", HeaderValue::from_str(&account_id)?);
+            headers.insert("ChatGPT-Account-ID", HeaderValue::from_str(account_id)?);
         }
         if auth.fedramp {
             headers.insert("X-OpenAI-Fedramp", HeaderValue::from_static("true"));
@@ -254,12 +254,20 @@ impl SlotStatus {
     }
 }
 
-pub fn compare_for_selection(left: &SlotResult, right: &SlotResult) -> Ordering {
+pub fn sort_by_score_desc(results: &mut [SlotResult]) {
+    results.sort_by(compare_by_score_desc);
+}
+
+fn compare_by_score_desc(left: &SlotResult, right: &SlotResult) -> Ordering {
     right
         .score
         .partial_cmp(&left.score)
         .unwrap_or(Ordering::Equal)
         .then_with(|| left.index.cmp(&right.index))
+}
+
+pub fn compare_for_selection(left: &SlotResult, right: &SlotResult) -> Ordering {
+    compare_by_score_desc(left, right)
 }
 
 fn read_slot_base_url(slot_dir: &std::path::Path, slot_home: &std::path::Path) -> Result<String> {
@@ -497,6 +505,24 @@ mod tests {
             result.rate_limit_reached_type,
             Some("workspace_member_credits_depleted".to_string())
         );
+    }
+
+    #[test]
+    fn sorts_by_score_descending_then_rotation_order() {
+        let mut results = vec![
+            SlotResult::new("busy", 0, SlotStatus::Available, 20.0, "busy"),
+            SlotResult::new("backup", 2, SlotStatus::Available, 90.0, "backup"),
+            SlotResult::new("fresh", 1, SlotStatus::Available, 90.0, "fresh"),
+            SlotResult::new("offline", 3, SlotStatus::Error, -1.0, "offline"),
+        ];
+
+        sort_by_score_desc(&mut results);
+
+        let slots = results
+            .iter()
+            .map(|result| result.slot.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(slots, ["fresh", "backup", "busy", "offline"]);
     }
 
     #[test]

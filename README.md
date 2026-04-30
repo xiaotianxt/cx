@@ -63,12 +63,15 @@ Selection logic:
 `credits.has_credits=false` is not treated as exhaustion. The real availability
 signals are `rate_limit.allowed` and `rate_limit.limit_reached`.
 
-In `cx status`, the `5h` column comes from `rate_limit.primary_window` and the
-`weekly` column comes from `rate_limit.secondary_window`. The summary includes
-the next refresh time when the usage endpoint reports a reset timestamp. The
-status line also includes a masked account label, using a masked email plus a
-short account-id suffix when available, so accounts can be distinguished without
-printing full email addresses.
+`cx status` prints slots sorted by score descending by default, preserving
+`rotation.txt` order for ties. Use `cx status --sort rotation` to show
+`rotation.txt` or explicit argument order instead. The `5h` column comes from
+`rate_limit.primary_window` and the `weekly` column comes from
+`rate_limit.secondary_window`. The summary includes the next refresh time when
+the usage endpoint reports a reset timestamp. The status line also includes a
+masked account label, using a masked email plus a short account-id suffix when
+available, so accounts can be distinguished without printing full email
+addresses.
 
 ## Install
 
@@ -118,6 +121,7 @@ Inspect usage:
 
 ```bash
 cx status
+cx status --sort rotation
 cx status --json
 cx select
 ```

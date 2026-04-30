@@ -256,7 +256,7 @@ pub fn collect_report(paths: &ManagerPaths, args: StatsArgs) -> Result<StatsRepo
     };
     let mut accumulators = periods
         .into_iter()
-        .map(|period| PeriodAccumulator::new(period))
+        .map(PeriodAccumulator::new)
         .collect::<Vec<_>>();
     let mut seen_threads = HashSet::new();
 

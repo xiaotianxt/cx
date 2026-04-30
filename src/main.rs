@@ -19,6 +19,7 @@ use anyhow::Result;
 use clap::Parser;
 use cli::Cli;
 use cli::Command;
+use cli::StatusSort;
 
 fn main() -> ExitCode {
     match entry() {
@@ -60,11 +61,15 @@ fn entry() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Status(args) => {
-            let paths = paths::ManagerPaths::new(args.manager_dir.clone())?;
+            let paths = paths::ManagerPaths::new(args.query.manager_dir.clone())?;
             let slots = args.slots_or_rotation(&paths)?;
-            let results = selector::query_slots(&paths, &slots, args.timeout)?;
+            let mut results = selector::query_slots(&paths, &slots, args.query.timeout)?;
+            match args.sort {
+                StatusSort::Score => usage::sort_by_score_desc(&mut results),
+                StatusSort::Rotation => {}
+            }
             let selected = selector::choose_result(&results).map(|result| result.slot.clone());
-            output::print_report(&results, selected.as_deref(), args.json)?;
+            output::print_report(&results, selected.as_deref(), args.query.json)?;
         }
         Command::Stats(args) => {
             let paths = paths::ManagerPaths::new(args.manager_dir.clone())?;

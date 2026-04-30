@@ -60,6 +60,14 @@ pub enum CompleteKind {
     Models,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum StatusSort {
+    /// Show the best-scoring slots first.
+    Score,
+    /// Preserve rotation.txt or explicit argument order.
+    Rotation,
+}
+
 #[derive(Debug, Clone, Args)]
 pub struct CompletionsArgs {
     /// Shell to generate completions for.
@@ -104,7 +112,22 @@ impl SlotQueryArgs {
     }
 }
 
-pub type StatusArgs = SlotQueryArgs;
+#[derive(Debug, Clone, Args)]
+pub struct StatusArgs {
+    #[command(flatten)]
+    pub query: SlotQueryArgs,
+
+    /// Sort status output.
+    #[arg(long, value_enum, default_value = "score")]
+    pub sort: StatusSort,
+}
+
+impl StatusArgs {
+    pub fn slots_or_rotation(&self, paths: &ManagerPaths) -> Result<Vec<String>> {
+        self.query.slots_or_rotation(paths)
+    }
+}
+
 pub type SelectArgs = SlotQueryArgs;
 
 #[derive(Debug, Clone, Args)]
@@ -139,6 +162,34 @@ pub struct StatsArgs {
 
     /// Slot names to filter. Defaults to all known local Codex usage.
     pub slots: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::*;
+
+    #[test]
+    fn status_defaults_to_score_sort() {
+        let cli = Cli::parse_from(["cx", "status"]);
+
+        let Command::Status(args) = cli.command else {
+            panic!("expected status command");
+        };
+        assert_eq!(args.sort, StatusSort::Score);
+    }
+
+    #[test]
+    fn status_accepts_rotation_sort() {
+        let cli = Cli::parse_from(["cx", "status", "--sort", "rotation", "bus1"]);
+
+        let Command::Status(args) = cli.command else {
+            panic!("expected status command");
+        };
+        assert_eq!(args.sort, StatusSort::Rotation);
+        assert_eq!(args.query.slots, vec![String::from("bus1")]);
+    }
 }
 
 #[derive(Debug, Clone, Args)]

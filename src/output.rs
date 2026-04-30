@@ -38,8 +38,9 @@ pub fn print_report(results: &[SlotResult], selected: Option<&str>, json: bool) 
         };
 
         println!(
-            "{mark} {:<18} {:<18} score {:>5.1}%",
+            "{mark} {:<18} {:<30} {:<18} score {:>5.1}%",
             truncate(&result.slot, 18),
+            truncate(result.account_label.as_deref().unwrap_or("-"), 30),
             result.status.as_str(),
             result.score
         );

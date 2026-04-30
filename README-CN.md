@@ -11,6 +11,7 @@ cx 是一个本地 Codex 入口：负责启动 Codex、处理 stdin pipe、管�
 - `cx status`：并发查看所有 slot 的真实用量。
 - `cx stats`：从本地 `state_5.sqlite` 汇总 Codex token 消耗。
 - `cx add` / `cx login` / `cx remove`：管理独立 slot。
+- `cx completions`：生成 shell completion，支持动态补全 slot 和 model。
 
 ## 工作方式
 
@@ -53,7 +54,8 @@ ChatGPT-Account-ID: <account_id>
 
 `cx status` 里的 `5h` 列来自 `rate_limit.primary_window`，`weekly` 列来自
 `rate_limit.secondary_window`。如果接口返回 reset 时间，summary 会显示下一次 refresh
-还要多久。
+还要多久。状态行也会展示脱敏账号标识：优先使用脱敏 email，并在可用时补一个短 account id
+后缀，这样能区分账号，但不会打印完整邮箱地址。
 
 ## 安装
 
@@ -168,6 +170,18 @@ cx add deepseek --rotate \
 cx -- status
 ```
 
+安装 shell completion：
+
+```bash
+cx completions fish > ~/.config/fish/completions/cx.fish
+cx completions zsh > ~/.zsh/completions/_cx
+cx completions bash > ~/.local/share/bash-completion/completions/cx
+```
+
+release formula 会为 Homebrew 用户自动安装这些 completions。
+生成的脚本会补全 cx 命令、launcher flags、本地 slot 名和本地缓存的 Codex model 名。
+动态候选只读本地文件，不会调用在线用量接口。
+
 ## 配置文件
 
 `overrides.conf` 每行是一条会传给 Codex 的 `-c` 配置：
@@ -203,7 +217,7 @@ cargo test
 ```
 
 项目刻意保持小依赖面：CLI 用 `clap`，HTTP 用 `reqwest` blocking client，配置解析用 `toml`，
-JSON 用 `serde_json`。并发使用标准库线程，不引入异步 runtime。
+JSON 用 `serde_json`，本地 JWT claim 解码用 `base64`。并发使用标准库线程，不引入异步 runtime。
 
 ## 发版
 

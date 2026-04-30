@@ -330,6 +330,7 @@ class Cx < Formula
     else
       bin.install "cx"
     end
+    generate_completions_from_executable(bin/"cx", "completions")
   end
 
   test do

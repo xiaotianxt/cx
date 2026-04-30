@@ -15,6 +15,8 @@ live usage.
 - `cx stats`: summarize local Codex token usage from `state_5.sqlite`.
 - `cx add` / `cx login` / `cx remove`: manage isolated Codex slots.
 - `cx select`: print the best slot name for scripts.
+- `cx completions`: generate shell completion scripts with dynamic slot/model
+  candidates.
 
 cx is intended for people who use Codex heavily across multiple ChatGPT
 accounts, workspaces, or model-provider configurations and want the launcher to
@@ -63,7 +65,10 @@ signals are `rate_limit.allowed` and `rate_limit.limit_reached`.
 
 In `cx status`, the `5h` column comes from `rate_limit.primary_window` and the
 `weekly` column comes from `rate_limit.secondary_window`. The summary includes
-the next refresh time when the usage endpoint reports a reset timestamp.
+the next refresh time when the usage endpoint reports a reset timestamp. The
+status line also includes a masked account label, using a masked email plus a
+short account-id suffix when available, so accounts can be distinguished without
+printing full email addresses.
 
 ## Install
 
@@ -177,6 +182,19 @@ to force launcher mode:
 cx -- status
 ```
 
+Install shell completions:
+
+```bash
+cx completions fish > ~/.config/fish/completions/cx.fish
+cx completions zsh > ~/.zsh/completions/_cx
+cx completions bash > ~/.local/share/bash-completion/completions/cx
+```
+
+The release formula installs these completions automatically for Homebrew users.
+The generated scripts complete cx commands, launcher flags, local slot names, and
+cached Codex model names. Dynamic candidates come from local files only; tab
+completion does not call the live usage endpoint.
+
 ## Slot Files
 
 `overrides.conf` contains one Codex `-c` override per line:
@@ -215,8 +233,9 @@ cargo test
 ```
 
 The project intentionally keeps dependencies small: `clap` for CLI parsing,
-blocking `reqwest` for HTTP, `toml` for config parsing, and `serde_json` for
-JSON. Slot queries use standard-library threads instead of an async runtime.
+blocking `reqwest` for HTTP, `toml` for config parsing, `serde_json` for JSON,
+and `base64` for local JWT claim decoding. Slot queries use standard-library
+threads instead of an async runtime.
 
 ## Release
 

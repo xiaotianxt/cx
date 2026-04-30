@@ -1,5 +1,6 @@
 mod auth;
 mod cli;
+mod completion;
 mod cx;
 mod envfile;
 mod install;
@@ -46,6 +47,8 @@ fn entry() -> Result<()> {
                 | "login"
                 | "doctor"
                 | "install"
+                | "completions"
+                | "__complete"
                 | "help"
                 | "-h"
                 | "--help"
@@ -112,6 +115,12 @@ fn entry() -> Result<()> {
         }
         Command::Install(args) => {
             install::install(args).context("failed to install cx")?;
+        }
+        Command::Completions(args) => {
+            completion::print_script(args.shell)?;
+        }
+        Command::Complete(args) => {
+            completion::print_candidates(args.kind, args.manager_dir)?;
         }
     }
     Ok(())

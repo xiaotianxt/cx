@@ -4,6 +4,7 @@ use anyhow::Result;
 use clap::Args;
 use clap::Parser;
 use clap::Subcommand;
+use clap::ValueEnum;
 
 use crate::paths::ManagerPaths;
 
@@ -39,6 +40,40 @@ pub enum Command {
     Doctor(DoctorArgs),
     /// Install cx into ~/.local/bin.
     Install(InstallArgs),
+    /// Generate shell completion scripts.
+    Completions(CompletionsArgs),
+    /// Internal dynamic completion helper.
+    #[command(name = "__complete", hide = true)]
+    Complete(CompleteArgs),
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CompletionShell {
+    Fish,
+    Zsh,
+    Bash,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum CompleteKind {
+    Slots,
+    Models,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct CompletionsArgs {
+    /// Shell to generate completions for.
+    pub shell: CompletionShell,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct CompleteArgs {
+    /// Dynamic candidate kind.
+    pub kind: CompleteKind,
+
+    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
+    #[arg(long)]
+    pub manager_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]

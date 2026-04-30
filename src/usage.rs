@@ -25,6 +25,8 @@ pub struct UsageChecker {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct SlotResult {
     pub slot: String,
+    #[serde(rename = "account")]
+    pub account_label: Option<String>,
     pub index: usize,
     pub status: SlotStatus,
     pub score: f64,
@@ -93,6 +95,7 @@ impl UsageChecker {
         }
 
         let auth = auth::read_slot_auth(&slot_dir)?;
+        let account_label = auth.account_label();
         if auth.access_token.is_none() {
             if auth.api_key.is_some() {
                 return Ok(SlotResult::new(
@@ -101,7 +104,8 @@ impl UsageChecker {
                     SlotStatus::ApiKey,
                     100.0,
                     "OpenAI API key slot",
-                ));
+                )
+                .with_account_label(account_label));
             }
             if let Some(provider) = auth
                 .provider
@@ -114,7 +118,8 @@ impl UsageChecker {
                     SlotStatus::ExternalProvider,
                     100.0,
                     format!("external provider slot ({provider})"),
-                ));
+                )
+                .with_account_label(account_label));
             }
             return Ok(SlotResult::new(
                 slot,
@@ -122,18 +127,19 @@ impl UsageChecker {
                 SlotStatus::NoAuth,
                 -1.0,
                 "no ChatGPT access token",
-            ));
+            )
+            .with_account_label(account_label));
         }
 
         let base_url = read_slot_base_url(&slot_dir, &slot_home)?;
         let url = usage_url(&base_url);
         let mut headers = HeaderMap::new();
         headers.insert("User-Agent", HeaderValue::from_static("codex-cli"));
-        if let Some(token) = auth.access_token {
+        if let Some(token) = auth.access_token.as_deref() {
             let value = HeaderValue::from_str(&format!("Bearer {token}"))?;
             headers.insert(AUTHORIZATION, value);
         }
-        if let Some(account_id) = auth.account_id {
+        if let Some(account_id) = auth.account_id.as_deref() {
             headers.insert("ChatGPT-Account-ID", HeaderValue::from_str(&account_id)?);
         }
         if auth.fedramp {
@@ -143,13 +149,10 @@ impl UsageChecker {
         let response = match self.client.get(&url).headers(headers).send() {
             Ok(response) => response,
             Err(err) => {
-                return Ok(SlotResult::new(
-                    slot,
-                    index,
-                    SlotStatus::Error,
-                    -1.0,
-                    err.to_string(),
-                ));
+                return Ok(
+                    SlotResult::new(slot, index, SlotStatus::Error, -1.0, err.to_string())
+                        .with_account_label(account_label),
+                );
             }
         };
         let status = response.status();
@@ -160,7 +163,8 @@ impl UsageChecker {
                 SlotStatus::NeedsLogin,
                 -1.0,
                 format!("usage check returned {status}"),
-            ));
+            )
+            .with_account_label(account_label));
         }
         if !status.is_success() {
             return Ok(SlotResult::new(
@@ -169,7 +173,8 @@ impl UsageChecker {
                 SlotStatus::HttpError,
                 -1.0,
                 format!("usage check returned {status}"),
-            ));
+            )
+            .with_account_label(account_label));
         }
 
         let body = response.text().unwrap_or_default();
@@ -180,9 +185,10 @@ impl UsageChecker {
                 SlotStatus::BadJson,
                 -1.0,
                 "usage response is not valid JSON",
-            ));
+            )
+            .with_account_label(account_label));
         };
-        Ok(result_from_payload(slot, index, &payload))
+        Ok(result_from_payload(slot, index, &payload).with_account_label(account_label))
     }
 }
 
@@ -196,6 +202,7 @@ impl SlotResult {
     ) -> Self {
         Self {
             slot: slot.to_string(),
+            account_label: None,
             index,
             status,
             score,
@@ -208,6 +215,11 @@ impl SlotResult {
             plan_type: None,
             rate_limit_reached_type: None,
         }
+    }
+
+    pub fn with_account_label(mut self, account_label: Option<String>) -> Self {
+        self.account_label = account_label;
+        self
     }
 
     pub fn is_available(&self) -> bool {

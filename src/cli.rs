@@ -31,6 +31,8 @@ pub enum Command {
     Select(SelectArgs),
     /// Create or update a slot.
     Add(AddArgs),
+    /// Remove a slot from rotation.
+    Remove(RemoveArgs),
     /// Run `codex login` inside a slot.
     Login(LoginArgs),
     /// Validate the local profile-manager layout.
@@ -128,6 +130,20 @@ pub struct AddArgs {
     /// Per-slot environment variable, stored in env.conf.
     #[arg(long = "env")]
     pub envs: Vec<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct RemoveArgs {
+    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
+    #[arg(long)]
+    pub manager_dir: Option<PathBuf>,
+
+    /// Slot name to remove.
+    pub slot: String,
+
+    /// Also delete the slot directory and its auth files.
+    #[arg(long)]
+    pub delete_files: bool,
 }
 
 #[derive(Debug, Clone, Args)]

@@ -13,7 +13,7 @@ live usage.
 - `cat file | cx "summarize this"`: pass stdin into Codex as prompt context.
 - `cx status`: query all configured slots concurrently.
 - `cx stats`: summarize local Codex token usage from `state_5.sqlite`.
-- `cx add` / `cx login`: create and authenticate isolated Codex slots.
+- `cx add` / `cx login` / `cx remove`: manage isolated Codex slots.
 - `cx select`: print the best slot name for scripts.
 
 cx is intended for people who use Codex heavily across multiple ChatGPT
@@ -146,6 +146,18 @@ Copy the current `~/.codex` auth state into a slot:
 
 ```bash
 cx add work-a --rotate --from-current
+```
+
+Remove a slot from rotation without deleting its login files:
+
+```bash
+cx remove work-a
+```
+
+Delete the slot directory as well:
+
+```bash
+cx remove work-a --delete-files
 ```
 
 Create a non-OpenAI provider slot:

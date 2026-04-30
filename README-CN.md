@@ -10,7 +10,7 @@ cx 是一个本地 Codex 入口：负责启动 Codex、处理 stdin pipe、管�
 - `cat file | cx "总结一下"`：把 stdin 包成上下文后进入 Codex TUI。
 - `cx status`：并发查看所有 slot 的真实用量。
 - `cx stats`：从本地 `state_5.sqlite` 汇总 Codex token 消耗。
-- `cx add` / `cx login`：创建和登录独立 slot。
+- `cx add` / `cx login` / `cx remove`：管理独立 slot。
 
 ## 工作方式
 
@@ -138,6 +138,18 @@ cx login bus6
 
 ```bash
 cx add work-a --rotate --from-current
+```
+
+从轮换列表移除一个 slot，但保留登录文件：
+
+```bash
+cx remove work-a
+```
+
+同时删除 slot 目录：
+
+```bash
+cx remove work-a --delete-files
 ```
 
 新增外部 provider slot：

@@ -42,6 +42,7 @@ fn entry() -> Result<()> {
                 | "stats"
                 | "select"
                 | "add"
+                | "remove"
                 | "login"
                 | "doctor"
                 | "install"
@@ -89,6 +90,10 @@ fn entry() -> Result<()> {
         Command::Add(args) => {
             let paths = paths::ManagerPaths::new(args.manager_dir.clone())?;
             slot::add_slot(&paths, args)?;
+        }
+        Command::Remove(args) => {
+            let paths = paths::ManagerPaths::new(args.manager_dir.clone())?;
+            slot::remove_slot(&paths, args)?;
         }
         Command::Login(args) => {
             let paths = paths::ManagerPaths::new(args.manager_dir.clone())?;

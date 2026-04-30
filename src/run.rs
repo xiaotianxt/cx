@@ -107,7 +107,7 @@ fn exec_slot_codex(
         );
     }
 
-    slot::ensure_shared_sqlite(paths, selected_slot)?;
+    slot::repair_slot_layout(paths, selected_slot)?;
 
     let slot_dir = paths.slot_dir(selected_slot);
     let overrides = slot::read_override_lines(&slot_dir)?;

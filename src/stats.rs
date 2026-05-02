@@ -28,6 +28,11 @@ const DEFAULT_PRICE_URL: &str = "https://developers.openai.com/api/docs/pricing"
 const PRICE_CACHE_FILE: &str = "price-cache.json";
 const CALIBRATION_FILE: &str = "stats-calibration.json";
 const PRICE_CACHE_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
+const PRICE_CACHE_SCHEMA_VERSION: u64 = 2;
+const CALIBRATION_SCHEMA_VERSION: u64 = 2;
+const LEGACY_FILE_SCHEMA_VERSION: u64 = 1;
+
+pub const STATS_JSON_SCHEMA_VERSION: u64 = 2;
 
 // Codex state only stores a thread-level total. This mix keeps estimates useful
 // for Codex's cache-heavy workload without pretending to be exact billing.
@@ -37,29 +42,29 @@ const FALLBACK_TOKEN_MIX: TokenMix = TokenMix {
     output_share: 0.005,
 };
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct StatsReport {
-    #[serde(skip)]
     pub json: bool,
-    #[serde(rename = "bySlot")]
     pub by_slot: bool,
-    #[serde(rename = "sourceDatabases")]
     pub source_databases: Vec<String>,
-    #[serde(rename = "periodBasis")]
     pub period_basis: String,
-    #[serde(rename = "priceSource")]
     pub price_source: Option<String>,
-    #[serde(rename = "priceNote")]
     pub price_note: Option<String>,
-    #[serde(rename = "tokenMix")]
     pub token_mix: Option<TokenMix>,
-    #[serde(rename = "tokenMixSource")]
     pub token_mix_source: Option<String>,
     pub periods: Vec<PeriodUsage>,
 }
 
+impl StatsReport {
+    pub fn includes_price_estimates(&self) -> bool {
+        self.price_source.is_some()
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct CalibrationReport {
+    #[serde(rename = "schemaVersion")]
+    pub schema_version: u64,
     #[serde(skip)]
     pub json: bool,
     #[serde(rename = "savedTo")]
@@ -91,47 +96,37 @@ pub struct TokenMix {
     pub output_share: f64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct PeriodUsage {
     pub period: String,
-    #[serde(rename = "sinceUnix")]
     pub since_unix: i64,
     pub threads: u64,
     pub tokens: u64,
-    #[serde(rename = "estimatedCostUsd")]
     pub estimated_cost_usd: Option<f64>,
-    #[serde(rename = "pricedTokens")]
     pub priced_tokens: u64,
-    #[serde(rename = "unpricedTokens")]
     pub unpriced_tokens: u64,
     pub slots: Vec<NamedUsage>,
     pub models: Vec<ModelUsage>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct NamedUsage {
     pub name: String,
     pub threads: u64,
     pub tokens: u64,
-    #[serde(rename = "estimatedCostUsd")]
     pub estimated_cost_usd: Option<f64>,
-    #[serde(rename = "pricedTokens")]
     pub priced_tokens: u64,
-    #[serde(rename = "unpricedTokens")]
     pub unpriced_tokens: u64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct ModelUsage {
     pub provider: String,
     pub model: String,
     pub threads: u64,
     pub tokens: u64,
-    #[serde(rename = "estimatedCostUsd")]
     pub estimated_cost_usd: Option<f64>,
-    #[serde(rename = "pricedTokens")]
     pub priced_tokens: u64,
-    #[serde(rename = "unpricedTokens")]
     pub unpriced_tokens: u64,
 }
 
@@ -191,8 +186,25 @@ struct PriceBook {
     note: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatsPricePolicy<'a> {
+    Disabled,
+    Enabled {
+        price_url: &'a str,
+        cache_policy: PriceCachePolicy,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PriceCachePolicy {
+    UseFreshCacheIfAvailable,
+    Refresh,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PriceCache {
+    #[serde(rename = "schemaVersion", default = "legacy_file_schema_version")]
+    schema_version: u64,
     #[serde(rename = "fetchedAt")]
     fetched_at: i64,
     #[serde(rename = "sourceUrl")]
@@ -202,6 +214,8 @@ struct PriceCache {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MixCalibration {
+    #[serde(rename = "schemaVersion", default = "legacy_file_schema_version")]
+    schema_version: u64,
     #[serde(rename = "calibratedAt")]
     calibrated_at: i64,
     samples: u64,
@@ -224,6 +238,7 @@ struct ModelPrice {
 }
 
 pub fn collect_report(paths: &ManagerPaths, args: StatsArgs) -> Result<StatsReport> {
+    let price_policy = StatsPricePolicy::from_args(&args);
     let slot_filters = args.slots.iter().cloned().collect::<BTreeSet<_>>();
     let db_paths = state_db_paths(paths, &slot_filters)?;
     if db_paths.is_empty() {
@@ -236,23 +251,16 @@ pub fn collect_report(paths: &ManagerPaths, args: StatsArgs) -> Result<StatsRepo
         .map(|period| period.since_unix)
         .min()
         .unwrap_or(0);
-    let (token_mix, token_mix_source) = if args.no_price {
-        (None, None)
-    } else {
-        let (mix, source) = load_token_mix(paths);
-        (Some(mix), Some(source))
-    };
-    let price_book = if args.no_price {
-        None
-    } else {
-        let mix = token_mix.expect("token mix exists when price estimates are enabled");
-        Some(load_price_book(
-            paths,
-            args.price_url.as_deref().unwrap_or(DEFAULT_PRICE_URL),
-            args.refresh_prices,
-            mix,
-            token_mix_source.as_deref().unwrap_or("unknown"),
-        ))
+    let (price_book, token_mix, token_mix_source) = match price_policy {
+        StatsPricePolicy::Disabled => (None, None, None),
+        StatsPricePolicy::Enabled {
+            price_url,
+            cache_policy,
+        } => {
+            let (mix, source) = load_token_mix(paths);
+            let price_book = load_price_book(paths, price_url, cache_policy, mix, &source);
+            (Some(price_book), Some(mix), Some(source))
+        }
     };
     let mut accumulators = periods
         .into_iter()
@@ -277,10 +285,7 @@ pub fn collect_report(paths: &ManagerPaths, args: StatsArgs) -> Result<StatsRepo
     }
 
     let price_source = price_book.as_ref().map(|book| book.source.clone());
-    let price_note = price_book
-        .as_ref()
-        .map(|book| book.note.clone())
-        .or_else(|| Some("price estimates disabled".to_string()));
+    let price_note = price_book.as_ref().map(|book| book.note.clone());
 
     Ok(StatsReport {
         json: args.json,
@@ -299,6 +304,91 @@ pub fn collect_report(paths: &ManagerPaths, args: StatsArgs) -> Result<StatsRepo
             .map(PeriodAccumulator::into_usage)
             .collect(),
     })
+}
+
+impl<'a> StatsPricePolicy<'a> {
+    fn from_args(args: &'a StatsArgs) -> Self {
+        if args.no_price {
+            return Self::Disabled;
+        }
+        if args.price || args.refresh_prices || args.price_url.is_some() {
+            return Self::Enabled {
+                price_url: args.price_url.as_deref().unwrap_or(DEFAULT_PRICE_URL),
+                cache_policy: PriceCachePolicy::from_refresh_flag(args.refresh_prices),
+            };
+        }
+        Self::Disabled
+    }
+}
+
+impl PriceCachePolicy {
+    fn from_refresh_flag(refresh_prices: bool) -> Self {
+        if refresh_prices {
+            Self::Refresh
+        } else {
+            Self::UseFreshCacheIfAvailable
+        }
+    }
+
+    fn allows_cache_read(self) -> bool {
+        matches!(self, Self::UseFreshCacheIfAvailable)
+    }
+}
+
+impl PriceCache {
+    fn new(source_url: String, prices: BTreeMap<String, ModelPrice>) -> Self {
+        Self {
+            schema_version: PRICE_CACHE_SCHEMA_VERSION,
+            fetched_at: unix_now(),
+            source_url,
+            prices,
+        }
+    }
+
+    fn supports_schema_version(&self) -> bool {
+        matches!(
+            self.schema_version,
+            LEGACY_FILE_SCHEMA_VERSION | PRICE_CACHE_SCHEMA_VERSION
+        )
+    }
+
+    fn needs_normalization(&self) -> bool {
+        self.schema_version != PRICE_CACHE_SCHEMA_VERSION
+    }
+
+    fn normalized(mut self) -> Self {
+        self.schema_version = PRICE_CACHE_SCHEMA_VERSION;
+        self
+    }
+}
+
+impl MixCalibration {
+    fn new(source_rollouts: u64, totals: &TokenTotals, token_mix: TokenMix) -> Self {
+        Self {
+            schema_version: CALIBRATION_SCHEMA_VERSION,
+            calibrated_at: unix_now(),
+            samples: totals.samples,
+            source_rollouts,
+            total_tokens: totals.total_tokens,
+            token_mix,
+        }
+    }
+
+    fn supports_schema_version(&self) -> bool {
+        matches!(
+            self.schema_version,
+            LEGACY_FILE_SCHEMA_VERSION | CALIBRATION_SCHEMA_VERSION
+        )
+    }
+
+    fn needs_normalization(&self) -> bool {
+        self.schema_version != CALIBRATION_SCHEMA_VERSION
+    }
+
+    fn normalized(mut self) -> Self {
+        self.schema_version = CALIBRATION_SCHEMA_VERSION;
+        self
+    }
 }
 
 pub fn calibrate_mix(paths: &ManagerPaths, args: StatsArgs) -> Result<CalibrationReport> {
@@ -331,16 +421,11 @@ pub fn calibrate_mix(paths: &ManagerPaths, args: StatsArgs) -> Result<Calibratio
     }
 
     let token_mix = totals.token_mix();
-    let calibration = MixCalibration {
-        calibrated_at: unix_now(),
-        samples: totals.samples,
-        source_rollouts: rollout_paths.len() as u64,
-        total_tokens: totals.total_tokens,
-        token_mix,
-    };
+    let calibration = MixCalibration::new(rollout_paths.len() as u64, &totals, token_mix);
     let saved_to = write_mix_calibration(paths, &calibration)?;
 
     Ok(CalibrationReport {
+        schema_version: STATS_JSON_SCHEMA_VERSION,
         json: args.json,
         saved_to: saved_to.display().to_string(),
         source_databases: db_paths
@@ -745,11 +830,11 @@ fn current_periods() -> Result<Vec<Period>> {
 fn load_price_book(
     paths: &ManagerPaths,
     price_url: &str,
-    refresh: bool,
+    cache_policy: PriceCachePolicy,
     token_mix: TokenMix,
     token_mix_source: &str,
 ) -> PriceBook {
-    if !refresh {
+    if cache_policy.allows_cache_read() {
         if let Some(cache) = read_price_cache(paths) {
             if cache.source_url == price_url
                 && unix_now().saturating_sub(cache.fetched_at) < PRICE_CACHE_TTL_SECONDS
@@ -767,12 +852,10 @@ fn load_price_book(
 
     match fetch_prices(price_url) {
         Ok(prices) if !prices.is_empty() => {
-            let cache = PriceCache {
-                fetched_at: unix_now(),
-                source_url: price_url.to_string(),
-                prices: prices.clone(),
-            };
-            let _ = write_price_cache(paths, &cache);
+            let cache = PriceCache::new(price_url.to_string(), prices.clone());
+            if let Err(_err) = write_price_cache(paths, &cache) {
+                // Price estimates can use freshly fetched prices even when cache persistence fails.
+            }
             PriceBook {
                 prices,
                 token_mix,
@@ -807,8 +890,9 @@ fn fetch_prices(price_url: &str) -> Result<BTreeMap<String, ModelPrice>> {
 
 fn read_price_cache(paths: &ManagerPaths) -> Option<PriceCache> {
     let path = paths.manager_dir.join(PRICE_CACHE_FILE);
-    let content = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&content).ok()
+    let content = fs::read_to_string(&path).ok()?;
+    let cache = parse_price_cache(&content)?;
+    Some(normalize_price_cache_if_needed(paths, cache))
 }
 
 fn write_price_cache(paths: &ManagerPaths, cache: &PriceCache) -> Result<()> {
@@ -817,6 +901,22 @@ fn write_price_cache(paths: &ManagerPaths, cache: &PriceCache) -> Result<()> {
     let path = paths.manager_dir.join(PRICE_CACHE_FILE);
     let content = serde_json::to_string_pretty(cache)?;
     fs::write(&path, content).with_context(|| format!("write {}", path.display()))
+}
+
+fn parse_price_cache(content: &str) -> Option<PriceCache> {
+    let cache = serde_json::from_str::<PriceCache>(content).ok()?;
+    cache.supports_schema_version().then_some(cache)
+}
+
+fn normalize_price_cache_if_needed(paths: &ManagerPaths, cache: PriceCache) -> PriceCache {
+    if !cache.needs_normalization() {
+        return cache;
+    }
+    let normalized = cache.normalized();
+    if let Err(_err) = write_price_cache(paths, &normalized) {
+        // Cache normalization is best-effort; the parsed cache remains valid for this run.
+    }
+    normalized
 }
 
 fn load_token_mix(paths: &ManagerPaths) -> (TokenMix, String) {
@@ -839,16 +939,37 @@ fn load_token_mix(paths: &ManagerPaths) -> (TokenMix, String) {
 
 fn read_mix_calibration(path: &Path) -> Option<MixCalibration> {
     let content = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&content).ok()
+    let calibration = parse_mix_calibration(&content)?;
+    Some(normalize_mix_calibration_if_needed(path, calibration))
 }
 
 fn write_mix_calibration(paths: &ManagerPaths, calibration: &MixCalibration) -> Result<PathBuf> {
     fs::create_dir_all(&paths.manager_dir)
         .with_context(|| format!("create {}", paths.manager_dir.display()))?;
     let path = paths.manager_dir.join(CALIBRATION_FILE);
-    let content = serde_json::to_string_pretty(calibration)?;
-    fs::write(&path, content).with_context(|| format!("write {}", path.display()))?;
+    write_mix_calibration_path(&path, calibration)?;
     Ok(path)
+}
+
+fn write_mix_calibration_path(path: &Path, calibration: &MixCalibration) -> Result<()> {
+    let content = serde_json::to_string_pretty(calibration)?;
+    fs::write(path, content).with_context(|| format!("write {}", path.display()))
+}
+
+fn parse_mix_calibration(content: &str) -> Option<MixCalibration> {
+    let calibration = serde_json::from_str::<MixCalibration>(content).ok()?;
+    calibration.supports_schema_version().then_some(calibration)
+}
+
+fn normalize_mix_calibration_if_needed(path: &Path, calibration: MixCalibration) -> MixCalibration {
+    if !calibration.needs_normalization() {
+        return calibration;
+    }
+    let normalized = calibration.normalized();
+    if let Err(_err) = write_mix_calibration_path(path, &normalized) {
+        // Calibration normalization is best-effort; the parsed calibration remains valid.
+    }
+    normalized
 }
 
 fn fallback_price_book(token_mix: TokenMix, token_mix_source: &str, reason: &str) -> PriceBook {
@@ -988,6 +1109,10 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
+fn legacy_file_schema_version() -> u64 {
+    LEGACY_FILE_SCHEMA_VERSION
+}
+
 pub(crate) fn human_tokens(tokens: u64) -> String {
     let value = tokens as f64;
     if tokens >= 1_000_000_000 {
@@ -1007,7 +1132,192 @@ pub(crate) fn human_tokens(tokens: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::time::SystemTime;
+    use std::time::UNIX_EPOCH;
+
+    use clap::Parser;
+
+    use crate::cli::Cli;
+    use crate::cli::Command;
+
     use super::*;
+
+    fn parse_stats_args(args: &[&str]) -> StatsArgs {
+        let mut raw_args = vec!["cx", "stats"];
+        raw_args.extend_from_slice(args);
+        let cli = Cli::parse_from(raw_args);
+        let Command::Stats(args) = cli.command else {
+            panic!("expected stats command");
+        };
+        args
+    }
+
+    fn temp_paths(name: &str) -> ManagerPaths {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cx-stats-test-{name}-{}-{unique}",
+            std::process::id()
+        ));
+        ManagerPaths {
+            base_codex_home: root.join("codex"),
+            manager_dir: root.join("profile-manager"),
+            slots_dir: root.join("profile-manager/slots"),
+            rotation_file: root.join("profile-manager/rotation.txt"),
+        }
+    }
+
+    #[test]
+    fn stats_price_policy_defaults_to_local_only() {
+        let args = parse_stats_args(&[]);
+
+        assert_eq!(
+            StatsPricePolicy::from_args(&args),
+            StatsPricePolicy::Disabled
+        );
+    }
+
+    #[test]
+    fn stats_price_policy_explicitly_enables_default_pricing() {
+        let args = parse_stats_args(&["--price"]);
+
+        assert_eq!(
+            StatsPricePolicy::from_args(&args),
+            StatsPricePolicy::Enabled {
+                price_url: DEFAULT_PRICE_URL,
+                cache_policy: PriceCachePolicy::UseFreshCacheIfAvailable
+            }
+        );
+    }
+
+    #[test]
+    fn stats_price_policy_refresh_enables_and_refreshes() {
+        let args = parse_stats_args(&["--refresh-prices"]);
+
+        assert_eq!(
+            StatsPricePolicy::from_args(&args),
+            StatsPricePolicy::Enabled {
+                price_url: DEFAULT_PRICE_URL,
+                cache_policy: PriceCachePolicy::Refresh
+            }
+        );
+    }
+
+    #[test]
+    fn stats_price_policy_uses_custom_price_url() {
+        let args = parse_stats_args(&["--price-url", "https://example.test/pricing"]);
+
+        assert_eq!(
+            StatsPricePolicy::from_args(&args),
+            StatsPricePolicy::Enabled {
+                price_url: "https://example.test/pricing",
+                cache_policy: PriceCachePolicy::UseFreshCacheIfAvailable
+            }
+        );
+    }
+
+    #[test]
+    fn stats_price_policy_no_price_overrides_price_flags() {
+        let args = parse_stats_args(&["--price", "--refresh-prices", "--no-price"]);
+
+        assert_eq!(
+            StatsPricePolicy::from_args(&args),
+            StatsPricePolicy::Disabled
+        );
+    }
+
+    #[test]
+    fn legacy_price_cache_normalizes_on_read() {
+        let paths = temp_paths("legacy-price-cache");
+        fs::create_dir_all(&paths.manager_dir).expect("create manager dir");
+        let path = paths.manager_dir.join(PRICE_CACHE_FILE);
+        fs::write(
+            &path,
+            r#"{
+              "fetchedAt": 123,
+              "sourceUrl": "https://example.test/pricing",
+              "prices": {
+                "gpt-5.5": {
+                  "inputPerMillion": 1.0,
+                  "cachedInputPerMillion": 0.1,
+                  "outputPerMillion": 2.0
+                }
+              }
+            }"#,
+        )
+        .expect("write legacy price cache");
+
+        let cache = read_price_cache(&paths).expect("read price cache");
+        let persisted = fs::read_to_string(&path).expect("read normalized price cache");
+        let persisted: serde_json::Value =
+            serde_json::from_str(&persisted).expect("parse normalized price cache");
+
+        assert_eq!(cache.schema_version, PRICE_CACHE_SCHEMA_VERSION);
+        assert_eq!(
+            persisted["schemaVersion"],
+            serde_json::json!(PRICE_CACHE_SCHEMA_VERSION)
+        );
+    }
+
+    #[test]
+    fn legacy_mix_calibration_normalizes_on_read() {
+        let paths = temp_paths("legacy-mix-calibration");
+        fs::create_dir_all(&paths.manager_dir).expect("create manager dir");
+        let path = paths.manager_dir.join(CALIBRATION_FILE);
+        fs::write(
+            &path,
+            r#"{
+              "calibratedAt": 123,
+              "samples": 1,
+              "sourceRollouts": 1,
+              "totalTokens": 1050,
+              "tokenMix": {
+                "uncachedInputShare": 0.1,
+                "cachedInputShare": 0.85,
+                "outputShare": 0.05
+              }
+            }"#,
+        )
+        .expect("write legacy calibration");
+
+        let calibration = read_mix_calibration(&path).expect("read calibration");
+        let persisted = fs::read_to_string(&path).expect("read normalized calibration");
+        let persisted: serde_json::Value =
+            serde_json::from_str(&persisted).expect("parse normalized calibration");
+
+        assert_eq!(calibration.schema_version, CALIBRATION_SCHEMA_VERSION);
+        assert_eq!(
+            persisted["schemaVersion"],
+            serde_json::json!(CALIBRATION_SCHEMA_VERSION)
+        );
+    }
+
+    #[test]
+    fn unsupported_owned_file_versions_are_rejected() {
+        let price_cache = r#"{
+          "schemaVersion": 99,
+          "fetchedAt": 123,
+          "sourceUrl": "https://example.test/pricing",
+          "prices": {}
+        }"#;
+        let calibration = r#"{
+          "schemaVersion": 99,
+          "calibratedAt": 123,
+          "samples": 1,
+          "sourceRollouts": 1,
+          "totalTokens": 1,
+          "tokenMix": {
+            "uncachedInputShare": 1.0,
+            "cachedInputShare": 0.0,
+            "outputShare": 0.0
+          }
+        }"#;
+
+        assert!(parse_price_cache(price_cache).is_none());
+        assert!(parse_mix_calibration(calibration).is_none());
+    }
 
     #[test]
     fn parses_pricing_props_rows() {

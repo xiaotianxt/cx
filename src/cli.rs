@@ -144,11 +144,15 @@ pub struct StatsArgs {
     #[arg(long)]
     pub by_slot: bool,
 
-    /// Skip price fetching and price estimates.
+    /// Include best-effort OpenAI API price estimates.
+    #[arg(long)]
+    pub price: bool,
+
+    /// Skip price estimates even if another price flag is supplied.
     #[arg(long)]
     pub no_price: bool,
 
-    /// Force-refresh the cached OpenAI pricing table.
+    /// Include price estimates and force-refresh the cached OpenAI pricing table.
     #[arg(long)]
     pub refresh_prices: bool,
 
@@ -156,7 +160,7 @@ pub struct StatsArgs {
     #[arg(long)]
     pub calibrate: bool,
 
-    /// Pricing page to fetch. Defaults to the official OpenAI API pricing docs.
+    /// Include price estimates from this pricing page.
     #[arg(long)]
     pub price_url: Option<String>,
 

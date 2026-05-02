@@ -48,6 +48,13 @@ complete -c cx -s m -r -a "(__cx_complete_models)" -d "Codex model"
 
 complete -c cx -n "__fish_seen_subcommand_from status" -l sort -r -a "score rotation" -d "Sort status output"
 complete -c cx -n "__fish_seen_subcommand_from status select stats login remove" -a "(__cx_complete_slots)"
+complete -c cx -n "__fish_seen_subcommand_from stats" -l by-slot -d "Break down usage by slot"
+complete -c cx -n "__fish_seen_subcommand_from stats" -l price -d "Include price estimates"
+complete -c cx -n "__fish_seen_subcommand_from stats" -l no-price -d "Skip price estimates"
+complete -c cx -n "__fish_seen_subcommand_from stats" -l refresh-prices -d "Refresh cached pricing"
+complete -c cx -n "__fish_seen_subcommand_from stats" -l price-url -r -d "Pricing page URL"
+complete -c cx -n "__fish_seen_subcommand_from stats" -l json -d "Print JSON"
+complete -c cx -n "__fish_seen_subcommand_from stats" -l calibrate -d "Calibrate token mix"
 complete -c cx -n "__fish_seen_subcommand_from completions" -a "fish zsh bash"
 "#;
 
@@ -111,7 +118,22 @@ _cx() {
             _cx_slots
           fi
           ;;
-        select|stats|login|remove)
+        stats)
+          if [[ "${words[CURRENT]}" == -* ]]; then
+            _values 'stats options' \
+              '--by-slot[Break down usage by slot]' \
+              '--price[Include price estimates]' \
+              '--no-price[Skip price estimates]' \
+              '--refresh-prices[Refresh cached pricing]' \
+              '--price-url[Pricing page URL]' \
+              '--json[Print JSON]' \
+              '--calibrate[Calibrate token mix]' \
+              '--manager-dir[Profile-manager directory]'
+          else
+            _cx_slots
+          fi
+          ;;
+        select|login|remove)
           _cx_slots
           ;;
         completions)
@@ -191,7 +213,14 @@ _cx() {
         mapfile -t COMPREPLY < <(compgen -W "$(__cx_complete_words slots)" -- "$cur")
       fi
       ;;
-    select|stats|login|remove)
+    stats)
+      if [[ "$cur" == -* ]]; then
+        mapfile -t COMPREPLY < <(compgen -W "--by-slot --price --no-price --refresh-prices --price-url --manager-dir --json --calibrate --help -h" -- "$cur")
+      else
+        mapfile -t COMPREPLY < <(compgen -W "$(__cx_complete_words slots)" -- "$cur")
+      fi
+      ;;
+    select|login|remove)
       mapfile -t COMPREPLY < <(compgen -W "$(__cx_complete_words slots)" -- "$cur")
       ;;
     completions)

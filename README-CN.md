@@ -121,15 +121,25 @@ cx select
 cx stats
 cx stats --by-slot
 cx stats bus3
-cx stats --json --no-price
+cx stats --price
+cx stats --price --refresh-prices
+cx stats --json
+cx stats --price --json
 cx stats --calibrate
 ```
 
 `cx stats` 读取 Codex 本地维护的 `state_5.sqlite`，按 `threads.updated_at`
 把 `threads.tokens_used` 汇总到 `1h`、`24h`、`today`、`week`、`month`、`year`。
-人类可读输出会自动缩放 token 单位。价格估算是 best-effort：cx 会抓取并缓存 OpenAI
-公开 API pricing 表，并优先使用 `cx stats --calibrate` 保存的 token mix。校准是显式触发的，
-因为它需要扫描 rollout JSONL；普通 `cx stats` 只读取小的校准文件，或回退到内置 token mix。
+人类可读输出会自动缩放 token 单位，并且默认只读取本地数据。价格估算需要显式传
+`--price`：cx 会抓取并缓存 OpenAI 公开 API pricing 表，并优先使用
+`cx stats --calibrate` 保存的 token mix。校准是显式触发的，因为它需要扫描 rollout
+JSONL；普通 `cx stats --price` 只读取小的校准文件，或回退到内置 token mix。
+
+`cx stats --json` 输出 schema v2。默认 token-only JSON 完全不输出成本字段；
+`cx stats --price --json` 会增加 `priceEstimate`，并在 period、slot、model 上输出成本字段。
+cx 自己拥有的 `price-cache.json` 和 `stats-calibration.json` 都带 `schemaVersion`，
+并会在 cx 第一次读取旧格式时 normalize 到当前文件 schema。cx 不会改写 Codex 上游的
+`state_5.sqlite`。
 
 新增一个 slot：
 

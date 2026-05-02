@@ -132,17 +132,28 @@ Inspect local token consumption:
 cx stats
 cx stats --by-slot
 cx stats bus3
-cx stats --json --no-price
+cx stats --price
+cx stats --price --refresh-prices
+cx stats --json
+cx stats --price --json
 cx stats --calibrate
 ```
 
 `cx stats` reads Codex's local `state_5.sqlite` and buckets
 `threads.tokens_used` by `threads.updated_at` for `1h`, `24h`, `today`, `week`,
-`month`, and `year`. Human output auto-scales token units. Price estimates are
-best-effort: cx fetches and caches OpenAI's public API pricing table, then uses
-the saved token mix from `cx stats --calibrate` when available. Calibration is
-explicit because it scans rollout JSONL files; normal `cx stats` only reads the
-small saved calibration file or falls back to a built-in token mix.
+`month`, and `year`. Human output auto-scales token units and stays local-only
+by default. Price estimates are opt-in with `--price`; cx fetches and caches
+OpenAI's public API pricing table, then uses the saved token mix from
+`cx stats --calibrate` when available. Calibration is explicit because it scans
+rollout JSONL files; normal `cx stats --price` only reads the small saved
+calibration file or falls back to a built-in token mix.
+
+`cx stats --json` emits schema v2. Token-only JSON omits cost fields entirely;
+`cx stats --price --json` adds a `priceEstimate` object plus per-period,
+per-slot, and per-model cost fields. cx-owned `price-cache.json` and
+`stats-calibration.json` are versioned with `schemaVersion` and are normalized
+to the current file schema the first time cx reads them. cx never rewrites
+Codex's upstream `state_5.sqlite`.
 
 Create and authenticate a slot:
 

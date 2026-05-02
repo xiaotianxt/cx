@@ -30,6 +30,18 @@ pub fn read_env_file(path: &Path) -> Result<BTreeMap<String, String>> {
 
 pub fn write_env_file(path: &Path, envs: &[String]) -> Result<()> {
     let mut content = String::new();
+    for (key, value) in parse_env_entries(envs)? {
+        content.push_str("export ");
+        content.push_str(&key);
+        content.push('=');
+        content.push_str(&quote_double(&value));
+        content.push('\n');
+    }
+    fs::write(path, content).with_context(|| format!("write {}", path.display()))
+}
+
+pub fn parse_env_entries(envs: &[String]) -> Result<BTreeMap<String, String>> {
+    let mut vars = BTreeMap::new();
     for entry in envs {
         let (key, value) = entry
             .split_once('=')
@@ -37,13 +49,9 @@ pub fn write_env_file(path: &Path, envs: &[String]) -> Result<()> {
         if !is_valid_env_key(key) {
             anyhow::bail!("invalid environment variable name: {key}");
         }
-        content.push_str("export ");
-        content.push_str(key);
-        content.push('=');
-        content.push_str(&quote_double(value));
-        content.push('\n');
+        vars.insert(key.to_string(), value.to_string());
     }
-    fs::write(path, content).with_context(|| format!("write {}", path.display()))
+    Ok(vars)
 }
 
 fn parse_value(value: &str) -> String {
@@ -86,7 +94,7 @@ fn unescape_double(value: &str) -> String {
     out
 }
 
-fn is_valid_env_key(key: &str) -> bool {
+pub(crate) fn is_valid_env_key(key: &str) -> bool {
     let mut chars = key.chars();
     matches!(chars.next(), Some('_' | 'A'..='Z' | 'a'..='z'))
         && chars.all(|ch| matches!(ch, '_' | 'A'..='Z' | 'a'..='z' | '0'..='9'))

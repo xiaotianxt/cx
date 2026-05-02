@@ -8,6 +8,7 @@ pub struct ManagerPaths {
     pub base_codex_home: PathBuf,
     pub manager_dir: PathBuf,
     pub slots_dir: PathBuf,
+    pub targets_dir: PathBuf,
     pub rotation_file: PathBuf,
 }
 
@@ -23,6 +24,7 @@ impl ManagerPaths {
             .unwrap_or_else(|| home.join(".codex"));
         Ok(Self {
             slots_dir: manager_dir.join("slots"),
+            targets_dir: manager_dir.join("targets"),
             rotation_file: manager_dir.join("rotation.txt"),
             manager_dir,
             base_codex_home,
@@ -35,6 +37,10 @@ impl ManagerPaths {
 
     pub fn slot_home(&self, slot: &str) -> PathBuf {
         self.slot_dir(slot).join("home")
+    }
+
+    pub fn target_file(&self, target: &str) -> PathBuf {
+        self.targets_dir.join(format!("{target}.toml"))
     }
 }
 

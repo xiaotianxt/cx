@@ -5,13 +5,22 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use anyhow::Result;
+#[cfg(test)]
 use rusqlite::Connection;
-use toml::Value;
 
 use crate::cli::AddArgs;
 use crate::cli::RemoveArgs;
 use crate::envfile;
 use crate::paths::ManagerPaths;
+
+mod config;
+mod rotation;
+mod sqlite;
+
+pub use config::read_config_string;
+pub use config::read_override_lines;
+pub use config::read_override_string;
+pub use rotation::load_rotation;
 
 const SHARED_NAMES: &[&str] = &[
     "AGENTS.md",
@@ -50,56 +59,6 @@ const SHARED_DIRS: &[&str] = &[
 
 const APPEND_ONLY_FILES: &[&str] = &["history.jsonl", "session_index.jsonl"];
 
-pub fn load_rotation(paths: &ManagerPaths) -> Result<Vec<String>> {
-    if !paths.rotation_file.exists() {
-        return Ok(Vec::new());
-    }
-    let content = fs::read_to_string(&paths.rotation_file)
-        .with_context(|| format!("read {}", paths.rotation_file.display()))?;
-    Ok(content
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(str::to_string)
-        .collect())
-}
-
-pub fn read_override_lines(slot_dir: &Path) -> Result<Vec<String>> {
-    let path = slot_dir.join("overrides.conf");
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let content = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    Ok(content
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(str::to_string)
-        .collect())
-}
-
-pub fn read_override_string(slot_dir: &Path, key: &str) -> Result<Option<String>> {
-    for line in read_override_lines(slot_dir)? {
-        let Ok(value) = toml::from_str::<Value>(&line) else {
-            continue;
-        };
-        if let Some(value) = value.get(key).and_then(Value::as_str) {
-            return Ok(Some(value.to_string()));
-        }
-    }
-    Ok(None)
-}
-
-pub fn read_config_string(path: &Path, key: &str) -> Result<Option<String>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let content = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let value =
-        toml::from_str::<Value>(&content).with_context(|| format!("parse {}", path.display()))?;
-    Ok(value.get(key).and_then(Value::as_str).map(str::to_string))
-}
-
 pub fn add_slot(paths: &ManagerPaths, args: AddArgs) -> Result<()> {
     validate_slot_name(&args.slot)?;
     ensure_slot_layout(paths, &args.slot)?;
@@ -126,7 +85,7 @@ pub fn add_slot(paths: &ManagerPaths, args: AddArgs) -> Result<()> {
         copy_auth_from_current(paths, &args.slot)?;
     }
     if args.rotate {
-        append_rotation(paths, &args.slot)?;
+        rotation::append_rotation(paths, &args.slot)?;
     }
 
     println!("updated slot: {}", args.slot);
@@ -143,7 +102,7 @@ pub fn add_slot(paths: &ManagerPaths, args: AddArgs) -> Result<()> {
 pub fn remove_slot(paths: &ManagerPaths, args: RemoveArgs) -> Result<()> {
     validate_slot_name(&args.slot)?;
 
-    let removed_from_rotation = remove_from_rotation(paths, &args.slot)?;
+    let removed_from_rotation = rotation::remove_from_rotation(paths, &args.slot)?;
     let slot_dir = paths.slot_dir(&args.slot);
 
     println!("removed slot: {}", args.slot);
@@ -248,7 +207,7 @@ fn repair_shared_sqlite(paths: &ManagerPaths, slot: &str) -> Result<()> {
                         canonical_path.display()
                     )
                 })?;
-            } else if let Err(err) = merge_sqlite_databases(&canonical_path, &slot_path) {
+            } else if let Err(err) = sqlite::merge_sqlite_databases(&canonical_path, &slot_path) {
                 if std::env::var_os("CX_SLOT_DEBUG").is_some() {
                     eprintln!(
                         "cx: skipped sqlite merge for {}: {err:#}",
@@ -288,43 +247,6 @@ fn copy_auth_from_current(paths: &ManagerPaths, slot: &str) -> Result<()> {
         copy_dir_all(&source_accounts, &dest_accounts)?;
     }
     Ok(())
-}
-
-fn append_rotation(paths: &ManagerPaths, slot: &str) -> Result<()> {
-    fs::create_dir_all(&paths.manager_dir)
-        .with_context(|| format!("create {}", paths.manager_dir.display()))?;
-    let mut slots = load_rotation(paths)?;
-    if !slots.iter().any(|existing| existing == slot) {
-        slots.push(slot.to_string());
-        fs::write(&paths.rotation_file, slots.join("\n") + "\n")
-            .with_context(|| format!("write {}", paths.rotation_file.display()))?;
-    }
-    Ok(())
-}
-
-fn remove_from_rotation(paths: &ManagerPaths, slot: &str) -> Result<bool> {
-    if !paths.rotation_file.exists() {
-        return Ok(false);
-    }
-
-    let slots = load_rotation(paths)?;
-    let filtered = slots
-        .iter()
-        .filter(|existing| existing.as_str() != slot)
-        .cloned()
-        .collect::<Vec<_>>();
-    if filtered.len() == slots.len() {
-        return Ok(false);
-    }
-
-    let content = if filtered.is_empty() {
-        String::new()
-    } else {
-        filtered.join("\n") + "\n"
-    };
-    fs::write(&paths.rotation_file, content)
-        .with_context(|| format!("write {}", paths.rotation_file.display()))?;
-    Ok(true)
 }
 
 fn validate_slot_name(slot: &str) -> Result<()> {
@@ -483,64 +405,6 @@ fn remove_path_if_exists(path: &Path) -> Result<bool> {
     Ok(true)
 }
 
-fn merge_sqlite_databases(canonical_path: &Path, slot_path: &Path) -> Result<()> {
-    let mut conn = Connection::open(canonical_path)
-        .with_context(|| format!("open {}", canonical_path.display()))?;
-    conn.execute(
-        "ATTACH DATABASE ?1 AS slot_db",
-        [slot_path.display().to_string()],
-    )
-    .with_context(|| format!("attach {}", slot_path.display()))?;
-
-    {
-        let transaction = conn.transaction().context("start sqlite merge")?;
-
-        let tables = {
-            let mut statement = transaction
-                .prepare(
-                    "SELECT name FROM slot_db.sqlite_master \
-                     WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
-                )
-                .context("list slot sqlite tables")?;
-            let tables = statement
-                .query_map([], |row| row.get::<_, String>(0))?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            tables
-        };
-
-        for table in tables {
-            if sqlite_table_exists(&transaction, &table)? {
-                let ident = quote_sqlite_ident(&table);
-                let sql = format!("INSERT OR IGNORE INTO {ident} SELECT * FROM slot_db.{ident}");
-                transaction
-                    .execute(&sql, [])
-                    .with_context(|| format!("merge sqlite table {table}"))?;
-            }
-        }
-
-        transaction.commit().context("commit sqlite merge")?;
-    }
-
-    conn.execute("DETACH DATABASE slot_db", [])
-        .context("detach slot sqlite")?;
-    Ok(())
-}
-
-fn sqlite_table_exists(conn: &Connection, table: &str) -> Result<bool> {
-    let exists = conn
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM main.sqlite_master WHERE type = 'table' AND name = ?1)",
-            [table],
-            |row| row.get::<_, bool>(0),
-        )
-        .context("check sqlite table")?;
-    Ok(exists)
-}
-
-fn quote_sqlite_ident(value: &str) -> String {
-    format!("\"{}\"", value.replace('"', "\"\""))
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::SystemTime;
@@ -561,6 +425,7 @@ mod tests {
             base_codex_home: root.join("codex"),
             manager_dir: root.join("profile-manager"),
             slots_dir: root.join("profile-manager/slots"),
+            targets_dir: root.join("profile-manager/targets"),
             rotation_file: root.join("profile-manager/rotation.txt"),
         }
     }

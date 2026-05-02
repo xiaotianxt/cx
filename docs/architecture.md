@@ -9,9 +9,15 @@ wrappers with a single Rust binary.
 - `cx`: default launcher and stdin pipe wrapper.
 - `run`: argument parsing and `exec` into the real Codex binary.
 - `slot`: slot layout, rotation file, overrides, auth copying, shared sqlite links.
+  Internally this is split into config, rotation, and sqlite repair helpers.
+- `target`: named target-specific slot groups, Codex config overrides, and env
+  overlays from `targets/<name>.toml`.
 - `auth`: `auth.json` parsing.
-- `usage`: direct usage endpoint requests and response scoring.
+- `usage`: direct usage endpoint requests, payload interpretation, and response
+  scoring.
 - `selector`: parallel query orchestration and final slot choice.
+- `stats`: local usage reporting. Internally this separates SQLite reads,
+  rollout calibration, pricing/cache handling, and aggregation.
 - `envfile`: small parser/writer for `env.conf`.
 - `install`: copy the current `cx` binary into a bin directory.
 
@@ -59,7 +65,18 @@ final process is the real Codex binary with:
 - `CODEX_HOME=<slot>/home`
 - variables from `<slot>/env.conf`
 - repeated `-c <line>` arguments from `<slot>/overrides.conf`
+- variables from `targets/<target>.toml` `[env]`, when `--target` is used
+- repeated target `set`/`overrides` lines, appended after slot overrides
 - the user's original Codex args
+
+Target-specific execution resolves in this order:
+
+1. `--slot` wins when supplied.
+2. `--target <name>` reads `targets/<name>.toml`.
+3. If the target has `slots`, only those slots are queried.
+4. If the target has no `slots`, `rotation.txt` is queried.
+5. Slot env/overrides are loaded first; target env/overrides are applied after
+   them so target policy wins over slot defaults.
 
 The real Codex binary is resolved in this order:
 

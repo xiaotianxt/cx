@@ -11,6 +11,7 @@ use crate::paths;
 use crate::paths::ManagerPaths;
 use crate::selector;
 use crate::slot;
+use crate::target::TargetSpec;
 
 const BYPASS_SUBCOMMANDS: &[&str] = &[
     "login",
@@ -32,6 +33,7 @@ const BYPASS_SUBCOMMANDS: &[&str] = &[
 #[derive(Debug, Clone, Default, PartialEq)]
 struct RunOptions {
     slot: Option<String>,
+    target: Option<String>,
     manager_dir: Option<PathBuf>,
     codex_bin: Option<PathBuf>,
     quiet: bool,
@@ -45,11 +47,15 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
     let paths = ManagerPaths::new(options.manager_dir.clone())?;
     let real_codex = resolve_codex_bin(options.codex_bin.as_ref())?;
 
-    if std::env::var_os("CODEX_HOME").is_some() && options.slot.is_none() {
+    if std::env::var_os("CODEX_HOME").is_some()
+        && options.slot.is_none()
+        && options.target.is_none()
+    {
         return exec_real_codex(&real_codex, options.codex_args);
     }
 
     if options.slot.is_none()
+        && options.target.is_none()
         && options
             .first_non_option
             .as_deref()
@@ -58,15 +64,20 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
         return exec_real_codex(&real_codex, options.codex_args);
     }
 
-    let rotation = slot::load_rotation(&paths)?;
-    if rotation.is_empty() && options.slot.is_none() {
+    let target = crate::target::load_optional_target(&paths, options.target.as_deref())?;
+    let candidates = if let Some(target) = &target {
+        target.slots_or_rotation(&paths)?
+    } else {
+        slot::load_rotation(&paths)?
+    };
+    if candidates.is_empty() && options.slot.is_none() {
         return exec_real_codex(&real_codex, options.codex_args);
     }
 
     let selected_slot = if let Some(slot) = options.slot.clone() {
         slot
     } else {
-        let results = selector::query_slots(&paths, &rotation, usage_timeout())?;
+        let results = selector::query_slots(&paths, &candidates, usage_timeout())?;
         let selected = selector::choose_result(&results);
         if options.debug || std::env::var_os("CX_SLOT_DEBUG").is_some() {
             crate::output::print_report(
@@ -80,7 +91,13 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
             .context("no usable Codex slot found")?
     };
 
-    exec_slot_codex(&paths, &real_codex, &selected_slot, options)
+    exec_slot_codex(
+        &paths,
+        &real_codex,
+        &selected_slot,
+        target.as_ref(),
+        options,
+    )
 }
 
 pub fn exec_slot_login(paths: &ManagerPaths, args: LoginArgs) -> Result<()> {
@@ -97,6 +114,7 @@ fn exec_slot_codex(
     paths: &ManagerPaths,
     real_codex: &PathBuf,
     selected_slot: &str,
+    target: Option<&TargetSpec>,
     options: RunOptions,
 ) -> Result<()> {
     let slot_home = paths.slot_home(selected_slot);
@@ -110,11 +128,18 @@ fn exec_slot_codex(
     slot::repair_slot_layout(paths, selected_slot)?;
 
     let slot_dir = paths.slot_dir(selected_slot);
-    let overrides = slot::read_override_lines(&slot_dir)?;
-    let envs = envfile::read_env_file(&slot_dir.join("env.conf"))?;
+    let mut overrides = slot::read_override_lines(&slot_dir)?;
+    let mut envs = envfile::read_env_file(&slot_dir.join("env.conf"))?;
+    if let Some(target) = target {
+        overrides.extend(target.overrides().iter().cloned());
+        envs.extend(target.env().clone());
+    }
 
     if !options.quiet {
         eprintln!("codex slot: {selected_slot}");
+        if let Some(target) = target {
+            eprintln!("codex target: {}", target.name());
+        }
     }
 
     let mut command = Command::new(real_codex);
@@ -189,6 +214,10 @@ fn parse_run_args(args: Vec<OsString>) -> Result<RunOptions> {
                 let value = next_value(&mut iter, "--slot")?;
                 options.slot = Some(value);
             }
+            "--target" => {
+                let value = next_value(&mut iter, "--target")?;
+                options.target = Some(value);
+            }
             "--manager-dir" => {
                 let value = next_os_value(&mut iter, "--manager-dir")?;
                 options.manager_dir = Some(PathBuf::from(value));
@@ -223,6 +252,9 @@ fn parse_run_args(args: Vec<OsString>) -> Result<RunOptions> {
             }
             _ if arg_text.starts_with("--slot=") => {
                 options.slot = Some(arg_text["--slot=".len()..].to_string());
+            }
+            _ if arg_text.starts_with("--target=") => {
+                options.target = Some(arg_text["--target=".len()..].to_string());
             }
             _ if arg_text.starts_with("--manager-dir=") => {
                 options.manager_dir = Some(PathBuf::from(&arg_text["--manager-dir=".len()..]));
@@ -277,6 +309,22 @@ mod tests {
         assert_eq!(
             options.codex_args,
             vec![OsString::from("-m"), OsString::from("gpt-5.4")]
+        );
+    }
+
+    #[test]
+    fn target_flag_is_removed_from_forwarded_args() {
+        let options = parse_run_args(vec![
+            OsString::from("--target=research"),
+            OsString::from("-m"),
+            OsString::from("gpt-5.5"),
+        ])
+        .unwrap();
+
+        assert_eq!(options.target, Some("research".to_string()));
+        assert_eq!(
+            options.codex_args,
+            vec![OsString::from("-m"), OsString::from("gpt-5.5")]
         );
     }
 

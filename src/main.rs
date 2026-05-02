@@ -10,6 +10,7 @@ mod run;
 mod selector;
 mod slot;
 mod stats;
+mod target;
 mod usage;
 
 use std::process::ExitCode;
@@ -20,6 +21,7 @@ use clap::Parser;
 use cli::Cli;
 use cli::Command;
 use cli::StatusSort;
+use cli::TargetCommand;
 
 fn main() -> ExitCode {
     match entry() {
@@ -46,6 +48,7 @@ fn entry() -> Result<()> {
                 | "add"
                 | "remove"
                 | "login"
+                | "target"
                 | "doctor"
                 | "install"
                 | "completions"
@@ -73,6 +76,10 @@ fn entry() -> Result<()> {
         }
         Command::Stats(args) => {
             let paths = paths::ManagerPaths::new(args.manager_dir.clone())?;
+            let mut args = args;
+            if let Some(target_name) = args.target.as_deref().filter(|_| args.slots.is_empty()) {
+                args.slots = target::load_target(&paths, target_name)?.slots_or_rotation(&paths)?;
+            }
             if args.calibrate {
                 let report = stats::calibrate_mix(&paths, args)?;
                 output::print_stats_calibration(&report)?;
@@ -108,6 +115,40 @@ fn entry() -> Result<()> {
             slot::ensure_slot_layout(&paths, &args.slot)?;
             run::exec_slot_login(&paths, args)?;
         }
+        Command::Target(args) => match args.command {
+            TargetCommand::List(args) => {
+                let paths = paths::ManagerPaths::new(args.manager_dir)?;
+                let targets = target::list_targets(&paths)?;
+                output::print_targets(&targets, args.json)?;
+            }
+            TargetCommand::Show(args) => {
+                let paths = paths::ManagerPaths::new(args.manager_dir)?;
+                let target = target::load_target(&paths, &args.target)?;
+                output::print_target(&target, args.json)?;
+            }
+            TargetCommand::Add(args) => {
+                let paths = paths::ManagerPaths::new(args.manager_dir)?;
+                target::save_target(
+                    &paths,
+                    target::TargetInput {
+                        name: args.target.clone(),
+                        slots: args.slots,
+                        overrides: args.sets,
+                        envs: args.envs,
+                    },
+                )?;
+                println!("updated target: {}", args.target);
+                println!("target file: {}", paths.target_file(&args.target).display());
+            }
+            TargetCommand::Remove(args) => {
+                let paths = paths::ManagerPaths::new(args.manager_dir)?;
+                if target::remove_target(&paths, &args.target)? {
+                    println!("removed target: {}", args.target);
+                } else {
+                    println!("target not found: {}", args.target);
+                }
+            }
+        },
         Command::Doctor(args) => {
             let paths = paths::ManagerPaths::new(args.manager_dir)?;
             let slots = slot::load_rotation(&paths)?;

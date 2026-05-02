@@ -9,15 +9,28 @@ use crate::stats::NamedUsage;
 use crate::stats::PeriodUsage;
 use crate::stats::StatsReport;
 use crate::stats::TokenMix;
+use crate::target::TargetSpec;
 use crate::usage::format_refresh_in;
-use crate::usage::SlotResult;
 
 const BAR_WIDTH: usize = 20;
 
+mod status;
+
+pub use status::print_no_available;
+pub use status::print_report;
+
 #[derive(Debug, Serialize)]
-struct Report<'a> {
-    selected: Option<&'a str>,
-    results: &'a [SlotResult],
+struct TargetListReport<'a> {
+    targets: &'a [String],
+}
+
+#[derive(Debug, Serialize)]
+struct TargetReport<'a> {
+    name: &'a str,
+    slots: &'a [String],
+    overrides: Vec<String>,
+    #[serde(rename = "envKeys")]
+    env_keys: Vec<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,64 +140,6 @@ struct PricedModelUsageJson<'a> {
     unpriced_tokens: u64,
 }
 
-pub fn print_report(results: &[SlotResult], selected: Option<&str>, json: bool) -> Result<()> {
-    if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&Report { selected, results })?
-        );
-        return Ok(());
-    }
-
-    if let Some(selected) = selected {
-        println!("selected: {selected}");
-        println!();
-    }
-
-    for result in results {
-        let mark = if selected == Some(result.slot.as_str()) {
-            "*"
-        } else {
-            "-"
-        };
-
-        println!(
-            "{mark} {:<18} {:<30} {:<18} score {:>5.1}%",
-            truncate(&result.slot, 18),
-            truncate(result.account_label.as_deref().unwrap_or("-"), 30),
-            result.status.as_str(),
-            result.score
-        );
-        print_window(
-            "5h",
-            result.five_hour_used_percent,
-            result.five_hour_refresh_at,
-        );
-        print_window(
-            "weekly",
-            result.weekly_used_percent,
-            result.weekly_refresh_at,
-        );
-        if result.five_hour_used_percent.is_none() && result.weekly_used_percent.is_none() {
-            println!("  note    {}", result.summary);
-        }
-        println!();
-    }
-    Ok(())
-}
-
-pub fn print_no_available(results: &[SlotResult]) {
-    eprintln!("cx: no available slots");
-    for result in results {
-        eprintln!(
-            "  {}: {}; {}",
-            result.slot,
-            result.status.as_str(),
-            result.summary
-        );
-    }
-}
-
 pub fn print_doctor(paths: &ManagerPaths, slots: &[String]) -> Result<()> {
     println!("manager: {}", paths.manager_dir.display());
     println!("slots: {}", paths.slots_dir.display());
@@ -206,6 +161,58 @@ pub fn print_doctor(paths: &ManagerPaths, slots: &[String]) -> Result<()> {
             "missing home"
         };
         println!("  {slot}: {status}");
+    }
+    Ok(())
+}
+
+pub fn print_targets(targets: &[String], json: bool) -> Result<()> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&TargetListReport { targets })?
+        );
+        return Ok(());
+    }
+    for target in targets {
+        println!("{target}");
+    }
+    Ok(())
+}
+
+pub fn print_target(target: &TargetSpec, json: bool) -> Result<()> {
+    let env_keys = target.env().keys().map(String::as_str).collect::<Vec<_>>();
+    let overrides = target
+        .overrides()
+        .iter()
+        .map(|line| redact_override(line))
+        .collect::<Vec<_>>();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&TargetReport {
+                name: target.name(),
+                slots: target.slots(),
+                overrides,
+                env_keys,
+            })?
+        );
+        return Ok(());
+    }
+
+    println!("target: {}", target.name());
+    if target.slots().is_empty() {
+        println!("slots: rotation.txt");
+    } else {
+        println!("slots: {}", target.slots().join(", "));
+    }
+    if !overrides.is_empty() {
+        println!("set:");
+        for line in overrides {
+            println!("  {line}");
+        }
+    }
+    if !env_keys.is_empty() {
+        println!("env: {}", env_keys.join(", "));
     }
     Ok(())
 }
@@ -526,6 +533,21 @@ fn format_percent(value: f64) -> String {
     format!("{:.2}%", value * 100.0)
 }
 
+fn redact_override(line: &str) -> String {
+    let Some((key, _value)) = line.split_once('=') else {
+        return line.to_string();
+    };
+    let key_lower = key.to_ascii_lowercase();
+    let sensitive = ["api_key", "credential", "password", "secret", "token"]
+        .iter()
+        .any(|needle| key_lower.contains(needle));
+    if sensitive {
+        format!("{}=<redacted>", key.trim())
+    } else {
+        line.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -696,5 +718,11 @@ mod tests {
             assert_eq!(usage["pricedTokens"], serde_json::json!(12_500));
             assert_eq!(usage["unpricedTokens"], serde_json::json!(0));
         }
+    }
+
+    #[test]
+    fn target_override_display_redacts_sensitive_values() {
+        assert_eq!(redact_override("api_key=\"sk-test\""), "api_key=<redacted>");
+        assert_eq!(redact_override("model=\"gpt-5.5\""), "model=\"gpt-5.5\"");
     }
 }

@@ -36,6 +36,8 @@ pub enum Command {
     Remove(RemoveArgs),
     /// Run `codex login` inside a slot.
     Login(LoginArgs),
+    /// Manage target-specific slot groups and overrides.
+    Target(TargetArgs),
     /// Validate the local profile-manager layout.
     Doctor(DoctorArgs),
     /// Install cx into ~/.local/bin.
@@ -57,6 +59,7 @@ pub enum CompletionShell {
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum CompleteKind {
     Slots,
+    Targets,
     Models,
 }
 
@@ -90,6 +93,10 @@ pub struct SlotQueryArgs {
     #[arg(long)]
     pub manager_dir: Option<PathBuf>,
 
+    /// Target config from targets/<name>.toml. Defaults to rotation.txt.
+    #[arg(long)]
+    pub target: Option<String>,
+
     /// Per-slot usage request timeout in seconds.
     #[arg(long, default_value_t = 2.0)]
     pub timeout: f32,
@@ -104,6 +111,9 @@ pub struct SlotQueryArgs {
 
 impl SlotQueryArgs {
     pub fn slots_or_rotation(&self, paths: &ManagerPaths) -> Result<Vec<String>> {
+        if let Some(target) = self.target.as_deref().filter(|_| self.slots.is_empty()) {
+            return crate::target::load_target(paths, target)?.slots_or_rotation(paths);
+        }
         if self.slots.is_empty() {
             crate::slot::load_rotation(paths)
         } else {
@@ -139,6 +149,10 @@ pub struct StatsArgs {
     /// Print JSON instead of a human table.
     #[arg(long)]
     pub json: bool,
+
+    /// Target config from targets/<name>.toml. Defaults to all known local usage.
+    #[arg(long)]
+    pub target: Option<String>,
 
     /// Break each period down by inferred slot/account.
     #[arg(long)]
@@ -193,6 +207,16 @@ mod tests {
         };
         assert_eq!(args.sort, StatusSort::Rotation);
         assert_eq!(args.query.slots, vec![String::from("bus1")]);
+    }
+
+    #[test]
+    fn status_accepts_target_filter() {
+        let cli = Cli::parse_from(["cx", "status", "--target", "work"]);
+
+        let Command::Status(args) = cli.command else {
+            panic!("expected status command");
+        };
+        assert_eq!(args.query.target, Some(String::from("work")));
     }
 }
 
@@ -252,6 +276,80 @@ pub struct LoginArgs {
     /// Extra args forwarded to `codex login`.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct TargetArgs {
+    #[command(subcommand)]
+    pub command: TargetCommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum TargetCommand {
+    /// List configured targets.
+    List(TargetListArgs),
+    /// Show one target config.
+    Show(TargetShowArgs),
+    /// Create or update a target config.
+    Add(TargetAddArgs),
+    /// Remove a target config.
+    Remove(TargetRemoveArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct TargetListArgs {
+    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
+    #[arg(long)]
+    pub manager_dir: Option<PathBuf>,
+
+    /// Print JSON instead of plain names.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct TargetShowArgs {
+    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
+    #[arg(long)]
+    pub manager_dir: Option<PathBuf>,
+
+    /// Print JSON instead of human output.
+    #[arg(long)]
+    pub json: bool,
+
+    /// Target name.
+    pub target: String,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct TargetAddArgs {
+    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
+    #[arg(long)]
+    pub manager_dir: Option<PathBuf>,
+
+    /// Target name.
+    pub target: String,
+
+    /// Target-specific Codex config override, passed after slot overrides.
+    #[arg(long = "set")]
+    pub sets: Vec<String>,
+
+    /// Target-specific environment variable, merged after slot env.conf.
+    #[arg(long = "env")]
+    pub envs: Vec<String>,
+
+    /// Slots used by this target. Defaults to rotation.txt when omitted.
+    pub slots: Vec<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct TargetRemoveArgs {
+    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
+    #[arg(long)]
+    pub manager_dir: Option<PathBuf>,
+
+    /// Target name.
+    pub target: String,
 }
 
 #[derive(Debug, Clone, Args)]

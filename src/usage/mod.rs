@@ -1,7 +1,4 @@
-use std::cmp::Ordering;
 use std::time::Duration;
-use std::time::SystemTime;
-use std::time::UNIX_EPOCH;
 
 use anyhow::Result;
 use reqwest::blocking::Client;
@@ -14,6 +11,13 @@ use serde_json::Value;
 use crate::auth;
 use crate::paths::ManagerPaths;
 use crate::slot;
+
+mod payload;
+mod score;
+
+pub(crate) use payload::format_refresh_in;
+pub use score::compare_for_selection;
+pub use score::sort_by_score_desc;
 
 const DEFAULT_CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 
@@ -132,7 +136,7 @@ impl UsageChecker {
         }
 
         let base_url = read_slot_base_url(&slot_dir, &slot_home)?;
-        let url = usage_url(&base_url);
+        let url = payload::usage_url(&base_url);
         let mut headers = HeaderMap::new();
         headers.insert("User-Agent", HeaderValue::from_static("codex-cli"));
         if let Some(token) = auth.access_token.as_deref() {
@@ -188,7 +192,7 @@ impl UsageChecker {
             )
             .with_account_label(account_label));
         };
-        Ok(result_from_payload(slot, index, &payload).with_account_label(account_label))
+        Ok(payload::result_from_payload(slot, index, &payload).with_account_label(account_label))
     }
 }
 
@@ -254,22 +258,6 @@ impl SlotStatus {
     }
 }
 
-pub fn sort_by_score_desc(results: &mut [SlotResult]) {
-    results.sort_by(compare_by_score_desc);
-}
-
-fn compare_by_score_desc(left: &SlotResult, right: &SlotResult) -> Ordering {
-    right
-        .score
-        .partial_cmp(&left.score)
-        .unwrap_or(Ordering::Equal)
-        .then_with(|| left.index.cmp(&right.index))
-}
-
-pub fn compare_for_selection(left: &SlotResult, right: &SlotResult) -> Ordering {
-    compare_by_score_desc(left, right)
-}
-
 fn read_slot_base_url(slot_dir: &std::path::Path, slot_home: &std::path::Path) -> Result<String> {
     let raw = slot::read_override_string(slot_dir, "chatgpt_base_url")?
         .or(slot::read_config_string(
@@ -277,175 +265,7 @@ fn read_slot_base_url(slot_dir: &std::path::Path, slot_home: &std::path::Path) -
             "chatgpt_base_url",
         )?)
         .unwrap_or_else(|| DEFAULT_CHATGPT_BASE_URL.to_string());
-    Ok(normalize_chatgpt_base_url(&raw))
-}
-
-fn normalize_chatgpt_base_url(raw_url: &str) -> String {
-    let mut base_url = raw_url.trim().trim_end_matches('/').to_string();
-    if (base_url.starts_with("https://chatgpt.com")
-        || base_url.starts_with("https://chat.openai.com"))
-        && !base_url.contains("/backend-api")
-    {
-        base_url.push_str("/backend-api");
-    }
-    base_url
-}
-
-fn usage_url(base_url: &str) -> String {
-    if base_url.contains("/backend-api") {
-        format!("{base_url}/wham/usage")
-    } else {
-        format!("{base_url}/api/codex/usage")
-    }
-}
-
-fn result_from_payload(slot: &str, index: usize, payload: &Value) -> SlotResult {
-    let rate_limit = payload.get("rate_limit").unwrap_or(&Value::Null);
-    let five_hour_window = rate_limit.get("primary_window").unwrap_or(&Value::Null);
-    let weekly_window = rate_limit.get("secondary_window").unwrap_or(&Value::Null);
-    let five_hour_used = used_percent(five_hour_window);
-    let weekly_used = used_percent(weekly_window);
-    let five_hour_reset_at = reset_at(five_hour_window);
-    let weekly_reset_at = reset_at(weekly_window);
-    let score = [five_hour_used, weekly_used]
-        .into_iter()
-        .flatten()
-        .map(|used| 100.0 - used)
-        .fold(100.0, f64::min);
-    let allowed = rate_limit
-        .get("allowed")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    let limit_reached = rate_limit
-        .get("limit_reached")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let reset_at = five_hour_reset_at.or(weekly_reset_at);
-    let plan_type = payload
-        .get("plan_type")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let reached_type = rate_limit_reached_type(payload);
-
-    let mut result = if allowed && !limit_reached {
-        SlotResult::new(
-            slot,
-            index,
-            SlotStatus::Available,
-            score,
-            summarize_window(
-                five_hour_used,
-                weekly_used,
-                five_hour_reset_at,
-                weekly_reset_at,
-                score,
-            ),
-        )
-    } else {
-        let reason = reached_type
-            .as_deref()
-            .unwrap_or("limit reached")
-            .to_string();
-        SlotResult::new(
-            slot,
-            index,
-            SlotStatus::Exhausted,
-            score,
-            format!(
-                "{reason}; {}",
-                summarize_window(
-                    five_hour_used,
-                    weekly_used,
-                    five_hour_reset_at,
-                    weekly_reset_at,
-                    score
-                )
-            ),
-        )
-    };
-    result.five_hour_used_percent = five_hour_used;
-    result.weekly_used_percent = weekly_used;
-    result.reset_at = reset_at;
-    result.five_hour_refresh_at = five_hour_reset_at;
-    result.weekly_refresh_at = weekly_reset_at;
-    result.plan_type = plan_type;
-    result.rate_limit_reached_type = reached_type;
-    result
-}
-
-fn used_percent(window: &Value) -> Option<f64> {
-    let value = window.get("used_percent")?.as_f64()?;
-    value.is_finite().then(|| value.clamp(0.0, 100.0))
-}
-
-fn reset_at(window: &Value) -> Option<i64> {
-    window.get("reset_at")?.as_i64()
-}
-
-fn rate_limit_reached_type(payload: &Value) -> Option<String> {
-    let value = payload.get("rate_limit_reached_type")?;
-    value
-        .get("type")
-        .and_then(Value::as_str)
-        .or_else(|| value.as_str())
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-}
-
-fn summarize_window(
-    five_hour: Option<f64>,
-    weekly: Option<f64>,
-    five_hour_reset_at: Option<i64>,
-    weekly_reset_at: Option<i64>,
-    score: f64,
-) -> String {
-    let mut parts = vec![format!("remaining {score:.1}%")];
-    if let Some(five_hour) = five_hour {
-        parts.push(window_summary("5h", five_hour, five_hour_reset_at));
-    }
-    if let Some(weekly) = weekly {
-        parts.push(window_summary("weekly", weekly, weekly_reset_at));
-    }
-    parts.join(", ")
-}
-
-fn window_summary(label: &str, used_percent: f64, refresh_at: Option<i64>) -> String {
-    let mut summary = format!("{label} used {used_percent:.1}%");
-    if let Some(refresh_at) = refresh_at.and_then(format_refresh_in) {
-        summary.push_str(&format!(" (refresh {refresh_at})"));
-    }
-    summary
-}
-
-pub(crate) fn format_refresh_in(refresh_at: i64) -> Option<String> {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs() as i64;
-    let seconds = refresh_at.saturating_sub(now);
-    if seconds <= 0 {
-        return Some("now".to_string());
-    }
-
-    let minutes = (seconds + 59) / 60;
-    if minutes < 60 {
-        return Some(format!("in {minutes}m"));
-    }
-
-    let hours = minutes / 60;
-    let remaining_minutes = minutes % 60;
-    if hours < 24 {
-        if remaining_minutes == 0 {
-            Some(format!("in {hours}h"))
-        } else {
-            Some(format!("in {hours}h {remaining_minutes}m"))
-        }
-    } else {
-        let days = hours / 24;
-        let remaining_hours = hours % 24;
-        if remaining_hours == 0 {
-            Some(format!("in {days}d"))
-        } else {
-            Some(format!("in {days}d {remaining_hours}h"))
-        }
-    }
+    Ok(payload::normalize_chatgpt_base_url(&raw))
 }
 
 #[cfg(test)]
@@ -466,7 +286,7 @@ mod tests {
             }
         });
 
-        let result = result_from_payload("primary", 0, &payload);
+        let result = payload::result_from_payload("primary", 0, &payload);
 
         assert_eq!(result.status, SlotStatus::Available);
         assert_eq!(result.score, 79.0);
@@ -497,7 +317,7 @@ mod tests {
             }
         });
 
-        let result = result_from_payload("bus3", 3, &payload);
+        let result = payload::result_from_payload("bus3", 3, &payload);
 
         assert_eq!(result.status, SlotStatus::Exhausted);
         assert_eq!(result.score, 0.0);
@@ -527,10 +347,10 @@ mod tests {
 
     #[test]
     fn chatgpt_url_uses_backend_usage_endpoint() {
-        let base_url = normalize_chatgpt_base_url("https://chatgpt.com");
+        let base_url = payload::normalize_chatgpt_base_url("https://chatgpt.com");
 
         assert_eq!(
-            usage_url(&base_url),
+            payload::usage_url(&base_url),
             "https://chatgpt.com/backend-api/wham/usage"
         );
     }

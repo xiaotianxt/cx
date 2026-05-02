@@ -14,6 +14,7 @@ use crate::cli::CompleteKind;
 use crate::cli::CompletionShell;
 use crate::paths::ManagerPaths;
 use crate::slot;
+use crate::target;
 
 const FISH_COMPLETIONS: &str = r#"# cx fish completions
 function __cx_complete_slots
@@ -24,8 +25,12 @@ function __cx_complete_models
     cx __complete models 2>/dev/null
 end
 
+function __cx_complete_targets
+    cx __complete targets 2>/dev/null
+end
+
 function __cx_no_subcommand
-    not __fish_seen_subcommand_from status stats select add remove login doctor install completions help
+    not __fish_seen_subcommand_from status stats select add remove login target doctor install completions help
 end
 
 complete -c cx -f
@@ -35,11 +40,13 @@ complete -c cx -n "__cx_no_subcommand" -a select -d "Print the best slot"
 complete -c cx -n "__cx_no_subcommand" -a add -d "Create or update a slot"
 complete -c cx -n "__cx_no_subcommand" -a remove -d "Remove a slot from rotation"
 complete -c cx -n "__cx_no_subcommand" -a login -d "Log into a slot"
+complete -c cx -n "__cx_no_subcommand" -a target -d "Manage target configs"
 complete -c cx -n "__cx_no_subcommand" -a doctor -d "Validate local layout"
 complete -c cx -n "__cx_no_subcommand" -a install -d "Install cx locally"
 complete -c cx -n "__cx_no_subcommand" -a completions -d "Generate shell completions"
 
 complete -c cx -s s -l slot -r -a "(__cx_complete_slots)" -d "Use a specific slot"
+complete -c cx -l target -r -a "(__cx_complete_targets)" -d "Use a target config"
 complete -c cx -l manager-dir -r -d "Profile-manager directory"
 complete -c cx -l codex-bin -r -d "Path to the real Codex binary"
 complete -c cx -l cx-quiet -d "Suppress cx slot banner"
@@ -47,6 +54,7 @@ complete -c cx -l cx-debug -d "Print slot selection details"
 complete -c cx -s m -r -a "(__cx_complete_models)" -d "Codex model"
 
 complete -c cx -n "__fish_seen_subcommand_from status" -l sort -r -a "score rotation" -d "Sort status output"
+complete -c cx -n "__fish_seen_subcommand_from status select stats" -l target -r -a "(__cx_complete_targets)" -d "Use a target config"
 complete -c cx -n "__fish_seen_subcommand_from status select stats login remove" -a "(__cx_complete_slots)"
 complete -c cx -n "__fish_seen_subcommand_from stats" -l by-slot -d "Break down usage by slot"
 complete -c cx -n "__fish_seen_subcommand_from stats" -l price -d "Include price estimates"
@@ -55,6 +63,10 @@ complete -c cx -n "__fish_seen_subcommand_from stats" -l refresh-prices -d "Refr
 complete -c cx -n "__fish_seen_subcommand_from stats" -l price-url -r -d "Pricing page URL"
 complete -c cx -n "__fish_seen_subcommand_from stats" -l json -d "Print JSON"
 complete -c cx -n "__fish_seen_subcommand_from stats" -l calibrate -d "Calibrate token mix"
+complete -c cx -n "__fish_seen_subcommand_from target" -a "list show add remove"
+complete -c cx -n "__fish_seen_subcommand_from target" -l json -d "Print JSON"
+complete -c cx -n "__fish_seen_subcommand_from target" -l set -r -d "Target Codex config override"
+complete -c cx -n "__fish_seen_subcommand_from target" -l env -r -d "Target environment variable"
 complete -c cx -n "__fish_seen_subcommand_from completions" -a "fish zsh bash"
 "#;
 
@@ -78,6 +90,15 @@ _cx_models() {
   _describe 'models' candidates
 }
 
+_cx_targets() {
+  local -a candidates
+  local value description
+  while IFS=$'\t' read -r value description; do
+    [[ -n "$value" ]] && candidates+=("${value}:${description}")
+  done < <(cx __complete targets 2>/dev/null)
+  _describe 'targets' candidates
+}
+
 _cx() {
   local curcontext="$curcontext" state
   typeset -A opt_args
@@ -89,6 +110,7 @@ _cx() {
     'add:create or update a slot'
     'remove:remove a slot from rotation'
     'login:log into a slot'
+    'target:manage target configs'
     'doctor:validate local layout'
     'install:install cx locally'
     'completions:generate shell completions'
@@ -97,6 +119,7 @@ _cx() {
   _arguments -C \
     '(-h --help)'{-h,--help}'[Print help]' \
     '(-s --slot)'{-s,--slot}'[Use a specific slot]:slot:_cx_slots' \
+    '--target[Use a target config]:target:_cx_targets' \
     '--manager-dir[Profile-manager directory]:directory:_files -/' \
     '--codex-bin[Path to the real Codex binary]:file:_files' \
     '--cx-quiet[Suppress cx slot banner]' \
@@ -114,6 +137,8 @@ _cx() {
         status)
           if [[ "${words[CURRENT-1]}" == "--sort" ]]; then
             _values 'sort' score rotation
+          elif [[ "${words[CURRENT-1]}" == "--target" ]]; then
+            _cx_targets
           else
             _cx_slots
           fi
@@ -128,10 +153,14 @@ _cx() {
               '--price-url[Pricing page URL]' \
               '--json[Print JSON]' \
               '--calibrate[Calibrate token mix]' \
+              '--target[Use a target config]' \
               '--manager-dir[Profile-manager directory]'
           else
             _cx_slots
           fi
+          ;;
+        target)
+          _values 'target command' list show add remove
           ;;
         select|login|remove)
           _cx_slots
@@ -186,6 +215,10 @@ _cx() {
       mapfile -t COMPREPLY < <(compgen -W "$(__cx_complete_words slots)" -- "$cur")
       return 0
       ;;
+    --target)
+      mapfile -t COMPREPLY < <(compgen -W "$(__cx_complete_words targets)" -- "$cur")
+      return 0
+      ;;
     -m)
       mapfile -t COMPREPLY < <(compgen -W "$(__cx_complete_words models)" -- "$cur")
       return 0
@@ -198,9 +231,9 @@ _cx() {
 
   if [[ -z "$subcommand" ]]; then
     if [[ "$cur" == -* ]]; then
-      mapfile -t COMPREPLY < <(compgen -W "--slot -s --manager-dir --codex-bin --cx-quiet --cx-debug -m --help -h" -- "$cur")
+      mapfile -t COMPREPLY < <(compgen -W "--slot -s --target --manager-dir --codex-bin --cx-quiet --cx-debug -m --help -h" -- "$cur")
     else
-      mapfile -t COMPREPLY < <(compgen -W "status stats select add remove login doctor install completions" -- "$cur")
+      mapfile -t COMPREPLY < <(compgen -W "status stats select add remove login target doctor install completions" -- "$cur")
     fi
     return 0
   fi
@@ -208,17 +241,20 @@ _cx() {
   case "$subcommand" in
     status)
       if [[ "$cur" == -* ]]; then
-        mapfile -t COMPREPLY < <(compgen -W "--sort --manager-dir --timeout --json --help -h" -- "$cur")
+        mapfile -t COMPREPLY < <(compgen -W "--sort --target --manager-dir --timeout --json --help -h" -- "$cur")
       else
         mapfile -t COMPREPLY < <(compgen -W "$(__cx_complete_words slots)" -- "$cur")
       fi
       ;;
     stats)
       if [[ "$cur" == -* ]]; then
-        mapfile -t COMPREPLY < <(compgen -W "--by-slot --price --no-price --refresh-prices --price-url --manager-dir --json --calibrate --help -h" -- "$cur")
+        mapfile -t COMPREPLY < <(compgen -W "--by-slot --price --no-price --refresh-prices --price-url --target --manager-dir --json --calibrate --help -h" -- "$cur")
       else
         mapfile -t COMPREPLY < <(compgen -W "$(__cx_complete_words slots)" -- "$cur")
       fi
+      ;;
+    target)
+      mapfile -t COMPREPLY < <(compgen -W "list show add remove --json --manager-dir --set --env --help -h" -- "$cur")
       ;;
     select|login|remove)
       mapfile -t COMPREPLY < <(compgen -W "$(__cx_complete_words slots)" -- "$cur")
@@ -254,6 +290,7 @@ pub fn print_candidates(kind: CompleteKind, manager_dir: Option<PathBuf>) -> Res
     let paths = ManagerPaths::new(manager_dir)?;
     let candidates = match kind {
         CompleteKind::Slots => slot_candidates(&paths)?,
+        CompleteKind::Targets => target_candidates(&paths)?,
         CompleteKind::Models => model_candidates(&paths.base_codex_home.join("models_cache.json"))?,
     };
 
@@ -307,6 +344,16 @@ fn slot_candidates(paths: &ManagerPaths) -> Result<Vec<Candidate>> {
     Ok(candidates
         .into_iter()
         .map(|(value, description)| Candidate { value, description })
+        .collect())
+}
+
+fn target_candidates(paths: &ManagerPaths) -> Result<Vec<Candidate>> {
+    Ok(target::list_targets(paths)?
+        .into_iter()
+        .map(|value| Candidate {
+            value,
+            description: "target config".to_string(),
+        })
         .collect())
 }
 
@@ -373,6 +420,7 @@ mod tests {
             base_codex_home: root.join("codex"),
             manager_dir: root.join("profile-manager"),
             slots_dir: root.join("profile-manager/slots"),
+            targets_dir: root.join("profile-manager/targets"),
             rotation_file: root.join("profile-manager/rotation.txt"),
         }
     }

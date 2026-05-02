@@ -11,6 +11,7 @@ cx 是一个本地 Codex 入口：负责启动 Codex、处理 stdin pipe、管�
 - `cx status`：并发查看所有 slot 的真实用量。
 - `cx stats`：从本地 `state_5.sqlite` 汇总 Codex token 消耗。
 - `cx add` / `cx login` / `cx remove`：管理独立 slot。
+- `cx --target <name>`：使用命名 target 的 slot 组和覆盖策略启动 Codex。
 - `cx completions`：生成 shell completion，支持动态补全 slot 和 model。
 
 ## 工作方式
@@ -20,6 +21,8 @@ cx 是一个本地 Codex 入口：负责启动 Codex、处理 stdin pipe、管�
 ```text
 ~/.codex/profile-manager/
   rotation.txt
+  targets/
+    research.toml
   slots/
     primary/
       home/
@@ -92,6 +95,7 @@ make install-local
 cx
 cx -m gpt-5.4
 cx --slot bus1 -m gpt-5.4
+cx --target research -m gpt-5.5
 ```
 
 stdin pipe：
@@ -105,6 +109,7 @@ git diff | cx "review 这个改动"
 
 ```bash
 cx status
+cx status --target research
 cx status --sort rotation
 cx status --json
 ```
@@ -113,12 +118,14 @@ cx status --json
 
 ```bash
 cx select
+cx select --target research
 ```
 
 查看本地 token 消耗：
 
 ```bash
 cx stats
+cx stats --target research
 cx stats --by-slot
 cx stats bus3
 cx stats --price
@@ -176,6 +183,31 @@ cx add deepseek --rotate \
   --env DEEPSEEK_API_KEY=sk-...
 ```
 
+新增 target-specific 配置：
+
+```bash
+cx target add research bus1 bus2 \
+  --set 'model="gpt-5.5"' \
+  --env CX_EXPERIMENT=research
+cx target list
+cx target show research
+```
+
+target 文件位于 `~/.codex/profile-manager/targets/<name>.toml`：
+
+```toml
+slots = ["bus1", "bus2"]
+set = ['model="gpt-5.5"']
+
+[env]
+CX_EXPERIMENT = "research"
+```
+
+如果 target 没有配置 `slots`，cx 会使用 `rotation.txt`。target 的 `set` 会排在 slot
+`overrides.conf` 后面，target env 会排在 slot `env.conf` 后面，因此 target 策略会覆盖
+slot 默认值。`cx target show` 只显示环境变量名，不打印值，并会对看起来敏感的 override
+值做脱敏。
+
 如果参数和 cx 子命令冲突，用 `--` 强制进入 Codex：
 
 ```bash
@@ -191,7 +223,7 @@ cx completions bash > ~/.local/share/bash-completion/completions/cx
 ```
 
 release formula 会为 Homebrew 用户自动安装这些 completions。
-生成的脚本会补全 cx 命令、launcher flags、本地 slot 名和本地缓存的 Codex model 名。
+生成的脚本会补全 cx 命令、launcher flags、本地 slot 名、target 名和本地缓存的 Codex model 名。
 动态候选只读本地文件，不会调用在线用量接口。
 
 ## 配置文件
@@ -209,7 +241,7 @@ model="deepseek-v4-pro"
 export DEEPSEEK_API_KEY="sk-..."
 ```
 
-这些文件可能包含敏感信息，不要提交。
+这些文件和 target 文件可能包含敏感信息，不要提交真实 secret。
 
 ## 环境变量
 

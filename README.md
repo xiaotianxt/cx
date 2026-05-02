@@ -15,6 +15,8 @@ live usage.
 - `cx stats`: summarize local Codex token usage from `state_5.sqlite`.
 - `cx add` / `cx login` / `cx remove`: manage isolated Codex slots.
 - `cx select`: print the best slot name for scripts.
+- `cx --target <name>`: launch through a named target-specific slot group and
+  override set.
 - `cx completions`: generate shell completion scripts with dynamic slot/model
   candidates.
 
@@ -29,6 +31,8 @@ Each slot is an isolated `CODEX_HOME`:
 ```text
 ~/.codex/profile-manager/
   rotation.txt
+  targets/
+    research.toml
   slots/
     primary/
       home/
@@ -108,6 +112,7 @@ Launch Codex through the best available slot:
 cx
 cx -m gpt-5.4
 cx --slot bus1 -m gpt-5.4
+cx --target research -m gpt-5.5
 ```
 
 Pipe context into Codex:
@@ -121,15 +126,18 @@ Inspect usage:
 
 ```bash
 cx status
+cx status --target research
 cx status --sort rotation
 cx status --json
 cx select
+cx select --target research
 ```
 
 Inspect local token consumption:
 
 ```bash
 cx stats
+cx stats --target research
 cx stats --by-slot
 cx stats bus3
 cx stats --price
@@ -190,6 +198,32 @@ cx add deepseek --rotate \
   --env DEEPSEEK_API_KEY=sk-...
 ```
 
+Create a target-specific config:
+
+```bash
+cx target add research bus1 bus2 \
+  --set 'model="gpt-5.5"' \
+  --env CX_EXPERIMENT=research
+cx target list
+cx target show research
+```
+
+Targets live in `~/.codex/profile-manager/targets/<name>.toml`:
+
+```toml
+slots = ["bus1", "bus2"]
+set = ['model="gpt-5.5"']
+
+[env]
+CX_EXPERIMENT = "research"
+```
+
+When a target has no `slots`, cx uses `rotation.txt`. Target `set` overrides
+are passed after slot `overrides.conf`, and target env values are merged after
+slot `env.conf`, so target policy wins over slot defaults. `cx target show`
+prints env variable names rather than values and redacts sensitive-looking
+override values.
+
 If a Codex prompt or argument conflicts with a cx management command, use `--`
 to force launcher mode:
 
@@ -207,8 +241,8 @@ cx completions bash > ~/.local/share/bash-completion/completions/cx
 
 The release formula installs these completions automatically for Homebrew users.
 The generated scripts complete cx commands, launcher flags, local slot names, and
-cached Codex model names. Dynamic candidates come from local files only; tab
-completion does not call the live usage endpoint.
+target names, and cached Codex model names. Dynamic candidates come from local
+files only; tab completion does not call the live usage endpoint.
 
 ## Slot Files
 
@@ -226,7 +260,7 @@ export DEEPSEEK_API_KEY="sk-..."
 ```
 
 These files may contain credentials. Do not commit slot directories,
-`auth.json`, or real `env.conf` values.
+target files with secret env values, `auth.json`, or real `env.conf` values.
 
 ## Environment Variables
 

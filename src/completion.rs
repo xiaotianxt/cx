@@ -11,6 +11,7 @@ use anyhow::Result;
 use clap::Arg;
 use clap::Command;
 use clap::CommandFactory;
+use clap::ValueHint;
 use serde_json::Value;
 
 use crate::cli::Cli;
@@ -495,12 +496,12 @@ fn value_candidates_for_arg(
     if !option_takes_value(arg) {
         return Ok(None);
     }
+    if let Some(completion) = value_hint_completion(arg.get_value_hint()) {
+        return value_candidates(completion, prefix, paths).map(Some);
+    }
     if let Some(long) = arg.get_long() {
         let completion = match long {
             "target" => Some(ValueCompletion::Dynamic(DynamicKind::Targets)),
-            "manager-dir" => Some(ValueCompletion::Path(PathKind::Directories)),
-            "codex-bin" => Some(ValueCompletion::Path(PathKind::Files)),
-            "bin-dir" => Some(ValueCompletion::Path(PathKind::Directories)),
             _ => None,
         };
         if let Some(completion) = completion {
@@ -512,6 +513,14 @@ fn value_candidates_for_arg(
         Ok(None)
     } else {
         Ok(Some(filter_candidates(possible_values, prefix)))
+    }
+}
+
+fn value_hint_completion(value_hint: ValueHint) -> Option<ValueCompletion> {
+    match value_hint {
+        ValueHint::FilePath => Some(ValueCompletion::Path(PathKind::Files)),
+        ValueHint::DirPath => Some(ValueCompletion::Path(PathKind::Directories)),
+        _ => None,
     }
 }
 
@@ -919,6 +928,15 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&paths.manager_dir);
+    }
+
+    #[test]
+    fn clap_command_carries_path_completion_metadata() {
+        let root = Cli::command();
+        let status = visible_subcommand(&root, "status").unwrap();
+        let manager_dir = long_arg_from_word(status, "--manager-dir").unwrap();
+
+        assert_eq!(manager_dir.get_value_hint(), ValueHint::DirPath);
     }
 
     #[test]

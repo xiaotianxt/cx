@@ -84,7 +84,7 @@ pub struct CompleteArgs {
     pub kind: CompleteKind,
 
     /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
-    #[arg(long)]
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
     pub manager_dir: Option<PathBuf>,
 
     /// Shell requesting word completion.
@@ -107,7 +107,7 @@ pub struct CompleteArgs {
 #[derive(Debug, Clone, Args)]
 pub struct SlotQueryArgs {
     /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
-    #[arg(long)]
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
     pub manager_dir: Option<PathBuf>,
 
     /// Target config from targets/<name>.toml. Defaults to rotation.txt.
@@ -160,7 +160,7 @@ pub type SelectArgs = SlotQueryArgs;
 #[derive(Debug, Clone, Args)]
 pub struct StatsArgs {
     /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
-    #[arg(long)]
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
     pub manager_dir: Option<PathBuf>,
 
     /// Print JSON instead of a human table.
@@ -192,7 +192,7 @@ pub struct StatsArgs {
     pub calibrate: bool,
 
     /// Include price estimates from this pricing page.
-    #[arg(long)]
+    #[arg(long, value_hint = clap::ValueHint::Url)]
     pub price_url: Option<String>,
 
     /// Slot names to filter. Defaults to all known local Codex usage.
@@ -240,7 +240,7 @@ mod tests {
 #[derive(Debug, Clone, Args)]
 pub struct AddArgs {
     /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
-    #[arg(long)]
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
     pub manager_dir: Option<PathBuf>,
 
     /// Slot name to create or update.
@@ -266,7 +266,7 @@ pub struct AddArgs {
 #[derive(Debug, Clone, Args)]
 pub struct RemoveArgs {
     /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
-    #[arg(long)]
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
     pub manager_dir: Option<PathBuf>,
 
     /// Slot name to remove.
@@ -280,11 +280,11 @@ pub struct RemoveArgs {
 #[derive(Debug, Clone, Args)]
 pub struct LoginArgs {
     /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
-    #[arg(long)]
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
     pub manager_dir: Option<PathBuf>,
 
     /// Path to the real Codex binary.
-    #[arg(long)]
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
     pub codex_bin: Option<PathBuf>,
 
     /// Slot name to log into.
@@ -316,7 +316,7 @@ pub enum TargetCommand {
 #[derive(Debug, Clone, Args)]
 pub struct TargetListArgs {
     /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
-    #[arg(long)]
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
     pub manager_dir: Option<PathBuf>,
 
     /// Print JSON instead of plain names.
@@ -327,7 +327,7 @@ pub struct TargetListArgs {
 #[derive(Debug, Clone, Args)]
 pub struct TargetShowArgs {
     /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
-    #[arg(long)]
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
     pub manager_dir: Option<PathBuf>,
 
     /// Print JSON instead of human output.
@@ -341,7 +341,7 @@ pub struct TargetShowArgs {
 #[derive(Debug, Clone, Args)]
 pub struct TargetAddArgs {
     /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
-    #[arg(long)]
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
     pub manager_dir: Option<PathBuf>,
 
     /// Target name.
@@ -362,7 +362,7 @@ pub struct TargetAddArgs {
 #[derive(Debug, Clone, Args)]
 pub struct TargetRemoveArgs {
     /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
-    #[arg(long)]
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
     pub manager_dir: Option<PathBuf>,
 
     /// Target name.
@@ -372,7 +372,7 @@ pub struct TargetRemoveArgs {
 #[derive(Debug, Clone, Args)]
 pub struct DoctorArgs {
     /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
-    #[arg(long)]
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
     pub manager_dir: Option<PathBuf>,
 
     /// Also query the live usage endpoint.
@@ -387,7 +387,7 @@ pub struct DoctorArgs {
 #[derive(Debug, Clone, Args)]
 pub struct InstallArgs {
     /// Directory to install cx into.
-    #[arg(long)]
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
     pub bin_dir: Option<PathBuf>,
 
     /// Replace an existing cx binary.

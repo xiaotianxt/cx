@@ -29,7 +29,7 @@ jobs:
           cd archive
           tar czf ../cx-${{ github.ref_name }}-darwin-arm64.tar.gz cx
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: cx-${{ github.ref_name }}-darwin-arm64
           path: cx-${{ github.ref_name }}-darwin-arm64.tar.gz

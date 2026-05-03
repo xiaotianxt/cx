@@ -17,6 +17,7 @@ use std::process::ExitCode;
 
 use anyhow::Context;
 use anyhow::Result;
+use clap::CommandFactory;
 use clap::Parser;
 use cli::Cli;
 use cli::Command;
@@ -39,25 +40,7 @@ fn entry() -> Result<()> {
     if first_arg == Some("--") {
         return cx::run_from_args(raw_args.into_iter().skip(2).collect());
     }
-    if !matches!(
-        first_arg,
-        Some(
-            "status"
-                | "stats"
-                | "select"
-                | "add"
-                | "remove"
-                | "login"
-                | "target"
-                | "doctor"
-                | "install"
-                | "completions"
-                | "__complete"
-                | "help"
-                | "-h"
-                | "--help"
-        )
-    ) {
+    if !is_management_entry_arg(first_arg) {
         return cx::run_from_args(raw_args.into_iter().skip(1).collect());
     }
 
@@ -166,8 +149,34 @@ fn entry() -> Result<()> {
             completion::print_script(args.shell)?;
         }
         Command::Complete(args) => {
-            completion::print_candidates(args.kind, args.manager_dir)?;
+            completion::print_candidates(args)?;
         }
     }
     Ok(())
+}
+
+fn is_management_entry_arg(first_arg: Option<&str>) -> bool {
+    let Some(first_arg) = first_arg else {
+        return false;
+    };
+    if matches!(first_arg, "help" | "-h" | "--help") {
+        return true;
+    }
+    Cli::command()
+        .get_subcommands()
+        .any(|command| command.get_name() == first_arg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn management_entry_args_come_from_clap_subcommands() {
+        assert!(is_management_entry_arg(Some("status")));
+        assert!(is_management_entry_arg(Some("__complete")));
+        assert!(is_management_entry_arg(Some("--help")));
+        assert!(!is_management_entry_arg(Some("prompt")));
+        assert!(!is_management_entry_arg(None));
+    }
 }

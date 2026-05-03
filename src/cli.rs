@@ -61,6 +61,7 @@ pub enum CompleteKind {
     Slots,
     Targets,
     Models,
+    Words,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -85,6 +86,22 @@ pub struct CompleteArgs {
     /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
     #[arg(long)]
     pub manager_dir: Option<PathBuf>,
+
+    /// Shell requesting word completion.
+    #[arg(long, value_enum)]
+    pub shell: Option<CompletionShell>,
+
+    /// Active word index reported by the shell.
+    #[arg(long)]
+    pub cursor: Option<usize>,
+
+    /// Active token prefix reported by the shell.
+    #[arg(long, allow_hyphen_values = true)]
+    pub current: Option<String>,
+
+    /// Full shell words for runtime completion.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub words: Vec<String>,
 }
 
 #[derive(Debug, Clone, Args)]

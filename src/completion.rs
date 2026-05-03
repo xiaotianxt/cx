@@ -8,8 +8,13 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use anyhow::Result;
+use clap::Arg;
+use clap::Command;
+use clap::CommandFactory;
 use serde_json::Value;
 
+use crate::cli::Cli;
+use crate::cli::CompleteArgs;
 use crate::cli::CompleteKind;
 use crate::cli::CompletionShell;
 use crate::paths::ManagerPaths;
@@ -17,252 +22,37 @@ use crate::slot;
 use crate::target;
 
 const FISH_COMPLETIONS: &str = r#"# cx fish completions
-function __cx_complete_slots
-    cx __complete slots 2>/dev/null
+function __cx_complete
+    set -l current (commandline -ct)
+    set -l words (commandline -opc)
+    cx __complete words --shell fish "--current=$current" -- $words 2>/dev/null
 end
 
-function __cx_complete_models
-    cx __complete models 2>/dev/null
-end
-
-function __cx_complete_targets
-    cx __complete targets 2>/dev/null
-end
-
-function __cx_no_subcommand
-    not __fish_seen_subcommand_from status stats select add remove login target doctor install completions help
-end
-
-complete -c cx -f
-complete -c cx -n "__cx_no_subcommand" -a status -d "Query slot availability"
-complete -c cx -n "__cx_no_subcommand" -a stats -d "Show local token usage"
-complete -c cx -n "__cx_no_subcommand" -a select -d "Print the best slot"
-complete -c cx -n "__cx_no_subcommand" -a add -d "Create or update a slot"
-complete -c cx -n "__cx_no_subcommand" -a remove -d "Remove a slot from rotation"
-complete -c cx -n "__cx_no_subcommand" -a login -d "Log into a slot"
-complete -c cx -n "__cx_no_subcommand" -a target -d "Manage target configs"
-complete -c cx -n "__cx_no_subcommand" -a doctor -d "Validate local layout"
-complete -c cx -n "__cx_no_subcommand" -a install -d "Install cx locally"
-complete -c cx -n "__cx_no_subcommand" -a completions -d "Generate shell completions"
-
-complete -c cx -s s -l slot -r -a "(__cx_complete_slots)" -d "Use a specific slot"
-complete -c cx -l target -r -a "(__cx_complete_targets)" -d "Use a target config"
-complete -c cx -l manager-dir -r -d "Profile-manager directory"
-complete -c cx -l codex-bin -r -d "Path to the real Codex binary"
-complete -c cx -l cx-quiet -d "Suppress cx slot banner"
-complete -c cx -l cx-debug -d "Print slot selection details"
-complete -c cx -s m -r -a "(__cx_complete_models)" -d "Codex model"
-
-complete -c cx -n "__fish_seen_subcommand_from status" -l sort -r -a "score rotation" -d "Sort status output"
-complete -c cx -n "__fish_seen_subcommand_from status select stats" -l target -r -a "(__cx_complete_targets)" -d "Use a target config"
-complete -c cx -n "__fish_seen_subcommand_from status select stats login remove" -a "(__cx_complete_slots)"
-complete -c cx -n "__fish_seen_subcommand_from stats" -l by-slot -d "Break down usage by slot"
-complete -c cx -n "__fish_seen_subcommand_from stats" -l price -d "Include price estimates"
-complete -c cx -n "__fish_seen_subcommand_from stats" -l no-price -d "Skip price estimates"
-complete -c cx -n "__fish_seen_subcommand_from stats" -l refresh-prices -d "Refresh cached pricing"
-complete -c cx -n "__fish_seen_subcommand_from stats" -l price-url -r -d "Pricing page URL"
-complete -c cx -n "__fish_seen_subcommand_from stats" -l json -d "Print JSON"
-complete -c cx -n "__fish_seen_subcommand_from stats" -l calibrate -d "Calibrate token mix"
-complete -c cx -n "__fish_seen_subcommand_from target" -a "list show add remove"
-complete -c cx -n "__fish_seen_subcommand_from target" -l json -d "Print JSON"
-complete -c cx -n "__fish_seen_subcommand_from target" -l set -r -d "Target Codex config override"
-complete -c cx -n "__fish_seen_subcommand_from target" -l env -r -d "Target environment variable"
-complete -c cx -n "__fish_seen_subcommand_from completions" -a "fish zsh bash"
+complete -c cx -f -a "(__cx_complete)"
 "#;
 
 const ZSH_COMPLETIONS: &str = r#"#compdef cx
 
-_cx_slots() {
-  local -a candidates
-  local value description
-  while IFS=$'\t' read -r value description; do
-    [[ -n "$value" ]] && candidates+=("${value}:${description}")
-  done < <(cx __complete slots 2>/dev/null)
-  _describe 'slots' candidates
-}
-
-_cx_models() {
-  local -a candidates
-  local value description
-  while IFS=$'\t' read -r value description; do
-    [[ -n "$value" ]] && candidates+=("${value}:${description}")
-  done < <(cx __complete models 2>/dev/null)
-  _describe 'models' candidates
-}
-
-_cx_targets() {
-  local -a candidates
-  local value description
-  while IFS=$'\t' read -r value description; do
-    [[ -n "$value" ]] && candidates+=("${value}:${description}")
-  done < <(cx __complete targets 2>/dev/null)
-  _describe 'targets' candidates
-}
-
 _cx() {
-  local curcontext="$curcontext" state
-  typeset -A opt_args
-  local -a commands
-  commands=(
-    'status:query slot availability'
-    'stats:show local token usage'
-    'select:print the best slot'
-    'add:create or update a slot'
-    'remove:remove a slot from rotation'
-    'login:log into a slot'
-    'target:manage target configs'
-    'doctor:validate local layout'
-    'install:install cx locally'
-    'completions:generate shell completions'
-  )
-
-  _arguments -C \
-    '(-h --help)'{-h,--help}'[Print help]' \
-    '(-s --slot)'{-s,--slot}'[Use a specific slot]:slot:_cx_slots' \
-    '--target[Use a target config]:target:_cx_targets' \
-    '--manager-dir[Profile-manager directory]:directory:_files -/' \
-    '--codex-bin[Path to the real Codex binary]:file:_files' \
-    '--cx-quiet[Suppress cx slot banner]' \
-    '--cx-debug[Print slot selection details]' \
-    '-m[Codex model]:model:_cx_models' \
-    '1:command:->command' \
-    '*::arg:->arg'
-
-  case "$state" in
-    command)
-      _describe -t commands 'cx command' commands
-      ;;
-    arg)
-      case "${words[1]}" in
-        status)
-          if [[ "${words[CURRENT-1]}" == "--sort" ]]; then
-            _values 'sort' score rotation
-          elif [[ "${words[CURRENT-1]}" == "--target" ]]; then
-            _cx_targets
-          else
-            _cx_slots
-          fi
-          ;;
-        stats)
-          if [[ "${words[CURRENT]}" == -* ]]; then
-            _values 'stats options' \
-              '--by-slot[Break down usage by slot]' \
-              '--price[Include price estimates]' \
-              '--no-price[Skip price estimates]' \
-              '--refresh-prices[Refresh cached pricing]' \
-              '--price-url[Pricing page URL]' \
-              '--json[Print JSON]' \
-              '--calibrate[Calibrate token mix]' \
-              '--target[Use a target config]' \
-              '--manager-dir[Profile-manager directory]'
-          else
-            _cx_slots
-          fi
-          ;;
-        target)
-          _values 'target command' list show add remove
-          ;;
-        select|login|remove)
-          _cx_slots
-          ;;
-        completions)
-          _values 'shell' fish zsh bash
-          ;;
-        *)
-          _normal
-          ;;
-      esac
-      ;;
-  esac
+  local -a candidates
+  local value description
+  while IFS=$'\t' read -r value description; do
+    [[ -n "$value" ]] && candidates+=("${value}:${description}")
+  done < <(cx __complete words --shell zsh --cursor "$CURRENT" "--current=${words[CURRENT]}" -- "${words[@]}" 2>/dev/null)
+  _describe -t values 'cx completions' candidates
 }
 
 _cx "$@"
 "#;
 
 const BASH_COMPLETIONS: &str = r#"# cx bash completions
-__cx_complete_words() {
-  local kind="$1"
-  cx __complete "$kind" 2>/dev/null | while IFS=$'\t' read -r value _description; do
-    [[ -n "$value" ]] && printf '%s\n' "$value"
-  done
-}
-
 _cx() {
-  local cur prev subcommand word
+  local cur value description
   COMPREPLY=()
   cur="${COMP_WORDS[COMP_CWORD]}"
-  prev="${COMP_WORDS[COMP_CWORD-1]}"
-
-  for word in "${COMP_WORDS[@]:1:$COMP_CWORD-1}"; do
-    case "$word" in
-      -*)
-        ;;
-      *)
-        subcommand="$word"
-        break
-        ;;
-    esac
-  done
-
-  case "$prev" in
-    --sort)
-      if [[ "$subcommand" == "status" ]]; then
-        mapfile -t COMPREPLY < <(compgen -W "score rotation" -- "$cur")
-        return 0
-      fi
-      ;;
-    --slot|-s)
-      mapfile -t COMPREPLY < <(compgen -W "$(__cx_complete_words slots)" -- "$cur")
-      return 0
-      ;;
-    --target)
-      mapfile -t COMPREPLY < <(compgen -W "$(__cx_complete_words targets)" -- "$cur")
-      return 0
-      ;;
-    -m)
-      mapfile -t COMPREPLY < <(compgen -W "$(__cx_complete_words models)" -- "$cur")
-      return 0
-      ;;
-    completions)
-      mapfile -t COMPREPLY < <(compgen -W "fish zsh bash" -- "$cur")
-      return 0
-      ;;
-  esac
-
-  if [[ -z "$subcommand" ]]; then
-    if [[ "$cur" == -* ]]; then
-      mapfile -t COMPREPLY < <(compgen -W "--slot -s --target --manager-dir --codex-bin --cx-quiet --cx-debug -m --help -h" -- "$cur")
-    else
-      mapfile -t COMPREPLY < <(compgen -W "status stats select add remove login target doctor install completions" -- "$cur")
-    fi
-    return 0
-  fi
-
-  case "$subcommand" in
-    status)
-      if [[ "$cur" == -* ]]; then
-        mapfile -t COMPREPLY < <(compgen -W "--sort --target --manager-dir --timeout --json --help -h" -- "$cur")
-      else
-        mapfile -t COMPREPLY < <(compgen -W "$(__cx_complete_words slots)" -- "$cur")
-      fi
-      ;;
-    stats)
-      if [[ "$cur" == -* ]]; then
-        mapfile -t COMPREPLY < <(compgen -W "--by-slot --price --no-price --refresh-prices --price-url --target --manager-dir --json --calibrate --help -h" -- "$cur")
-      else
-        mapfile -t COMPREPLY < <(compgen -W "$(__cx_complete_words slots)" -- "$cur")
-      fi
-      ;;
-    target)
-      mapfile -t COMPREPLY < <(compgen -W "list show add remove --json --manager-dir --set --env --help -h" -- "$cur")
-      ;;
-    select|login|remove)
-      mapfile -t COMPREPLY < <(compgen -W "$(__cx_complete_words slots)" -- "$cur")
-      ;;
-    completions)
-      mapfile -t COMPREPLY < <(compgen -W "fish zsh bash" -- "$cur")
-      ;;
-  esac
+  while IFS=$'\t' read -r value description; do
+    [[ -n "$value" ]] && COMPREPLY+=("$value")
+  done < <(cx __complete words --shell bash --cursor "$COMP_CWORD" "--current=$cur" -- "${COMP_WORDS[@]}" 2>/dev/null)
 }
 
 complete -F _cx cx
@@ -273,6 +63,84 @@ struct Candidate {
     value: String,
     description: String,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DynamicKind {
+    Slots,
+    Targets,
+    Models,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathKind {
+    Files,
+    Directories,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValueCompletion {
+    Dynamic(DynamicKind),
+    Path(PathKind),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LauncherOption {
+    long: Option<&'static str>,
+    short: Option<char>,
+    description: &'static str,
+    value: Option<ValueCompletion>,
+}
+
+const LAUNCHER_OPTIONS: &[LauncherOption] = &[
+    LauncherOption {
+        long: Some("slot"),
+        short: Some('s'),
+        description: "Use a specific slot",
+        value: Some(ValueCompletion::Dynamic(DynamicKind::Slots)),
+    },
+    LauncherOption {
+        long: Some("target"),
+        short: None,
+        description: "Use a target config",
+        value: Some(ValueCompletion::Dynamic(DynamicKind::Targets)),
+    },
+    LauncherOption {
+        long: Some("manager-dir"),
+        short: None,
+        description: "Profile-manager directory",
+        value: Some(ValueCompletion::Path(PathKind::Directories)),
+    },
+    LauncherOption {
+        long: Some("codex-bin"),
+        short: None,
+        description: "Path to the real Codex binary",
+        value: Some(ValueCompletion::Path(PathKind::Files)),
+    },
+    LauncherOption {
+        long: Some("cx-quiet"),
+        short: None,
+        description: "Suppress cx slot banner",
+        value: None,
+    },
+    LauncherOption {
+        long: Some("cx-debug"),
+        short: None,
+        description: "Print slot selection details",
+        value: None,
+    },
+    LauncherOption {
+        long: None,
+        short: Some('m'),
+        description: "Codex model",
+        value: Some(ValueCompletion::Dynamic(DynamicKind::Models)),
+    },
+    LauncherOption {
+        long: Some("help"),
+        short: Some('h'),
+        description: "Print help",
+        value: None,
+    },
+];
 
 pub fn print_script(shell: CompletionShell) -> Result<()> {
     let script = match shell {
@@ -286,14 +154,26 @@ pub fn print_script(shell: CompletionShell) -> Result<()> {
     Ok(())
 }
 
-pub fn print_candidates(kind: CompleteKind, manager_dir: Option<PathBuf>) -> Result<()> {
-    let paths = ManagerPaths::new(manager_dir)?;
-    let candidates = match kind {
-        CompleteKind::Slots => slot_candidates(&paths)?,
-        CompleteKind::Targets => target_candidates(&paths)?,
-        CompleteKind::Models => model_candidates(&paths.base_codex_home.join("models_cache.json"))?,
+pub fn print_candidates(args: CompleteArgs) -> Result<()> {
+    let candidates = match args.kind {
+        CompleteKind::Slots => {
+            let paths = ManagerPaths::new(args.manager_dir)?;
+            slot_candidates(&paths)?
+        }
+        CompleteKind::Targets => {
+            let paths = ManagerPaths::new(args.manager_dir)?;
+            target_candidates(&paths)?
+        }
+        CompleteKind::Models => {
+            let paths = ManagerPaths::new(args.manager_dir)?;
+            model_candidates(&paths.base_codex_home.join("models_cache.json"))?
+        }
+        CompleteKind::Words => word_candidates(&args)?,
     };
+    print_candidate_lines(candidates)
+}
 
+fn print_candidate_lines(candidates: Vec<Candidate>) -> Result<()> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
     for candidate in candidates {
@@ -306,6 +186,549 @@ pub fn print_candidates(kind: CompleteKind, manager_dir: Option<PathBuf>) -> Res
         .context("write completion candidate")?;
     }
     Ok(())
+}
+
+fn word_candidates(args: &CompleteArgs) -> Result<Vec<Candidate>> {
+    let current = args.current.as_deref().unwrap_or_default();
+    let shell = args.shell.unwrap_or(CompletionShell::Bash);
+    let before = words_before_current(shell, args.cursor, current, &args.words);
+    let manager_dir = args
+        .manager_dir
+        .clone()
+        .or_else(|| manager_dir_from(&before));
+    let paths = ManagerPaths::new(manager_dir)?;
+    let user_words = strip_program_name(&before);
+
+    if let Some(candidates) = complete_attached_value(current, &user_words, &paths)? {
+        return Ok(candidates);
+    }
+    if let Some(candidates) = complete_value_after_previous(current, &user_words, &paths)? {
+        return Ok(candidates);
+    }
+
+    let candidates = if is_management_mode(&user_words) {
+        let root = Cli::command();
+        management_candidates(&root, current, &user_words, &paths)?
+    } else {
+        launcher_candidates(current)?
+    };
+    Ok(filter_candidates(candidates, current))
+}
+
+fn words_before_current(
+    shell: CompletionShell,
+    cursor: Option<usize>,
+    current: &str,
+    words: &[String],
+) -> Vec<String> {
+    match shell {
+        CompletionShell::Bash => {
+            let end = cursor.unwrap_or(words.len()).min(words.len());
+            words[..end].to_vec()
+        }
+        CompletionShell::Zsh => {
+            let end = cursor
+                .and_then(|value| value.checked_sub(1))
+                .unwrap_or(words.len())
+                .min(words.len());
+            words[..end].to_vec()
+        }
+        CompletionShell::Fish => {
+            if !current.is_empty() && words.last().is_some_and(|word| word == current) {
+                words[..words.len() - 1].to_vec()
+            } else {
+                words.to_vec()
+            }
+        }
+    }
+}
+
+fn strip_program_name(words: &[String]) -> Vec<String> {
+    if words.first().is_some_and(|word| word == "cx") {
+        words[1..].to_vec()
+    } else {
+        words.to_vec()
+    }
+}
+
+fn manager_dir_from(words: &[String]) -> Option<PathBuf> {
+    let mut iter = words.iter().peekable();
+    while let Some(word) = iter.next() {
+        if word == "--manager-dir" {
+            return iter.peek().map(|value| PathBuf::from(value.as_str()));
+        }
+        if let Some(value) = word.strip_prefix("--manager-dir=") {
+            return Some(PathBuf::from(value));
+        }
+    }
+    None
+}
+
+fn is_management_mode(user_words: &[String]) -> bool {
+    let Some(first) = user_words.first() else {
+        return false;
+    };
+    Cli::command()
+        .get_subcommands()
+        .filter(|command| !command.is_hide_set())
+        .any(|command| command.get_name() == first)
+}
+
+fn launcher_candidates(current: &str) -> Result<Vec<Candidate>> {
+    if current.starts_with('-') {
+        return Ok(launcher_option_candidates());
+    }
+    let root = Cli::command();
+    Ok(command_candidates(&root))
+}
+
+fn management_candidates(
+    root: &Command,
+    current: &str,
+    user_words: &[String],
+    paths: &ManagerPaths,
+) -> Result<Vec<Candidate>> {
+    let context = command_context(root, user_words);
+    if current.starts_with('-') {
+        return Ok(option_candidates(context.command));
+    }
+    if context
+        .command
+        .get_subcommands()
+        .any(|command| !command.is_hide_set())
+    {
+        return Ok(command_candidates(context.command));
+    }
+    positional_candidates(&context, paths)
+}
+
+#[derive(Debug)]
+struct CompletionContext<'a> {
+    command: &'a Command,
+    path: Vec<String>,
+    positionals: Vec<String>,
+}
+
+fn command_context<'a>(root: &'a Command, user_words: &[String]) -> CompletionContext<'a> {
+    let mut command = root;
+    let mut path = Vec::new();
+    let mut positionals = Vec::new();
+    let mut expecting_value = false;
+
+    for word in user_words {
+        if expecting_value {
+            expecting_value = false;
+            continue;
+        }
+        if let Some(arg) = long_arg_from_word(command, word) {
+            expecting_value = option_takes_value(arg) && !word.contains('=');
+            continue;
+        }
+        if let Some(arg) = short_arg_from_word(command, word) {
+            expecting_value = option_takes_value(arg);
+            continue;
+        }
+        if word.starts_with('-') {
+            continue;
+        }
+        if let Some(subcommand) = visible_subcommand(command, word) {
+            command = subcommand;
+            path.push(word.clone());
+            positionals.clear();
+            continue;
+        }
+        positionals.push(word.clone());
+    }
+
+    CompletionContext {
+        command,
+        path,
+        positionals,
+    }
+}
+
+fn complete_attached_value(
+    current: &str,
+    user_words: &[String],
+    paths: &ManagerPaths,
+) -> Result<Option<Vec<Candidate>>> {
+    let Some((option_name, value_prefix)) = current.strip_prefix("--").and_then(|value| {
+        let (name, value) = value.split_once('=')?;
+        Some((name, value))
+    }) else {
+        return Ok(None);
+    };
+
+    if is_management_mode(user_words) {
+        let root = Cli::command();
+        let context = command_context(&root, user_words);
+        let Some(arg) = context
+            .command
+            .get_arguments()
+            .find(|arg| !arg.is_hide_set() && arg.get_long() == Some(option_name))
+        else {
+            return Ok(None);
+        };
+        let Some(candidates) = value_candidates_for_arg(arg, value_prefix, paths)? else {
+            return Ok(None);
+        };
+        let prefix = format!("--{option_name}=");
+        let candidates = candidates
+            .into_iter()
+            .map(|candidate| Candidate {
+                value: format!("{prefix}{}", candidate.value),
+                description: candidate.description,
+            })
+            .collect();
+        Ok(Some(candidates))
+    } else {
+        let Some(value_completion) =
+            launcher_option_by_long(option_name).and_then(|option| option.value)
+        else {
+            return Ok(None);
+        };
+        let prefix = format!("--{option_name}=");
+        let candidates = value_candidates(value_completion, value_prefix, paths)?
+            .into_iter()
+            .map(|candidate| Candidate {
+                value: format!("{prefix}{}", candidate.value),
+                description: candidate.description,
+            })
+            .collect();
+        Ok(Some(candidates))
+    }
+}
+
+fn complete_value_after_previous(
+    current: &str,
+    user_words: &[String],
+    paths: &ManagerPaths,
+) -> Result<Option<Vec<Candidate>>> {
+    let Some(previous) = user_words.last() else {
+        return Ok(None);
+    };
+
+    if is_management_mode(user_words) {
+        let root = Cli::command();
+        let context = command_context(&root, &user_words[..user_words.len() - 1]);
+        option_from_token(context.command, previous)
+            .map(|arg| value_candidates_for_arg(arg, current, paths))
+            .transpose()
+            .map(Option::flatten)
+    } else {
+        launcher_option_from_token(previous)
+            .and_then(|option| option.value)
+            .map(|completion| value_candidates(completion, current, paths))
+            .transpose()
+    }
+}
+
+fn positional_candidates(
+    context: &CompletionContext<'_>,
+    paths: &ManagerPaths,
+) -> Result<Vec<Candidate>> {
+    let index = context.positionals.len();
+    if let Some(kind) = positional_dynamic_kind(&context.path, index) {
+        return dynamic_candidates(kind, paths);
+    }
+    if let Some(arg) = positional_arg(context.command, index) {
+        let values = possible_value_candidates(arg);
+        if !values.is_empty() {
+            return Ok(values);
+        }
+    }
+    Ok(Vec::new())
+}
+
+fn positional_dynamic_kind(path: &[String], index: usize) -> Option<DynamicKind> {
+    match path {
+        [command] if matches!(command.as_str(), "status" | "select" | "stats") => {
+            Some(DynamicKind::Slots)
+        }
+        [command] if matches!(command.as_str(), "add" | "remove" | "login") && index == 0 => {
+            Some(DynamicKind::Slots)
+        }
+        [target, command]
+            if target == "target" && matches!(command.as_str(), "show" | "remove") =>
+        {
+            (index == 0).then_some(DynamicKind::Targets)
+        }
+        [target, command] if target == "target" && command == "add" => {
+            if index == 0 {
+                Some(DynamicKind::Targets)
+            } else {
+                Some(DynamicKind::Slots)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn positional_arg(command: &Command, index: usize) -> Option<&Arg> {
+    let positionals = command
+        .get_positionals()
+        .filter(|arg| !arg.is_hide_set())
+        .collect::<Vec<_>>();
+    positionals
+        .get(index)
+        .copied()
+        .or_else(|| positionals.last().copied())
+}
+
+fn value_candidates(
+    completion: ValueCompletion,
+    prefix: &str,
+    paths: &ManagerPaths,
+) -> Result<Vec<Candidate>> {
+    let candidates = match completion {
+        ValueCompletion::Dynamic(kind) => dynamic_candidates(kind, paths)?,
+        ValueCompletion::Path(kind) => path_candidates(prefix, kind)?,
+    };
+    Ok(filter_candidates(candidates, prefix))
+}
+
+fn value_candidates_for_arg(
+    arg: &Arg,
+    prefix: &str,
+    paths: &ManagerPaths,
+) -> Result<Option<Vec<Candidate>>> {
+    if !option_takes_value(arg) {
+        return Ok(None);
+    }
+    if let Some(long) = arg.get_long() {
+        let completion = match long {
+            "target" => Some(ValueCompletion::Dynamic(DynamicKind::Targets)),
+            "manager-dir" => Some(ValueCompletion::Path(PathKind::Directories)),
+            "codex-bin" => Some(ValueCompletion::Path(PathKind::Files)),
+            "bin-dir" => Some(ValueCompletion::Path(PathKind::Directories)),
+            _ => None,
+        };
+        if let Some(completion) = completion {
+            return value_candidates(completion, prefix, paths).map(Some);
+        }
+    }
+    let possible_values = possible_value_candidates(arg);
+    if possible_values.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(filter_candidates(possible_values, prefix)))
+    }
+}
+
+fn dynamic_candidates(kind: DynamicKind, paths: &ManagerPaths) -> Result<Vec<Candidate>> {
+    match kind {
+        DynamicKind::Slots => slot_candidates(paths),
+        DynamicKind::Targets => target_candidates(paths),
+        DynamicKind::Models => model_candidates(&paths.base_codex_home.join("models_cache.json")),
+    }
+}
+
+fn launcher_option_candidates() -> Vec<Candidate> {
+    let mut candidates = Vec::new();
+    for option in LAUNCHER_OPTIONS {
+        if let Some(long) = option.long {
+            candidates.push(Candidate {
+                value: format!("--{long}"),
+                description: option.description.to_string(),
+            });
+        }
+        if let Some(short) = option.short {
+            candidates.push(Candidate {
+                value: format!("-{short}"),
+                description: option.description.to_string(),
+            });
+        }
+    }
+    candidates
+}
+
+fn command_candidates(command: &Command) -> Vec<Candidate> {
+    command
+        .get_subcommands()
+        .filter(|command| !command.is_hide_set())
+        .map(|command| Candidate {
+            value: command.get_name().to_string(),
+            description: command
+                .get_about()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+        })
+        .collect()
+}
+
+fn option_candidates(command: &Command) -> Vec<Candidate> {
+    let mut candidates = Vec::new();
+    for arg in command.get_arguments().filter(|arg| !arg.is_hide_set()) {
+        let description = arg.get_help().map(ToString::to_string).unwrap_or_default();
+        if let Some(long) = arg.get_long() {
+            candidates.push(Candidate {
+                value: format!("--{long}"),
+                description: description.clone(),
+            });
+        }
+        if let Some(short) = arg.get_short() {
+            candidates.push(Candidate {
+                value: format!("-{short}"),
+                description: description.clone(),
+            });
+        }
+    }
+    if !candidates
+        .iter()
+        .any(|candidate| candidate.value == "--help")
+    {
+        candidates.push(Candidate {
+            value: "--help".to_string(),
+            description: "Print help".to_string(),
+        });
+        candidates.push(Candidate {
+            value: "-h".to_string(),
+            description: "Print help".to_string(),
+        });
+    }
+    candidates
+}
+
+fn possible_value_candidates(arg: &Arg) -> Vec<Candidate> {
+    arg.get_possible_values()
+        .into_iter()
+        .filter(|value| !value.is_hide_set())
+        .map(|value| Candidate {
+            value: value.get_name().to_string(),
+            description: value
+                .get_help()
+                .map(ToString::to_string)
+                .unwrap_or_default(),
+        })
+        .collect()
+}
+
+fn option_takes_value(arg: &Arg) -> bool {
+    arg.get_action().takes_values()
+}
+
+fn option_from_token<'a>(command: &'a Command, token: &str) -> Option<&'a Arg> {
+    long_arg_from_word(command, token).or_else(|| short_arg_from_word(command, token))
+}
+
+fn long_arg_from_word<'a>(command: &'a Command, word: &str) -> Option<&'a Arg> {
+    let name = word.strip_prefix("--")?.split_once('=').map_or_else(
+        || word.strip_prefix("--").unwrap_or_default(),
+        |(name, _)| name,
+    );
+    command
+        .get_arguments()
+        .find(|arg| !arg.is_hide_set() && arg.get_long() == Some(name))
+}
+
+fn short_arg_from_word<'a>(command: &'a Command, word: &str) -> Option<&'a Arg> {
+    let mut chars = word.strip_prefix('-')?.chars();
+    let short = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+    command
+        .get_arguments()
+        .find(|arg| !arg.is_hide_set() && arg.get_short() == Some(short))
+}
+
+fn visible_subcommand<'a>(command: &'a Command, name: &str) -> Option<&'a Command> {
+    command
+        .get_subcommands()
+        .find(|command| !command.is_hide_set() && command.get_name() == name)
+}
+
+fn launcher_option_by_long(name: &str) -> Option<LauncherOption> {
+    LAUNCHER_OPTIONS
+        .iter()
+        .copied()
+        .find(|option| option.long == Some(name))
+}
+
+fn launcher_option_from_token(token: &str) -> Option<LauncherOption> {
+    if let Some(name) = token.strip_prefix("--") {
+        let name = name.split_once('=').map_or(name, |(name, _)| name);
+        return launcher_option_by_long(name);
+    }
+    let mut chars = token.strip_prefix('-')?.chars();
+    let short = chars.next()?;
+    if chars.next().is_some() {
+        return None;
+    }
+    LAUNCHER_OPTIONS
+        .iter()
+        .copied()
+        .find(|option| option.short == Some(short))
+}
+
+fn filter_candidates(candidates: Vec<Candidate>, prefix: &str) -> Vec<Candidate> {
+    let mut unique = BTreeMap::<String, String>::new();
+    for candidate in candidates {
+        if candidate.value.starts_with(prefix) {
+            unique
+                .entry(candidate.value)
+                .or_insert(candidate.description);
+        }
+    }
+    unique
+        .into_iter()
+        .map(|(value, description)| Candidate { value, description })
+        .collect()
+}
+
+fn path_candidates(prefix: &str, kind: PathKind) -> Result<Vec<Candidate>> {
+    let (dir_prefix, name_prefix) = split_path_prefix(prefix);
+    let read_dir = expand_tilde(if dir_prefix.is_empty() {
+        "."
+    } else {
+        dir_prefix
+    })?;
+    let Ok(entries) = fs::read_dir(&read_dir) else {
+        return Ok(Vec::new());
+    };
+
+    let mut candidates = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        if !name_prefix.starts_with('.') && file_name.starts_with('.') {
+            continue;
+        }
+        if !file_name.starts_with(name_prefix) {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        let is_dir = file_type.is_dir();
+        if kind == PathKind::Directories && !is_dir {
+            continue;
+        }
+        let mut value = format!("{dir_prefix}{file_name}");
+        if is_dir {
+            value.push('/');
+        }
+        candidates.push(Candidate {
+            value,
+            description: if is_dir { "directory" } else { "file" }.to_string(),
+        });
+    }
+    Ok(candidates)
+}
+
+fn split_path_prefix(prefix: &str) -> (&str, &str) {
+    prefix
+        .rfind('/')
+        .map(|index| prefix.split_at(index + 1))
+        .unwrap_or(("", prefix))
+}
+
+fn expand_tilde(path: &str) -> Result<PathBuf> {
+    if path == "~" {
+        return crate::paths::home_dir();
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        return Ok(crate::paths::home_dir()?.join(rest));
+    }
+    Ok(PathBuf::from(path))
 }
 
 fn slot_candidates(paths: &ManagerPaths) -> Result<Vec<Candidate>> {
@@ -423,6 +846,122 @@ mod tests {
             targets_dir: root.join("profile-manager/targets"),
             rotation_file: root.join("profile-manager/rotation.txt"),
         }
+    }
+
+    fn complete(words: &[&str], current: &str, paths: &ManagerPaths) -> Vec<Candidate> {
+        let args = CompleteArgs {
+            kind: CompleteKind::Words,
+            manager_dir: Some(paths.manager_dir.clone()),
+            shell: Some(CompletionShell::Bash),
+            cursor: Some(words.len()),
+            current: Some(current.to_string()),
+            words: words.iter().map(|word| (*word).to_string()).collect(),
+        };
+        word_candidates(&args).unwrap()
+    }
+
+    #[test]
+    fn generated_shell_scripts_are_protocol_shims() {
+        for script in [FISH_COMPLETIONS, ZSH_COMPLETIONS, BASH_COMPLETIONS] {
+            assert!(script.contains("__complete words"));
+            assert!(!script.contains("--delete-files"));
+            assert!(!script.contains("--from-current"));
+            assert!(!script.contains("status stats"));
+            assert!(!script.contains("target show"));
+        }
+    }
+
+    #[test]
+    fn root_completion_comes_from_clap_commands() {
+        let paths = temp_paths("root");
+
+        let candidates = complete(&["cx"], "st", &paths);
+
+        assert!(candidates.iter().any(|candidate| {
+            candidate.value == "status"
+                && candidate
+                    .description
+                    .starts_with("Query every slot and show current availability")
+        }));
+
+        let _ = fs::remove_dir_all(&paths.manager_dir);
+    }
+
+    #[test]
+    fn management_options_come_from_clap_command() {
+        let paths = temp_paths("options");
+
+        let candidates = complete(&["cx", "remove"], "--d", &paths);
+
+        assert_eq!(
+            candidates,
+            vec![Candidate {
+                value: "--delete-files".to_string(),
+                description: "Also delete the slot directory and its auth files".to_string(),
+            }]
+        );
+
+        let _ = fs::remove_dir_all(&paths.manager_dir);
+    }
+
+    #[test]
+    fn clap_value_enum_options_complete_possible_values() {
+        let paths = temp_paths("sort-values");
+
+        let candidates = complete(&["cx", "status", "--sort"], "r", &paths);
+
+        assert_eq!(
+            candidates,
+            vec![Candidate {
+                value: "rotation".to_string(),
+                description: "Preserve rotation.txt or explicit argument order".to_string(),
+            }]
+        );
+
+        let _ = fs::remove_dir_all(&paths.manager_dir);
+    }
+
+    #[test]
+    fn target_show_completes_target_names() {
+        let paths = temp_paths("targets");
+        fs::create_dir_all(&paths.targets_dir).unwrap();
+        fs::write(paths.target_file("research"), "").unwrap();
+
+        let candidates = complete(&["cx", "target", "show"], "re", &paths);
+
+        assert_eq!(
+            candidates,
+            vec![Candidate {
+                value: "research".to_string(),
+                description: "target config".to_string(),
+            }]
+        );
+
+        let _ = fs::remove_dir_all(&paths.manager_dir);
+    }
+
+    #[test]
+    fn launcher_model_option_completes_cached_models() {
+        let paths = temp_paths("models-runtime");
+        let runtime_base = paths.manager_dir.parent().unwrap();
+        fs::create_dir_all(runtime_base).unwrap();
+        fs::write(
+            runtime_base.join("models_cache.json"),
+            r#"{"models":[{"slug":"gpt-test","display_name":"GPT Test"}]}"#,
+        )
+        .unwrap();
+
+        let candidates = complete(&["cx", "-m"], "g", &paths);
+
+        assert_eq!(
+            candidates,
+            vec![Candidate {
+                value: "gpt-test".to_string(),
+                description: "GPT Test".to_string(),
+            }]
+        );
+
+        let _ = fs::remove_dir_all(runtime_base);
     }
 
     #[test]

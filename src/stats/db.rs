@@ -7,6 +7,8 @@ use anyhow::Context;
 use anyhow::Result;
 use rusqlite::params;
 use rusqlite::Connection;
+use rusqlite::Error;
+use rusqlite::ErrorCode;
 use rusqlite::OpenFlags;
 
 use crate::paths::ManagerPaths;
@@ -59,8 +61,7 @@ pub(super) fn read_threads(
     paths: &ManagerPaths,
     min_since: i64,
 ) -> Result<Vec<ThreadUsage>> {
-    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .with_context(|| format!("open {}", db_path.display()))?;
+    let conn = open_state_connection(db_path)?;
     let columns = thread_columns(&conn)?;
     if !columns.contains("updated_at") || !columns.contains("tokens_used") {
         return Ok(Vec::new());
@@ -101,8 +102,7 @@ pub(super) fn read_rollout_paths(
     paths: &ManagerPaths,
     slot_filters: &BTreeSet<String>,
 ) -> Result<Vec<PathBuf>> {
-    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .with_context(|| format!("open {}", db_path.display()))?;
+    let conn = open_state_connection(db_path)?;
     let columns = thread_columns(&conn)?;
     if !columns.contains("rollout_path") {
         return Ok(Vec::new());
@@ -123,6 +123,48 @@ pub(super) fn read_rollout_paths(
         paths_out.push(PathBuf::from(rollout_path));
     }
     Ok(paths_out)
+}
+
+fn open_state_connection(db_path: &Path) -> Result<Connection> {
+    match open_validated_connection(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+        Ok(conn) => Ok(conn),
+        Err(err) if is_cannot_open(&err) => {
+            let conn = Connection::open_with_flags(
+                db_path,
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+            )
+            .and_then(|conn| {
+                conn.pragma_update(None, "query_only", true)?;
+                validate_connection(&conn)?;
+                Ok(conn)
+            })
+            .with_context(|| {
+                format!(
+                    "open {} read-write after read-only open failed",
+                    db_path.display()
+                )
+            })?;
+            Ok(conn)
+        }
+        Err(err) => Err(err).with_context(|| format!("open {}", db_path.display())),
+    }
+}
+
+fn open_validated_connection(
+    db_path: &Path,
+    flags: OpenFlags,
+) -> std::result::Result<Connection, Error> {
+    let conn = Connection::open_with_flags(db_path, flags)?;
+    validate_connection(&conn)?;
+    Ok(conn)
+}
+
+fn validate_connection(conn: &Connection) -> std::result::Result<(), Error> {
+    conn.query_row("SELECT count(*) FROM sqlite_schema", [], |_| Ok(()))
+}
+
+fn is_cannot_open(err: &Error) -> bool {
+    matches!(err, Error::SqliteFailure(error, _) if error.code == ErrorCode::CannotOpen)
 }
 
 fn thread_columns(conn: &Connection) -> Result<BTreeSet<String>> {
@@ -162,4 +204,61 @@ pub(super) fn infer_slot_from_rollout_path(rollout_path: &str, paths: &ManagerPa
         }
     }
     "base".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::time::SystemTime;
+    use std::time::UNIX_EPOCH;
+
+    use super::*;
+
+    fn temp_paths(name: &str) -> ManagerPaths {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cx-stats-db-test-{name}-{}-{unique}",
+            std::process::id()
+        ));
+        ManagerPaths {
+            base_codex_home: root.join("codex"),
+            manager_dir: root.join("profile-manager"),
+            slots_dir: root.join("profile-manager/slots"),
+            targets_dir: root.join("profile-manager/targets"),
+            rotation_file: root.join("profile-manager/rotation.txt"),
+        }
+    }
+
+    #[test]
+    fn reads_wal_database_when_sidecars_are_missing() {
+        let paths = temp_paths("missing-wal-sidecars");
+        fs::create_dir_all(&paths.base_codex_home).expect("create codex home");
+        let db_path = paths.base_codex_home.join(STATE_DB);
+        {
+            let conn = Connection::open(&db_path).expect("open writable db");
+            conn.execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 CREATE TABLE threads (
+                   id TEXT PRIMARY KEY,
+                   updated_at INTEGER NOT NULL,
+                   tokens_used INTEGER NOT NULL
+                 );
+                 INSERT INTO threads (id, updated_at, tokens_used)
+                 VALUES ('thread-1', 123, 456);
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .expect("seed db");
+        }
+        let _ = fs::remove_file(format!("{}-wal", db_path.display()));
+        let _ = fs::remove_file(format!("{}-shm", db_path.display()));
+
+        let usages = read_threads(&db_path, &paths, 0).expect("read threads");
+
+        assert_eq!(usages.len(), 1);
+        assert_eq!(usages[0].id, "thread-1");
+        assert_eq!(usages[0].tokens, 456);
+    }
 }

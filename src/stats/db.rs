@@ -87,6 +87,7 @@ pub(super) fn read_threads(
             provider: empty_as_unknown(row.get::<_, String>(3)?),
             model: empty_as_unknown(row.get::<_, String>(4)?),
             slot: infer_slot_from_rollout_path(&rollout_path, paths),
+            rollout_path: PathBuf::from(rollout_path),
         })
     })?;
 

@@ -147,14 +147,15 @@ cx stats --price --json
 cx stats --calibrate
 ```
 
-`cx stats` reads Codex's local `state_5.sqlite` and buckets
-`threads.tokens_used` by `threads.updated_at` for `1h`, `24h`, `today`, `week`,
-`month`, and `year`. Human output auto-scales token units and stays local-only
-by default. Price estimates are opt-in with `--price`; cx fetches and caches
-OpenAI's public API pricing table, then uses the saved token mix from
-`cx stats --calibrate` when available. Calibration is explicit because it scans
-rollout JSONL files; normal `cx stats --price` only reads the small saved
-calibration file or falls back to a built-in token mix.
+`cx stats` reads Codex's local `state_5.sqlite` and, when rollout JSONL files
+are available, buckets timestamped `token_count` deltas for `1h`, `24h`,
+`today`, `week`, `month`, and `year`. If a rollout is missing or cannot be
+parsed, it falls back to bucketing `threads.tokens_used` by `threads.updated_at`.
+Human output auto-scales token units and stays local-only by default. Price
+estimates are opt-in with `--price`; cx fetches and caches OpenAI's public API
+pricing table, then uses exact rollout token categories when available or the
+saved token mix from `cx stats --calibrate` as a fallback. Calibration is
+explicit because it scans rollout JSONL files.
 
 `cx stats --json` emits schema v2. Token-only JSON omits cost fields entirely;
 `cx stats --price --json` adds a `priceEstimate` object plus per-period,

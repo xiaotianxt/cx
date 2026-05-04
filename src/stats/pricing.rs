@@ -14,6 +14,7 @@ use crate::paths::ManagerPaths;
 use super::legacy_file_schema_version;
 use super::unix_now;
 use super::TokenMix;
+use super::TokenTotals;
 
 pub(super) const DEFAULT_PRICE_URL: &str = "https://developers.openai.com/api/docs/pricing";
 pub(super) const PRICE_CACHE_FILE: &str = "price-cache.json";
@@ -122,10 +123,7 @@ impl PriceCache {
 
 impl PriceBook {
     pub(super) fn estimate_cost(&self, provider: &str, model: &str, tokens: u64) -> Option<f64> {
-        if provider != "openai" {
-            return None;
-        }
-        let price = self.prices.get(&normalize_model_key(model))?;
+        let price = self.model_price(provider, model)?;
         let cached_rate = price
             .cached_input_per_million
             .unwrap_or(price.input_per_million);
@@ -133,6 +131,31 @@ impl PriceBook {
             + (self.token_mix.cached_input_share * cached_rate)
             + (self.token_mix.output_share * price.output_per_million);
         Some(tokens as f64 * rate / 1_000_000.0)
+    }
+
+    pub(super) fn estimate_token_totals_cost(
+        &self,
+        provider: &str,
+        model: &str,
+        totals: &TokenTotals,
+    ) -> Option<f64> {
+        let price = self.model_price(provider, model)?;
+        let cached_rate = price
+            .cached_input_per_million
+            .unwrap_or(price.input_per_million);
+        Some(
+            ((totals.uncached_input_tokens as f64 * price.input_per_million)
+                + (totals.cached_input_tokens as f64 * cached_rate)
+                + (totals.output_tokens as f64 * price.output_per_million))
+                / 1_000_000.0,
+        )
+    }
+
+    fn model_price(&self, provider: &str, model: &str) -> Option<&ModelPrice> {
+        if provider != "openai" {
+            return None;
+        }
+        self.prices.get(&normalize_model_key(model))
     }
 }
 
@@ -242,7 +265,7 @@ fn fallback_price_book(token_mix: TokenMix, token_mix_source: &str, reason: &str
 
 fn price_estimate_note(token_mix: TokenMix, token_mix_source: &str) -> String {
     format!(
-        "estimate uses {:.2}% uncached input, {:.2}% cached input, {:.2}% output from {token_mix_source}; Codex state stores total tokens only",
+        "estimate uses exact rollout token breakdown when available; fallback uses {:.2}% uncached input, {:.2}% cached input, {:.2}% output from {token_mix_source}; Codex state stores total tokens only",
         token_mix.uncached_input_share * 100.0,
         token_mix.cached_input_share * 100.0,
         token_mix.output_share * 100.0
@@ -356,4 +379,49 @@ fn fallback_prices() -> BTreeMap<String, ModelPrice> {
         },
     )
     .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_price_book() -> PriceBook {
+        PriceBook {
+            prices: [(
+                "gpt-test".to_string(),
+                ModelPrice {
+                    input_per_million: 5.0,
+                    cached_input_per_million: Some(0.5),
+                    output_per_million: 30.0,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            token_mix: TokenMix {
+                uncached_input_share: 0.1,
+                cached_input_share: 0.8,
+                output_share: 0.1,
+            },
+            source: "test".to_string(),
+            note: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn exact_cost_uses_token_categories() {
+        let book = test_price_book();
+        let totals = TokenTotals {
+            samples: 1,
+            total_tokens: 100,
+            uncached_input_tokens: 10,
+            cached_input_tokens: 80,
+            output_tokens: 10,
+        };
+
+        let cost = book
+            .estimate_token_totals_cost("openai", "gpt-test", &totals)
+            .expect("priced model");
+
+        assert!((cost - 0.00039).abs() < f64::EPSILON);
+    }
 }

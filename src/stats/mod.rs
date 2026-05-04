@@ -3,7 +3,6 @@ use std::collections::BTreeSet;
 use std::collections::HashSet;
 #[cfg(test)]
 use std::fs;
-#[cfg(test)]
 use std::path::PathBuf;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -143,6 +142,7 @@ struct ThreadUsage {
     provider: String,
     model: String,
     slot: String,
+    rollout_path: PathBuf,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -216,11 +216,7 @@ pub fn collect_report(paths: &ManagerPaths, args: StatsArgs) -> Result<StatsRepo
             if !seen_threads.insert(usage.id.clone()) {
                 continue;
             }
-            for accumulator in &mut accumulators {
-                if usage.updated_at >= accumulator.period.since_unix {
-                    accumulator.add(&usage, price_book.as_ref());
-                }
-            }
+            add_thread_usage(&mut accumulators, price_book.as_ref(), &usage);
         }
     }
 
@@ -234,7 +230,9 @@ pub fn collect_report(paths: &ManagerPaths, args: StatsArgs) -> Result<StatsRepo
             .iter()
             .map(|path| path.display().to_string())
             .collect(),
-        period_basis: "threads.tokens_used bucketed by threads.updated_at".to_string(),
+        period_basis:
+            "rollout token_count deltas by timestamp; fallback threads.tokens_used bucketed by threads.updated_at"
+                .to_string(),
         price_source,
         price_note,
         token_mix,
@@ -256,21 +254,19 @@ impl PeriodAccumulator {
         }
     }
 
-    fn add(&mut self, usage: &ThreadUsage, price_book: Option<&PriceBook>) {
-        let cost = price_book
-            .and_then(|book| book.estimate_cost(&usage.provider, &usage.model, usage.tokens));
-        self.total.add(usage.tokens, cost);
+    fn add(&mut self, usage: &ThreadUsage, tokens: u64, cost: Option<f64>) {
+        self.total.add(tokens, cost);
         self.slots
             .entry(usage.slot.clone())
             .or_default()
-            .add(usage.tokens, cost);
+            .add(tokens, cost);
         self.models
             .entry(ModelKey {
                 provider: usage.provider.clone(),
                 model: usage.model.clone(),
             })
             .or_default()
-            .add(usage.tokens, cost);
+            .add(tokens, cost);
     }
 
     fn into_usage(self) -> PeriodUsage {
@@ -313,7 +309,77 @@ impl PeriodAccumulator {
     }
 }
 
+fn add_thread_usage(
+    accumulators: &mut [PeriodAccumulator],
+    price_book: Option<&PriceBook>,
+    usage: &ThreadUsage,
+) {
+    if usage.rollout_path.exists() {
+        if let Ok(events) = rollout::read_token_usage_events(&usage.rollout_path) {
+            if !events.is_empty() {
+                for accumulator in accumulators.iter_mut() {
+                    let mut totals = TokenTotals::default();
+                    for event in &events {
+                        if event.timestamp_unix >= accumulator.period.since_unix {
+                            totals.add(event.totals.clone());
+                        }
+                    }
+                    if totals.total_tokens > 0 {
+                        let cost = price_book.and_then(|book| {
+                            book.estimate_token_totals_cost(&usage.provider, &usage.model, &totals)
+                        });
+                        accumulator.add(usage, totals.total_tokens, cost);
+                    }
+                }
+                return;
+            }
+        }
+    }
+
+    let cost = price_book.and_then(|book| estimate_thread_cost(book, usage));
+    for accumulator in accumulators.iter_mut() {
+        if usage.updated_at >= accumulator.period.since_unix {
+            accumulator.add(usage, usage.tokens, cost);
+        }
+    }
+}
+
+fn estimate_thread_cost(price_book: &PriceBook, usage: &ThreadUsage) -> Option<f64> {
+    if usage.rollout_path.exists() {
+        if let Ok(Some(totals)) = rollout::read_final_token_usage(&usage.rollout_path) {
+            if totals.total_tokens == usage.tokens {
+                return price_book.estimate_token_totals_cost(
+                    &usage.provider,
+                    &usage.model,
+                    &totals,
+                );
+            }
+        }
+    }
+    price_book.estimate_cost(&usage.provider, &usage.model, usage.tokens)
+}
+
 impl TokenTotals {
+    fn delta_from(&self, previous: &TokenTotals) -> TokenTotals {
+        if self.total_tokens < previous.total_tokens {
+            return TokenTotals {
+                samples: 1,
+                ..self.clone()
+            };
+        }
+        TokenTotals {
+            samples: 1,
+            total_tokens: self.total_tokens - previous.total_tokens,
+            uncached_input_tokens: self
+                .uncached_input_tokens
+                .saturating_sub(previous.uncached_input_tokens),
+            cached_input_tokens: self
+                .cached_input_tokens
+                .saturating_sub(previous.cached_input_tokens),
+            output_tokens: self.output_tokens.saturating_sub(previous.output_tokens),
+        }
+    }
+
     fn add(&mut self, usage: TokenTotals) {
         self.samples += usage.samples;
         self.total_tokens += usage.total_tokens;

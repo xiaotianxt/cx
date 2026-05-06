@@ -12,12 +12,21 @@ pub(super) struct ClientRequest<P> {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub(super) enum ServerMessage {
+    Request(ServerRequest),
     Response(ServerResponse),
     Notification {
         method: String,
         #[serde(default, rename = "params")]
         params: Option<Value>,
     },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct ServerRequest {
+    pub id: Value,
+    pub method: String,
+    #[serde(default)]
+    pub params: Option<Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -96,11 +105,46 @@ pub(super) struct ThreadSummary {
 pub(super) struct ThreadStartParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_start_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct ThreadStartResponse {
     pub thread: ThreadIdOnly,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ThreadResumeParams {
+    pub thread_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct ThreadResumeResponse {
+    pub thread: ThreadIdOnly,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ThreadArchiveParams {
+    pub thread_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ThreadReadParams {
+    pub thread_id: String,
+    pub include_turns: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct TurnInterruptParams {
+    pub thread_id: String,
+    pub turn_id: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

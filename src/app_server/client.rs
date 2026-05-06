@@ -3,6 +3,7 @@ use std::time::Duration;
 use anyhow::Context;
 use anyhow::Result;
 use serde::Serialize;
+use serde_json::json;
 use serde_json::Value;
 
 use super::protocol;
@@ -54,6 +55,18 @@ pub(crate) struct StartedThread {
 pub(crate) struct StartedTurn {
     pub turn_id: String,
     pub assistant_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InterruptOutcome {
+    pub interrupted_turn_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ApprovalRequest {
+    pub id: Value,
+    pub method: String,
+    pub params: Value,
 }
 
 impl ThreadListInfo {
@@ -142,11 +155,12 @@ impl AppServerClient {
         })
     }
 
-    pub(crate) fn thread_start(&mut self) -> Result<StartedThread> {
+    pub(crate) fn thread_start(&mut self, cwd: Option<&str>) -> Result<StartedThread> {
         let response = self.request(
             "thread/start",
             protocol::ThreadStartParams {
                 session_start_source: Some(String::from("startup")),
+                cwd: cwd.map(str::to_string),
             },
         )?;
         let response = serde_json::from_value::<protocol::ThreadStartResponse>(response)
@@ -156,11 +170,54 @@ impl AppServerClient {
         })
     }
 
+    pub(crate) fn thread_resume(&mut self, thread_id: &str, cwd: Option<&str>) -> Result<()> {
+        let response = self.request(
+            "thread/resume",
+            protocol::ThreadResumeParams {
+                thread_id: thread_id.to_string(),
+                cwd: cwd.map(str::to_string),
+            },
+        )?;
+        let response = serde_json::from_value::<protocol::ThreadResumeResponse>(response)
+            .context("decode thread/resume response")?;
+        let _thread_id = response.thread.id;
+        Ok(())
+    }
+
+    pub(crate) fn thread_archive(&mut self, thread_id: &str) -> Result<()> {
+        let _response = self.request(
+            "thread/archive",
+            protocol::ThreadArchiveParams {
+                thread_id: thread_id.to_string(),
+            },
+        )?;
+        Ok(())
+    }
+
+    pub(crate) fn interrupt_active_turn(&mut self, thread_id: &str) -> Result<InterruptOutcome> {
+        let Some(turn_id) = self.active_turn_id(thread_id)? else {
+            return Ok(InterruptOutcome {
+                interrupted_turn_id: None,
+            });
+        };
+        let _response = self.request(
+            "turn/interrupt",
+            protocol::TurnInterruptParams {
+                thread_id: thread_id.to_string(),
+                turn_id: turn_id.clone(),
+            },
+        )?;
+        Ok(InterruptOutcome {
+            interrupted_turn_id: Some(turn_id),
+        })
+    }
+
     pub(crate) fn turn_start_stream<F>(
         &mut self,
         thread_id: &str,
         prompt: String,
         mut on_delta: F,
+        mut on_approval: impl FnMut(ApprovalRequest) -> Result<Value>,
     ) -> Result<StartedTurn>
     where
         F: FnMut(&str) -> Result<()>,
@@ -175,7 +232,18 @@ impl AppServerClient {
                 }],
             },
         )?;
-        self.collect_turn_start(request_id, thread_id, &mut on_delta)
+        self.collect_turn_start(request_id, thread_id, &mut on_delta, &mut on_approval)
+    }
+
+    fn active_turn_id(&mut self, thread_id: &str) -> Result<Option<String>> {
+        let response = self.request(
+            "thread/read",
+            protocol::ThreadReadParams {
+                thread_id: thread_id.to_string(),
+                include_turns: true,
+            },
+        )?;
+        Ok(latest_in_progress_turn_id(&response))
     }
 
     fn request<P>(&mut self, method: &'static str, params: P) -> Result<Value>
@@ -222,12 +290,16 @@ impl AppServerClient {
                         format!("app-server response for {method} omitted result")
                     });
                 }
-                ServerMessage::Response(response) => {
-                    anyhow::bail!(
-                        "app-server returned response id {} while waiting for {}",
-                        response.id,
-                        id
-                    );
+                ServerMessage::Response(_) => {}
+                ServerMessage::Request(request) => {
+                    self.send_error_response(
+                        request.id,
+                        -32601,
+                        format!(
+                            "unsupported app-server request during {method}: {}",
+                            request.method
+                        ),
+                    )?;
                 }
                 ServerMessage::Notification { .. } => {}
             }
@@ -239,6 +311,7 @@ impl AppServerClient {
         request_id: u64,
         thread_id: &str,
         on_delta: &mut F,
+        on_approval: &mut impl FnMut(ApprovalRequest) -> Result<Value>,
     ) -> Result<StartedTurn>
     where
         F: FnMut(&str) -> Result<()>,
@@ -300,15 +373,83 @@ impl AppServerClient {
                         anyhow::bail!("app-server turn error");
                     }
                 }
-                ServerMessage::Response(response) => {
-                    anyhow::bail!(
-                        "app-server returned unexpected response id {} while waiting for turn completion",
-                        response.id
-                    );
+                ServerMessage::Response(_) => {}
+                ServerMessage::Request(request) => {
+                    if is_approval_request_method(&request.method) {
+                        let approval = ApprovalRequest {
+                            id: request.id.clone(),
+                            method: request.method,
+                            params: request.params.unwrap_or(Value::Null),
+                        };
+                        let result = match on_approval(approval) {
+                            Ok(result) => result,
+                            Err(err) => {
+                                self.send_error_response(
+                                    request.id,
+                                    -32000,
+                                    format!("approval failed: {err:#}"),
+                                )?;
+                                return Err(err);
+                            }
+                        };
+                        self.send_success_response(request.id, result)?;
+                    } else {
+                        self.send_error_response(
+                            request.id,
+                            -32601,
+                            format!("unsupported app-server request: {}", request.method),
+                        )?;
+                    }
                 }
             }
         }
     }
+
+    fn send_success_response(&mut self, id: Value, result: Value) -> Result<()> {
+        let response = json!({
+            "id": id,
+            "result": result,
+        });
+        self.websocket
+            .send_text(&serde_json::to_string(&response).context("encode app-server response")?)
+    }
+
+    fn send_error_response(&mut self, id: Value, code: i64, message: String) -> Result<()> {
+        let response = json!({
+            "id": id,
+            "error": {
+                "code": code,
+                "message": message,
+            },
+        });
+        self.websocket.send_text(
+            &serde_json::to_string(&response).context("encode app-server error response")?,
+        )
+    }
+}
+
+fn is_approval_request_method(method: &str) -> bool {
+    matches!(
+        method,
+        "item/commandExecution/requestApproval"
+            | "item/fileChange/requestApproval"
+            | "item/permissions/requestApproval"
+            | "execCommandApproval"
+            | "applyPatchApproval"
+    )
+}
+
+fn latest_in_progress_turn_id(response: &Value) -> Option<String> {
+    response
+        .get("thread")?
+        .get("turns")?
+        .as_array()?
+        .iter()
+        .rev()
+        .find(|turn| turn.get("status").and_then(Value::as_str) == Some("inProgress"))?
+        .get("id")?
+        .as_str()
+        .map(str::to_string)
 }
 
 fn notification_delta<'a>(
@@ -422,5 +563,29 @@ mod tests {
         assert_eq!(summary.source, "custom");
         assert_eq!(summary.status, "active");
         assert!(summary.active);
+    }
+
+    #[test]
+    fn server_request_is_not_misread_as_empty_response() {
+        let message = serde_json::from_value::<ServerMessage>(json!({
+            "id": 7,
+            "method": "item/commandExecution/requestApproval",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "item-1",
+                "command": "touch /tmp/x"
+            }
+        }))
+        .unwrap();
+
+        match message {
+            ServerMessage::Request(request) => {
+                assert_eq!(request.id, json!(7));
+                assert_eq!(request.method, "item/commandExecution/requestApproval");
+                assert!(is_approval_request_method(&request.method));
+            }
+            other => panic!("expected server request, got {other:?}"),
+        }
     }
 }

@@ -10,6 +10,7 @@ pub mod telegram {
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
+    use std::time::Instant;
 
     use anyhow::Context;
     use anyhow::Result;
@@ -18,8 +19,12 @@ pub mod telegram {
     use reqwest::blocking::Client;
     use serde::Deserialize;
     use serde::Serialize;
+    use serde_json::json;
+    use serde_json::Value;
 
     use crate::app_server::AppServerClient;
+    use crate::app_server::AppThreadSummary;
+    use crate::app_server::ApprovalRequest;
     use crate::cli::TelegramBindArgs;
     use crate::cli::TelegramMenuArgs;
     use crate::cli::TelegramRunArgs;
@@ -34,6 +39,7 @@ pub mod telegram {
     use crate::session::SessionId;
 
     const TELEGRAM_STATE_SCHEMA_VERSION: u64 = 1;
+    const PORTAL_TOPIC_TITLE: &str = "cx portal";
 
     #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
     #[serde(rename_all = "camelCase")]
@@ -58,6 +64,16 @@ pub mod telegram {
         session_id: SessionId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         app_thread_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        app_thread_title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        app_thread_cwd: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        topic_title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        panel_message_id: Option<i64>,
+        #[serde(default)]
+        telegram_paused: bool,
         #[serde(default)]
         topic_created_by_adapter: bool,
     }
@@ -108,6 +124,13 @@ pub mod telegram {
         message_id: i64,
         message_thread_id: Option<i64>,
         text: Option<String>,
+        forum_topic_edited: Option<TelegramForumTopicEdited>,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    struct TelegramForumTopicEdited {
+        #[serde(default)]
+        name: Option<String>,
     }
 
     #[derive(Debug, Clone, Deserialize)]
@@ -119,7 +142,9 @@ pub mod telegram {
 
     #[derive(Debug, Deserialize)]
     struct TelegramCallbackQuery {
+        id: String,
         message: Option<TelegramMessage>,
+        data: Option<String>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -143,6 +168,8 @@ pub mod telegram {
         source: TelegramUpdateSource,
         chat_id: Option<i64>,
         message: Option<TelegramMessage>,
+        callback_query_id: Option<String>,
+        callback_data: Option<String>,
     }
 
     impl TelegramUpdate {
@@ -164,13 +191,17 @@ pub mod telegram {
             }
             if let Some(callback_query) = self.callback_query {
                 return match callback_query.message {
-                    Some(message) => {
-                        TelegramUpdateView::message(TelegramUpdateSource::CallbackQuery, message)
-                    }
+                    Some(message) => TelegramUpdateView::callback_query(
+                        message,
+                        callback_query.id,
+                        callback_query.data,
+                    ),
                     None => TelegramUpdateView {
                         source: TelegramUpdateSource::CallbackQuery,
                         chat_id: None,
                         message: None,
+                        callback_query_id: Some(callback_query.id),
+                        callback_data: callback_query.data,
                     },
                 };
             }
@@ -179,12 +210,16 @@ pub mod telegram {
                     source: TelegramUpdateSource::MyChatMember,
                     chat_id: Some(my_chat_member.chat.id),
                     message: None,
+                    callback_query_id: None,
+                    callback_data: None,
                 };
             }
             TelegramUpdateView {
                 source: TelegramUpdateSource::Unknown,
                 chat_id: None,
                 message: None,
+                callback_query_id: None,
+                callback_data: None,
             }
         }
     }
@@ -195,6 +230,22 @@ pub mod telegram {
                 source,
                 chat_id: Some(message.chat.id),
                 message: Some(message),
+                callback_query_id: None,
+                callback_data: None,
+            }
+        }
+
+        fn callback_query(
+            message: TelegramMessage,
+            callback_query_id: String,
+            callback_data: Option<String>,
+        ) -> Self {
+            Self {
+                source: TelegramUpdateSource::CallbackQuery,
+                chat_id: Some(message.chat.id),
+                message: Some(message),
+                callback_query_id: Some(callback_query_id),
+                callback_data,
             }
         }
     }
@@ -287,11 +338,67 @@ pub mod telegram {
                 channel_id,
                 session_id: result.session.session_id,
                 app_thread_id: None,
+                app_thread_title: None,
+                app_thread_cwd: None,
+                topic_title: None,
+                panel_message_id: None,
+                telegram_paused: false,
                 topic_created_by_adapter: false,
             };
             self.bindings.push(binding.clone());
             self.set_active_route(route, alias);
             Ok(binding)
+        }
+
+        fn bind_app_thread(
+            &mut self,
+            paths: &ManagerPaths,
+            route: &TelegramRoute,
+            app_thread: &AppThreadPortalEntry,
+            topic_created_by_adapter: bool,
+        ) -> Result<TelegramBinding> {
+            let mut binding = self.bind_route(paths, route, None)?;
+            let existing_session_id = binding.session_id.clone();
+            if let Some(stored) = self.binding_for_route_mut(route, None) {
+                stored.app_thread_id = Some(app_thread.thread_id.clone());
+                stored.app_thread_title = app_thread.title.clone();
+                stored.app_thread_cwd = Some(app_thread.cwd.clone());
+                stored.topic_title = Some(work_topic_title(app_thread));
+                stored.panel_message_id = None;
+                stored.telegram_paused = false;
+                stored.topic_created_by_adapter = topic_created_by_adapter;
+                binding = stored.clone();
+            }
+            debug_assert_eq!(binding.session_id, existing_session_id);
+            Ok(binding)
+        }
+
+        fn set_topic_title(&mut self, route: &TelegramRoute, title: &str) {
+            for binding in self.bindings.iter_mut().filter(|binding| {
+                binding.chat_id == route.chat_id
+                    && binding.message_thread_id == route.message_thread_id
+            }) {
+                binding.topic_title = Some(title.to_string());
+            }
+        }
+
+        fn panel_message_id_for_route(&self, route: &TelegramRoute) -> Option<i64> {
+            self.bindings
+                .iter()
+                .find(|binding| {
+                    binding.chat_id == route.chat_id
+                        && binding.message_thread_id == route.message_thread_id
+                })
+                .and_then(|binding| binding.panel_message_id)
+        }
+
+        fn remember_panel_message(&mut self, route: &TelegramRoute, message_id: i64) {
+            for binding in self.bindings.iter_mut().filter(|binding| {
+                binding.chat_id == route.chat_id
+                    && binding.message_thread_id == route.message_thread_id
+            }) {
+                binding.panel_message_id = Some(message_id);
+            }
         }
 
         fn set_active_route(&mut self, route: &TelegramRoute, alias: Option<&str>) {
@@ -321,6 +428,22 @@ pub mod telegram {
                     !(active.chat_id == route.chat_id
                         && active.message_thread_id == route.message_thread_id
                         && active.alias.as_deref() == alias)
+                });
+                return true;
+            }
+            false
+        }
+
+        fn remove_all_route_bindings(&mut self, route: &TelegramRoute) -> bool {
+            let original_len = self.bindings.len();
+            self.bindings.retain(|binding| {
+                !(binding.chat_id == route.chat_id
+                    && binding.message_thread_id == route.message_thread_id)
+            });
+            if original_len != self.bindings.len() {
+                self.active_routes.retain(|active| {
+                    !(active.chat_id == route.chat_id
+                        && active.message_thread_id == route.message_thread_id)
                 });
                 return true;
             }
@@ -380,6 +503,7 @@ pub mod telegram {
             .build()
             .context("build Telegram HTTP client")?;
         sync_bot_commands(&client, &token)?;
+        refresh_startup_portals(&paths, &client, &token, &mut state, args.app_server_timeout)?;
 
         loop {
             let outcome = poll_once(
@@ -552,8 +676,13 @@ pub mod telegram {
                 trusted.insert(route.clone());
                 bound_route = Some(route);
             }
+            let callback_message_id = view.callback_query_id.as_ref().map(|_| message.message_id);
             let notifier = TelegramNotifier { client, token };
-            notifier.ack_seen(&message);
+            if let Some(callback_query_id) = view.callback_query_id.as_deref() {
+                notifier.answer_callback_query(callback_query_id, None);
+            } else {
+                notifier.ack_seen(&message);
+            }
             let reply = handle_message(
                 paths,
                 state,
@@ -564,17 +693,20 @@ pub mod telegram {
                     steal: options.steal,
                     authorized_by_bind: matches!(access, MessageAccess::AuthorizedByBind),
                     app_server_timeout: options.app_server_timeout,
+                    callback_data: view.callback_data.as_deref(),
+                    callback_message_id,
                 },
             )?;
             write_state(paths, state)?;
             if let Some(reply) = reply {
-                send_reply(
-                    client,
-                    token,
-                    reply.chat_id,
-                    reply.message_thread_id,
-                    &reply.text,
-                )?;
+                let route = reply.route();
+                let panel_message_id = deliver_reply(client, token, &reply)?;
+                if reply.remember_panel_message {
+                    if let Some(message_id) = panel_message_id {
+                        state.remember_panel_message(&route, message_id);
+                        write_state(paths, state)?;
+                    }
+                }
             }
         }
         write_state(paths, state)?;
@@ -588,6 +720,83 @@ pub mod telegram {
         if request_timeout <= 0.0 {
             anyhow::bail!("--request-timeout must be positive");
         }
+        Ok(())
+    }
+
+    fn refresh_startup_portals(
+        paths: &ManagerPaths,
+        client: &Client,
+        token: &str,
+        state: &mut TelegramState,
+        app_server_timeout: f32,
+    ) -> Result<()> {
+        let mut routes = state
+            .bindings
+            .iter()
+            .filter(|binding| binding.message_thread_id.is_none())
+            .map(|binding| TelegramRoute {
+                chat_id: binding.chat_id,
+                message_thread_id: None,
+            })
+            .collect::<Vec<_>>();
+        routes.sort();
+        routes.dedup();
+
+        for route in routes {
+            if route.chat_id < 0 {
+                if let Err(err) = unhide_general_forum_topic(client, token, route.chat_id) {
+                    eprintln!(
+                        "telegram portal startup unhideGeneralForumTopic failed for {}: {err:#}",
+                        route.display()
+                    );
+                }
+                if let Err(err) =
+                    edit_general_forum_topic(client, token, route.chat_id, PORTAL_TOPIC_TITLE)
+                {
+                    eprintln!(
+                        "telegram portal startup editGeneralForumTopic failed for {}: {err:#}",
+                        route.display()
+                    );
+                }
+            }
+
+            let edit_message_id = state.panel_message_id_for_route(&route);
+            let reply = portal_reply(paths, &route, app_server_timeout, edit_message_id)
+                .unwrap_or_else(|err| portal_unavailable_reply(&route, err, edit_message_id));
+            match deliver_reply(client, token, &reply) {
+                Ok(Some(message_id)) => {
+                    state.remember_panel_message(&route, message_id);
+                }
+                Ok(None) => {}
+                Err(err) if reply.edit_message_id.is_some() => {
+                    eprintln!(
+                        "telegram portal startup edit panel failed for {}: {err:#}",
+                        route.display()
+                    );
+                    let fresh_reply = portal_reply(paths, &route, app_server_timeout, None)
+                        .unwrap_or_else(|err| portal_unavailable_reply(&route, err, None));
+                    match deliver_reply(client, token, &fresh_reply) {
+                        Ok(Some(message_id)) => {
+                            state.remember_panel_message(&route, message_id);
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            eprintln!(
+                                "telegram portal startup fresh panel failed for {}: {err:#}",
+                                route.display()
+                            );
+                        }
+                    }
+                }
+                Err(err) => {
+                    eprintln!(
+                        "telegram portal startup send panel failed for {}: {err:#}",
+                        route.display()
+                    );
+                }
+            }
+        }
+        write_state(paths, state)?;
         Ok(())
     }
 
@@ -626,6 +835,117 @@ pub mod telegram {
         chat_id: i64,
         message_thread_id: Option<i64>,
         text: String,
+        reply_markup: Option<TelegramInlineKeyboardMarkup>,
+        edit_message_id: Option<i64>,
+        remember_panel_message: bool,
+    }
+
+    #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+    struct TelegramInlineKeyboardMarkup {
+        inline_keyboard: Vec<Vec<TelegramInlineKeyboardButton>>,
+    }
+
+    #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+    struct TelegramInlineKeyboardButton {
+        text: String,
+        callback_data: String,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct AppThreadPortalEntry {
+        thread_id: String,
+        title: Option<String>,
+        preview: String,
+        cwd: String,
+        active: bool,
+        status: String,
+    }
+
+    impl From<AppThreadSummary> for AppThreadPortalEntry {
+        fn from(summary: AppThreadSummary) -> Self {
+            Self {
+                thread_id: summary.upstream_thread_id,
+                title: summary.title,
+                preview: summary.preview,
+                cwd: summary.cwd,
+                active: summary.active,
+                status: summary.status,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum TelegramCallbackCommand {
+        RefreshPortal,
+        RefreshWork,
+        Attach { thread_id: String },
+        Takeover,
+        Release,
+        Close,
+    }
+
+    impl TelegramCallbackCommand {
+        fn parse(data: &str) -> Option<Self> {
+            match data {
+                "cx:p" => Some(Self::RefreshPortal),
+                "cx:w" => Some(Self::RefreshWork),
+                "cx:t" => Some(Self::Takeover),
+                "cx:rel" => Some(Self::Release),
+                "cx:c" => Some(Self::Close),
+                _ => {
+                    let thread_id = data.strip_prefix("cx:a:")?;
+                    if thread_id.is_empty() {
+                        return None;
+                    }
+                    Some(Self::Attach {
+                        thread_id: thread_id.to_string(),
+                    })
+                }
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum TelegramApprovalDecision {
+        AcceptOnce,
+        AcceptForSession,
+        Decline,
+    }
+
+    impl TelegramApprovalDecision {
+        fn label(self) -> &'static str {
+            match self {
+                Self::AcceptOnce => "Approved once",
+                Self::AcceptForSession => "Approved for session",
+                Self::Decline => "Denied",
+            }
+        }
+    }
+
+    fn approval_callback_data(nonce: &str, decision: TelegramApprovalDecision) -> String {
+        let suffix = match decision {
+            TelegramApprovalDecision::AcceptOnce => "a",
+            TelegramApprovalDecision::AcceptForSession => "s",
+            TelegramApprovalDecision::Decline => "d",
+        };
+        format!("cx:ap:{nonce}:{suffix}")
+    }
+
+    fn parse_approval_callback_data(
+        data: &str,
+        expected_nonce: &str,
+    ) -> Option<TelegramApprovalDecision> {
+        let rest = data.strip_prefix("cx:ap:")?;
+        let (nonce, suffix) = rest.rsplit_once(':')?;
+        if nonce != expected_nonce {
+            return None;
+        }
+        match suffix {
+            "a" => Some(TelegramApprovalDecision::AcceptOnce),
+            "s" => Some(TelegramApprovalDecision::AcceptForSession),
+            "d" => Some(TelegramApprovalDecision::Decline),
+            _ => None,
+        }
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -689,10 +1009,35 @@ pub mod telegram {
     ) -> Result<Option<TelegramReply>> {
         let route = TelegramRoute::from_message(&message);
         let chat_id = route.chat_id;
+        let chat_is_forum = message.chat.is_forum;
+        if let Some(edit) = message.forum_topic_edited.as_ref() {
+            if let Some(name) = edit.name.as_deref() {
+                state.set_topic_title(&route, name);
+            }
+            return Ok(None);
+        }
         let text = message.text.unwrap_or_default();
         let command = TelegramTextCommand::parse(&text);
 
+        if let Some(callback_data) = options.callback_data {
+            return handle_callback(paths, state, &route, chat_is_forum, callback_data, &options);
+        }
+
         match command {
+            TelegramTextCommand::Portal => Ok(Some(
+                portal_reply(paths, &route, options.app_server_timeout, None)
+                    .unwrap_or_else(|err| portal_unavailable_reply(&route, err, None)),
+            )),
+            TelegramTextCommand::Attach { thread_id } => {
+                let Some(thread_id) = thread_id.as_deref() else {
+                    return Ok(Some(reply(&route, "Usage: /attach <thread-id>")));
+                };
+                Ok(Some(
+                    attach_app_thread(paths, state, &route, chat_is_forum, thread_id, &options)
+                        .unwrap_or_else(|err| reply(&route, portal_unavailable_message(err))),
+                ))
+            }
+            TelegramTextCommand::Takeover => takeover_handoff(paths, state, &route, &options, None),
             TelegramTextCommand::Status => {
                 let Some(binding) = state.active_binding_for_route(&route) else {
                     return Ok(Some(reply(&route, no_session_bound_message(state, &route))));
@@ -701,11 +1046,19 @@ pub mod telegram {
                 Ok(Some(reply(
                     &route,
                     format!(
-                        "session: {}\nalias: {}\nroute: {}\nchannel: {}\nlease_epoch: {}\nactive_lease: {}",
+                        "session: {}\nalias: {}\nroute: {}\ntopic_title: {}\nchannel: {}\ntelegram: {}\napp_thread: {}\ncwd: {}\nlease_epoch: {}\nactive_lease: {}",
                         session.session_id,
                         binding.alias.as_deref().unwrap_or("default"),
                         route.display(),
+                        binding.topic_title.as_deref().unwrap_or("<unknown>"),
                         session.current_channel_id,
+                        if binding.telegram_paused {
+                            "paused"
+                        } else {
+                            "active"
+                        },
+                        binding.app_thread_id.as_deref().unwrap_or("<none>"),
+                        binding.app_thread_cwd.as_deref().unwrap_or("<unknown>"),
                         session.lease_epoch,
                         session
                             .active_lease
@@ -725,29 +1078,7 @@ pub mod telegram {
                 }
                 Ok(Some(reply(&route, lines.join("\n"))))
             }
-            TelegramTextCommand::Release => {
-                let Some(binding) = state.active_binding_for_route(&route) else {
-                    return Ok(Some(reply(&route, no_session_bound_message(state, &route))));
-                };
-                let session = session::show_session(paths, &binding.session_id)?;
-                let Some(active_lease) = session.active_lease else {
-                    return Ok(Some(reply(&route, "This session has no active lease.")));
-                };
-                if active_lease.channel_id != binding.channel_id {
-                    return Ok(Some(reply(
-                        &route,
-                        format!("Lease is held by {}.", active_lease.channel_id),
-                    )));
-                }
-                session::release_lease(
-                    paths,
-                    session::ReleaseLeaseRequest {
-                        session_id: binding.session_id.clone(),
-                        lease_token: active_lease.lease_token,
-                    },
-                )?;
-                Ok(Some(reply(&route, "Released Telegram lease.")))
-            }
+            TelegramTextCommand::Release => release_handoff(paths, state, &route, None),
             TelegramTextCommand::Bind { .. } if !options.authorized_by_bind => {
                 Ok(Some(reply(&route, "Invalid or disabled bind secret.")))
             }
@@ -804,8 +1135,7 @@ pub mod telegram {
                         ),
                     )));
                 }
-                let effective_route = if route.message_thread_id.is_none() && message.chat.is_forum
-                {
+                let effective_route = if route.message_thread_id.is_none() && chat_is_forum {
                     if let Some(notifier) = options.notifier {
                         match create_forum_topic(
                             notifier.client,
@@ -836,7 +1166,7 @@ pub mod telegram {
                         if let (Some(topic_id), Some(notifier)) =
                             (effective_route.message_thread_id, options.notifier)
                         {
-                            let _ = close_forum_topic(
+                            let _ = delete_forum_topic(
                                 notifier.client,
                                 notifier.token,
                                 effective_route.chat_id,
@@ -880,42 +1210,19 @@ pub mod telegram {
             TelegramTextCommand::Close { alias } => {
                 let alias = normalize_alias(alias.as_deref())
                     .or_else(|| state.active_alias_for_route(&route).map(str::to_string));
-                if let Some(binding) = state.binding_for_route(&route, alias.as_deref()) {
-                    if let (Some(thread_id), Some(notifier)) =
-                        (binding.message_thread_id, options.notifier)
-                    {
-                        if binding.topic_created_by_adapter {
-                            if let Err(err) = close_forum_topic(
-                                notifier.client,
-                                notifier.token,
-                                route.chat_id,
-                                thread_id,
-                            ) {
-                                eprintln!("telegram closeForumTopic failed: {err:#}");
-                            }
-                        }
-                    }
-                }
-                if state.remove_route_binding(&route, alias.as_deref()) {
-                    Ok(Some(reply(
-                        &route,
-                        format!(
-                            "Unbound session `{}`.",
-                            alias.as_deref().unwrap_or("default")
-                        ),
-                    )))
-                } else {
-                    Ok(Some(reply(
-                        &route,
-                        missing_session_message(state, &route, alias.as_deref()),
-                    )))
-                }
+                close_bound_route(paths, state, &route, alias.as_deref(), &options)
             }
             TelegramTextCommand::Message => {
+                if is_portal_route(&route, chat_is_forum) {
+                    return Ok(Some(
+                        portal_reply(paths, &route, options.app_server_timeout, None)
+                            .unwrap_or_else(|err| portal_unavailable_reply(&route, err, None)),
+                    ));
+                }
                 if text.trim().is_empty() {
                     return Ok(Some(reply(
                         &route,
-                        "Send a message for Codex to answer, or use /new <name>, /use <name>, /sessions, /status, /close.",
+                        "Send a message for Codex to answer, or open the cx portal.",
                     )));
                 }
                 let binding = state
@@ -923,6 +1230,14 @@ pub mod telegram {
                     .cloned()
                     .map(Ok)
                     .unwrap_or_else(|| state.bind_route(paths, &route, None))?;
+                if binding.telegram_paused {
+                    return Ok(Some(work_panel_reply(
+                        &route,
+                        &binding,
+                        "Telegram handoff is paused for this topic.",
+                        None,
+                    )));
+                }
                 session::record_channel_message(
                     paths,
                     RecordChannelMessageRequest {
@@ -974,12 +1289,557 @@ pub mod telegram {
         }
     }
 
+    fn handle_callback(
+        paths: &ManagerPaths,
+        state: &mut TelegramState,
+        route: &TelegramRoute,
+        chat_is_forum: bool,
+        callback_data: &str,
+        options: &HandleOptions<'_>,
+    ) -> Result<Option<TelegramReply>> {
+        let edit_message_id = options.callback_message_id;
+        if callback_data.starts_with("cx:ap:") {
+            return Ok(Some(reply(
+                route,
+                "That approval request is no longer pending.",
+            )));
+        }
+        match TelegramCallbackCommand::parse(callback_data) {
+            Some(TelegramCallbackCommand::RefreshPortal) => Ok(Some(
+                portal_reply(paths, route, options.app_server_timeout, edit_message_id)
+                    .unwrap_or_else(|err| portal_unavailable_reply(route, err, edit_message_id)),
+            )),
+            Some(TelegramCallbackCommand::RefreshWork) => {
+                Ok(Some(refresh_work_panel(state, route, edit_message_id)))
+            }
+            Some(TelegramCallbackCommand::Attach { thread_id }) => Ok(Some(
+                attach_app_thread(paths, state, route, chat_is_forum, &thread_id, options)
+                    .unwrap_or_else(|err| reply(route, portal_unavailable_message(err))),
+            )),
+            Some(TelegramCallbackCommand::Takeover) => {
+                takeover_handoff(paths, state, route, options, edit_message_id)
+            }
+            Some(TelegramCallbackCommand::Release) => {
+                release_handoff(paths, state, route, edit_message_id)
+            }
+            Some(TelegramCallbackCommand::Close) => {
+                close_bound_route(paths, state, route, None, options)
+            }
+            None => Ok(Some(reply(route, "Unsupported portal action."))),
+        }
+    }
+
+    fn portal_reply(
+        paths: &ManagerPaths,
+        route: &TelegramRoute,
+        timeout_secs: f32,
+        edit_message_id: Option<i64>,
+    ) -> Result<TelegramReply> {
+        let entries = list_portal_entries(paths, timeout_secs, 8)?;
+        if entries.is_empty() {
+            return Ok(panel_reply_with_keyboard(
+                route,
+                "No Codex threads are visible. Start or resume a local cx session first, then tap Refresh.",
+                portal_keyboard(&entries),
+                edit_message_id,
+            ));
+        }
+        Ok(panel_reply_with_keyboard(
+            route,
+            portal_text(&entries),
+            portal_keyboard(&entries),
+            edit_message_id,
+        ))
+    }
+
+    fn attach_app_thread(
+        paths: &ManagerPaths,
+        state: &mut TelegramState,
+        route: &TelegramRoute,
+        chat_is_forum: bool,
+        thread_id: &str,
+        options: &HandleOptions<'_>,
+    ) -> Result<TelegramReply> {
+        let entries = list_portal_entries(paths, options.app_server_timeout, 30)?;
+        let Some(entry) = entries
+            .into_iter()
+            .find(|entry| entry.thread_id == thread_id)
+        else {
+            return Ok(reply(
+                route,
+                "That Codex thread is no longer visible. Open /portal and choose again.",
+            ));
+        };
+        let mut interrupted_turn_id = None;
+        if entry.active {
+            let mut client = connect_app_server(paths, options.app_server_timeout)?;
+            let interrupted = client.interrupt_active_turn(&entry.thread_id)?;
+            interrupted_turn_id = interrupted.interrupted_turn_id;
+        }
+
+        let mut topic_created_by_adapter = false;
+        let effective_route = if should_create_work_topic(state, route, chat_is_forum) {
+            if let Some(notifier) = options.notifier {
+                let topic_id = create_forum_topic(
+                    notifier.client,
+                    notifier.token,
+                    route.chat_id,
+                    &work_topic_title(&entry),
+                )?;
+                topic_created_by_adapter = true;
+                TelegramRoute {
+                    chat_id: route.chat_id,
+                    message_thread_id: Some(topic_id),
+                }
+            } else {
+                route.clone()
+            }
+        } else {
+            route.clone()
+        };
+
+        let binding =
+            state.bind_app_thread(paths, &effective_route, &entry, topic_created_by_adapter)?;
+        session::record_channel_message(
+            paths,
+            RecordChannelMessageRequest {
+                session_id: binding.session_id.clone(),
+                channel_id: binding.channel_id.clone(),
+            },
+        )?;
+        if options.acquire_lease {
+            acquire_binding_lease(paths, &binding, options.steal)?;
+        }
+
+        let headline = match interrupted_turn_id {
+            Some(turn_id) => format!(
+                "Telegram handoff active.\nInterrupted desktop turn {turn_id}.\nthread: {}\ncwd: {}",
+                entry.thread_id, entry.cwd
+            ),
+            None if entry.active => format!(
+                "Telegram handoff active.\nNo interruptible desktop turn was running.\nthread: {}\ncwd: {}",
+                entry.thread_id, entry.cwd
+            ),
+            None => format!(
+                "Telegram handoff active.\nthread: {}\ncwd: {}",
+                entry.thread_id, entry.cwd
+            ),
+        };
+        Ok(work_panel_reply(&effective_route, &binding, headline, None))
+    }
+
+    fn takeover_handoff(
+        paths: &ManagerPaths,
+        state: &mut TelegramState,
+        route: &TelegramRoute,
+        options: &HandleOptions<'_>,
+        edit_message_id: Option<i64>,
+    ) -> Result<Option<TelegramReply>> {
+        let Some(binding) = state.active_binding_for_route(route).cloned() else {
+            return Ok(Some(reply(route, no_session_bound_message(state, route))));
+        };
+        match interrupt_binding_thread(paths, &binding, options.app_server_timeout) {
+            Ok(interrupted) => {
+                if let Some(stored) = state.binding_for_route_mut(route, binding.alias.as_deref()) {
+                    stored.telegram_paused = false;
+                }
+                let binding = state
+                    .binding_for_route(route, binding.alias.as_deref())
+                    .cloned()
+                    .unwrap_or(binding);
+                Ok(Some(work_panel_reply(
+                    route,
+                    &binding,
+                    takeover_message(interrupted.interrupted_turn_id.as_deref()),
+                    edit_message_id,
+                )))
+            }
+            Err(err) => Ok(Some(reply(route, portal_unavailable_message(err)))),
+        }
+    }
+
+    fn release_handoff(
+        paths: &ManagerPaths,
+        state: &mut TelegramState,
+        route: &TelegramRoute,
+        edit_message_id: Option<i64>,
+    ) -> Result<Option<TelegramReply>> {
+        let Some(binding) = state.active_binding_for_route(route).cloned() else {
+            return Ok(Some(reply(route, no_session_bound_message(state, route))));
+        };
+        if let Some(stored) = state.binding_for_route_mut(route, binding.alias.as_deref()) {
+            stored.telegram_paused = true;
+        }
+        let mut released_lease = false;
+        if let Ok(session) = session::show_session(paths, &binding.session_id) {
+            if let Some(active_lease) = session.active_lease {
+                if active_lease.channel_id == binding.channel_id {
+                    session::release_lease(
+                        paths,
+                        session::ReleaseLeaseRequest {
+                            session_id: binding.session_id.clone(),
+                            lease_token: active_lease.lease_token,
+                        },
+                    )?;
+                    released_lease = true;
+                }
+            }
+        }
+        let suffix = if released_lease {
+            " Lease released."
+        } else {
+            ""
+        };
+        let binding = state
+            .binding_for_route(route, binding.alias.as_deref())
+            .cloned()
+            .unwrap_or(binding);
+        Ok(Some(work_panel_reply(
+            route,
+            &binding,
+            format!("Telegram handoff paused.{suffix} Continue on desktop."),
+            edit_message_id,
+        )))
+    }
+
+    fn refresh_work_panel(
+        state: &TelegramState,
+        route: &TelegramRoute,
+        edit_message_id: Option<i64>,
+    ) -> TelegramReply {
+        let Some(binding) = state.active_binding_for_route(route) else {
+            return reply(route, no_session_bound_message(state, route));
+        };
+        work_panel_reply(route, binding, "cx handoff", edit_message_id)
+    }
+
+    fn close_bound_route(
+        paths: &ManagerPaths,
+        state: &mut TelegramState,
+        route: &TelegramRoute,
+        alias: Option<&str>,
+        options: &HandleOptions<'_>,
+    ) -> Result<Option<TelegramReply>> {
+        let alias = alias
+            .map(str::to_string)
+            .or_else(|| state.active_alias_for_route(route).map(str::to_string));
+        let Some(binding) = state.binding_for_route(route, alias.as_deref()).cloned() else {
+            return Ok(Some(reply(
+                route,
+                missing_session_message(state, route, alias.as_deref()),
+            )));
+        };
+        if let Some(thread_id) = binding.message_thread_id {
+            if let Some(notifier) = options.notifier {
+                if let Err(err) =
+                    archive_route_app_threads(paths, state, route, options.app_server_timeout)
+                {
+                    return Ok(Some(reply(
+                        route,
+                        format!("Failed to archive Codex threads before closing.\n{err:#}"),
+                    )));
+                }
+                if let Err(err) =
+                    delete_forum_topic(notifier.client, notifier.token, binding.chat_id, thread_id)
+                {
+                    return Ok(Some(reply(
+                        route,
+                        format!(
+                            "Failed to delete Telegram topic; keeping binding active.\n{err:#}"
+                        ),
+                    )));
+                }
+                state.remove_all_route_bindings(route);
+                return Ok(None);
+            }
+        }
+        if let Err(err) = archive_bound_app_thread(paths, &binding, options.app_server_timeout) {
+            return Ok(Some(reply(
+                route,
+                format!("Failed to archive Codex thread before closing.\n{err:#}"),
+            )));
+        }
+        if state.remove_route_binding(route, alias.as_deref()) {
+            Ok(Some(reply(
+                route,
+                format!(
+                    "Unbound session `{}`.",
+                    alias.as_deref().unwrap_or("default")
+                ),
+            )))
+        } else {
+            Ok(Some(reply(
+                route,
+                missing_session_message(state, route, alias.as_deref()),
+            )))
+        }
+    }
+
+    fn should_create_work_topic(
+        state: &TelegramState,
+        route: &TelegramRoute,
+        chat_is_forum: bool,
+    ) -> bool {
+        chat_is_forum
+            && (route.message_thread_id.is_none()
+                || state.active_binding_for_route(route).is_none())
+    }
+
+    fn acquire_binding_lease(
+        paths: &ManagerPaths,
+        binding: &TelegramBinding,
+        steal: bool,
+    ) -> Result<()> {
+        session::acquire_lease(
+            paths,
+            AcquireLeaseRequest {
+                session_id: binding.session_id.clone(),
+                channel_id: binding.channel_id.clone(),
+                steal,
+            },
+        )?;
+        Ok(())
+    }
+
+    fn interrupt_binding_thread(
+        paths: &ManagerPaths,
+        binding: &TelegramBinding,
+        timeout_secs: f32,
+    ) -> Result<crate::app_server::InterruptOutcome> {
+        let Some(thread_id) = binding.app_thread_id.as_deref() else {
+            return Ok(crate::app_server::InterruptOutcome {
+                interrupted_turn_id: None,
+            });
+        };
+        let mut client = connect_app_server(paths, timeout_secs)?;
+        client.interrupt_active_turn(thread_id)
+    }
+
+    fn archive_bound_app_thread(
+        paths: &ManagerPaths,
+        binding: &TelegramBinding,
+        timeout_secs: f32,
+    ) -> Result<()> {
+        let Some(thread_id) = binding.app_thread_id.as_deref() else {
+            return Ok(());
+        };
+        let mut client = connect_app_server(paths, timeout_secs)?;
+        client.thread_archive(thread_id)
+    }
+
+    fn archive_route_app_threads(
+        paths: &ManagerPaths,
+        state: &TelegramState,
+        route: &TelegramRoute,
+        timeout_secs: f32,
+    ) -> Result<()> {
+        let thread_ids = state
+            .bindings
+            .iter()
+            .filter(|binding| {
+                binding.chat_id == route.chat_id
+                    && binding.message_thread_id == route.message_thread_id
+            })
+            .filter_map(|binding| binding.app_thread_id.clone())
+            .collect::<BTreeSet<_>>();
+        if thread_ids.is_empty() {
+            return Ok(());
+        }
+        let mut client = connect_app_server(paths, timeout_secs)?;
+        for thread_id in thread_ids {
+            client.thread_archive(&thread_id)?;
+        }
+        Ok(())
+    }
+
+    fn connect_app_server(paths: &ManagerPaths, timeout_secs: f32) -> Result<AppServerClient> {
+        let server = serve::ready_app_server(paths)?;
+        let mut client =
+            AppServerClient::connect(&server.listen_url, Duration::from_secs_f32(timeout_secs))?;
+        client.initialize("cx-telegram", env!("CARGO_PKG_VERSION"))?;
+        Ok(client)
+    }
+
+    fn list_portal_entries(
+        paths: &ManagerPaths,
+        timeout_secs: f32,
+        limit: u64,
+    ) -> Result<Vec<AppThreadPortalEntry>> {
+        let mut client = connect_app_server(paths, timeout_secs)?;
+        let page = client.thread_list(limit)?;
+        Ok(page
+            .threads
+            .into_iter()
+            .map(AppThreadPortalEntry::from)
+            .collect())
+    }
+
+    fn portal_text(entries: &[AppThreadPortalEntry]) -> String {
+        let mut lines = vec![String::from(PORTAL_TOPIC_TITLE)];
+        for (index, entry) in entries.iter().enumerate() {
+            lines.push(format!(
+                "{}. {} [{}]\n   cwd: {}",
+                index + 1,
+                work_topic_title(entry),
+                entry.status,
+                entry.cwd
+            ));
+        }
+        lines.push(String::from("Tap a thread to continue it from Telegram."));
+        lines.join("\n")
+    }
+
+    fn portal_keyboard(entries: &[AppThreadPortalEntry]) -> TelegramInlineKeyboardMarkup {
+        let mut rows = entries
+            .iter()
+            .map(|entry| {
+                vec![TelegramInlineKeyboardButton {
+                    text: portal_button_text(entry),
+                    callback_data: format!("cx:a:{}", entry.thread_id),
+                }]
+            })
+            .collect::<Vec<_>>();
+        rows.push(vec![TelegramInlineKeyboardButton {
+            text: String::from("Refresh"),
+            callback_data: String::from("cx:p"),
+        }]);
+        TelegramInlineKeyboardMarkup {
+            inline_keyboard: rows,
+        }
+    }
+
+    fn portal_button_text(entry: &AppThreadPortalEntry) -> String {
+        let prefix = if entry.active { "Take over" } else { "Open" };
+        truncate_chars(&format!("{prefix}: {}", work_topic_title(entry)), 48)
+    }
+
+    fn work_topic_title(entry: &AppThreadPortalEntry) -> String {
+        let title = entry
+            .title
+            .as_deref()
+            .filter(|title| !title.trim().is_empty())
+            .or_else(|| {
+                let preview = entry.preview.trim();
+                (!preview.is_empty()).then_some(preview)
+            })
+            .unwrap_or("Codex thread");
+        truncate_chars(title.lines().next().unwrap_or("Codex thread"), 64)
+    }
+
+    fn takeover_message(interrupted_turn_id: Option<&str>) -> String {
+        match interrupted_turn_id {
+            Some(turn_id) => {
+                format!("Telegram handoff active. Interrupted desktop turn {turn_id}.")
+            }
+            None => {
+                String::from("Telegram handoff active. No active desktop turn needed interruption.")
+            }
+        }
+    }
+
+    fn portal_unavailable_message(err: anyhow::Error) -> String {
+        format!(
+            "Codex portal is unavailable.\n{err:#}\n\nStart or restart the local service with `cx service start`, then tap Refresh."
+        )
+    }
+
+    fn portal_unavailable_reply(
+        route: &TelegramRoute,
+        err: anyhow::Error,
+        edit_message_id: Option<i64>,
+    ) -> TelegramReply {
+        panel_reply_with_keyboard(
+            route,
+            portal_unavailable_message(err),
+            portal_keyboard(&[]),
+            edit_message_id,
+        )
+    }
+
+    fn work_panel_reply(
+        route: &TelegramRoute,
+        binding: &TelegramBinding,
+        headline: impl Into<String>,
+        edit_message_id: Option<i64>,
+    ) -> TelegramReply {
+        panel_reply_with_keyboard(
+            route,
+            work_panel_text(binding, headline.into()),
+            work_panel_keyboard(binding, route),
+            edit_message_id,
+        )
+    }
+
+    fn work_panel_text(binding: &TelegramBinding, headline: String) -> String {
+        let status = if binding.telegram_paused {
+            "paused"
+        } else {
+            "telegram active"
+        };
+        format!(
+            "{headline}\nstate: {status}\nthread: {}\ncwd: {}",
+            binding.app_thread_id.as_deref().unwrap_or("<none>"),
+            binding.app_thread_cwd.as_deref().unwrap_or("<unknown>")
+        )
+    }
+
+    fn work_panel_keyboard(
+        binding: &TelegramBinding,
+        route: &TelegramRoute,
+    ) -> TelegramInlineKeyboardMarkup {
+        let control = if binding.telegram_paused {
+            TelegramInlineKeyboardButton {
+                text: String::from("Take over from desktop"),
+                callback_data: String::from("cx:t"),
+            }
+        } else {
+            TelegramInlineKeyboardButton {
+                text: String::from("Release to desktop"),
+                callback_data: String::from("cx:rel"),
+            }
+        };
+        let close_text = if route.message_thread_id.is_some() {
+            "Close topic"
+        } else {
+            "Close session"
+        };
+        TelegramInlineKeyboardMarkup {
+            inline_keyboard: vec![
+                vec![control],
+                vec![
+                    TelegramInlineKeyboardButton {
+                        text: String::from("Refresh"),
+                        callback_data: String::from("cx:w"),
+                    },
+                    TelegramInlineKeyboardButton {
+                        text: String::from(close_text),
+                        callback_data: String::from("cx:c"),
+                    },
+                ],
+            ],
+        }
+    }
+
+    fn is_portal_route(route: &TelegramRoute, chat_is_forum: bool) -> bool {
+        chat_is_forum && route.message_thread_id.is_none()
+    }
+
+    fn truncate_chars(value: &str, max_chars: usize) -> String {
+        let mut result = value.chars().take(max_chars).collect::<String>();
+        if value.chars().count() > max_chars {
+            result.push_str("...");
+        }
+        result
+    }
+
     struct HandleOptions<'a> {
         notifier: Option<&'a TelegramNotifier<'a>>,
         acquire_lease: bool,
         steal: bool,
         authorized_by_bind: bool,
         app_server_timeout: f32,
+        callback_data: Option<&'a str>,
+        callback_message_id: Option<i64>,
     }
 
     fn run_codex_turn(
@@ -996,13 +1856,21 @@ pub mod telegram {
             AppServerClient::connect(&server.listen_url, Duration::from_secs_f32(timeout_secs))?;
         client.initialize("cx-telegram", env!("CARGO_PKG_VERSION"))?;
 
-        let thread_id = match state
+        let binding_snapshot = state
             .binding_for_route(route, alias)
-            .and_then(|binding| binding.app_thread_id.clone())
-        {
-            Some(thread_id) => thread_id,
+            .cloned()
+            .with_context(|| format!("Telegram route {} is not bound", route.display()))?;
+        let thread_id = match binding_snapshot.app_thread_id.clone() {
+            Some(thread_id) => {
+                if let Err(err) =
+                    client.thread_resume(&thread_id, binding_snapshot.app_thread_cwd.as_deref())
+                {
+                    eprintln!("app-server thread/resume before Telegram turn failed: {err:#}");
+                }
+                thread_id
+            }
             None => {
-                let thread = client.thread_start()?;
+                let thread = client.thread_start(binding_snapshot.app_thread_cwd.as_deref())?;
                 let binding = state
                     .binding_for_route_mut(route, alias)
                     .with_context(|| format!("Telegram route {} is not bound", route.display()))?;
@@ -1011,12 +1879,22 @@ pub mod telegram {
             }
         };
         let mut sink = notifier.map(|notifier| TelegramDeltaSink::new(notifier, route.clone()));
-        let turn = client.turn_start_stream(&thread_id, prompt, |delta| {
-            if let Some(sink) = sink.as_mut() {
-                sink.push(delta)?;
-            }
-            Ok(())
-        })?;
+        let turn = client.turn_start_stream(
+            &thread_id,
+            prompt,
+            |delta| {
+                if let Some(sink) = sink.as_mut() {
+                    sink.push(delta)?;
+                }
+                Ok(())
+            },
+            |approval| {
+                let Some(notifier) = notifier else {
+                    anyhow::bail!("app-server requested approval but Telegram is unavailable");
+                };
+                handle_app_server_approval(paths, state, notifier, route, approval, timeout_secs)
+            },
+        )?;
         if let Some(sink) = sink.as_mut() {
             sink.finish()?;
         }
@@ -1049,19 +1927,292 @@ pub mod telegram {
             }
         }
 
+        fn answer_callback_query(&self, callback_query_id: &str, text: Option<&str>) {
+            if let Err(err) =
+                answer_callback_query(self.client, self.token, callback_query_id, text)
+            {
+                eprintln!("telegram answerCallbackQuery failed: {err:#}");
+            }
+        }
+
         fn typing(&self, route: &TelegramRoute) -> TelegramTypingGuard {
             TelegramTypingGuard::start(self.client.clone(), self.token.to_string(), route.clone())
         }
 
-        fn send(&self, route: &TelegramRoute, text: &str) -> Result<()> {
-            send_reply(
+        fn send_one(&self, route: &TelegramRoute, text: &str) -> Result<i64> {
+            send_message(
                 self.client,
                 self.token,
                 route.chat_id,
                 route.message_thread_id,
                 text,
+                None,
             )
         }
+
+        fn send_with_keyboard(
+            &self,
+            route: &TelegramRoute,
+            text: &str,
+            reply_markup: &TelegramInlineKeyboardMarkup,
+        ) -> Result<i64> {
+            send_message(
+                self.client,
+                self.token,
+                route.chat_id,
+                route.message_thread_id,
+                text,
+                Some(reply_markup),
+            )
+        }
+
+        fn edit_one(&self, route: &TelegramRoute, message_id: i64, text: &str) -> Result<()> {
+            edit_message_text(
+                self.client,
+                self.token,
+                route.chat_id,
+                message_id,
+                text,
+                None,
+            )
+        }
+    }
+
+    fn handle_app_server_approval(
+        paths: &ManagerPaths,
+        state: &mut TelegramState,
+        notifier: &TelegramNotifier<'_>,
+        route: &TelegramRoute,
+        approval: ApprovalRequest,
+        timeout_secs: f32,
+    ) -> Result<Value> {
+        let nonce = generate_bind_secret()?;
+        let prompt = approval_prompt_text(&approval);
+        let message_id = notifier.send_with_keyboard(route, &prompt, &approval_keyboard(&nonce))?;
+        let decision = wait_for_approval_callback(
+            paths,
+            state,
+            notifier,
+            route,
+            message_id,
+            &nonce,
+            timeout_secs,
+        )?;
+        let resolved = format!("{prompt}\n\n{}", decision.label());
+        if let Err(err) = notifier.edit_one(route, message_id, &resolved) {
+            eprintln!("telegram edit approval prompt failed: {err:#}");
+        }
+        approval_response_result(&approval, decision)
+    }
+
+    fn wait_for_approval_callback(
+        paths: &ManagerPaths,
+        state: &mut TelegramState,
+        notifier: &TelegramNotifier<'_>,
+        route: &TelegramRoute,
+        approval_message_id: i64,
+        nonce: &str,
+        timeout_secs: f32,
+    ) -> Result<TelegramApprovalDecision> {
+        let timeout = Duration::from_secs_f32(timeout_secs.max(1.0));
+        let deadline = Instant::now() + timeout;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                anyhow::bail!("timed out waiting for Telegram approval");
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let poll_timeout = remaining.as_secs().clamp(1, 10);
+            let updates = get_updates(
+                notifier.client,
+                notifier.token,
+                state.last_update_id.map(|id| id + 1),
+                poll_timeout,
+            )?;
+            for update in updates {
+                state.last_update_id = Some(
+                    state
+                        .last_update_id
+                        .map_or(update.update_id, |id| id.max(update.update_id)),
+                );
+                let view = update.view();
+                let Some(callback_query_id) = view.callback_query_id.as_deref() else {
+                    continue;
+                };
+                let Some(message) = view.message.as_ref() else {
+                    notifier.answer_callback_query(callback_query_id, Some("Approval is pending."));
+                    continue;
+                };
+                let callback_route = TelegramRoute::from_message(message);
+                if &callback_route != route || message.message_id != approval_message_id {
+                    notifier.answer_callback_query(
+                        callback_query_id,
+                        Some("A different cx approval is pending."),
+                    );
+                    continue;
+                }
+                let Some(data) = view.callback_data.as_deref() else {
+                    notifier
+                        .answer_callback_query(callback_query_id, Some("Missing approval action."));
+                    continue;
+                };
+                let Some(decision) = parse_approval_callback_data(data, nonce) else {
+                    notifier
+                        .answer_callback_query(callback_query_id, Some("Stale approval action."));
+                    continue;
+                };
+                notifier.answer_callback_query(callback_query_id, Some(decision.label()));
+                write_state(paths, state)?;
+                return Ok(decision);
+            }
+            write_state(paths, state)?;
+        }
+    }
+
+    fn approval_keyboard(nonce: &str) -> TelegramInlineKeyboardMarkup {
+        TelegramInlineKeyboardMarkup {
+            inline_keyboard: vec![
+                vec![
+                    TelegramInlineKeyboardButton {
+                        text: String::from("Allow once"),
+                        callback_data: approval_callback_data(
+                            nonce,
+                            TelegramApprovalDecision::AcceptOnce,
+                        ),
+                    },
+                    TelegramInlineKeyboardButton {
+                        text: String::from("Allow session"),
+                        callback_data: approval_callback_data(
+                            nonce,
+                            TelegramApprovalDecision::AcceptForSession,
+                        ),
+                    },
+                ],
+                vec![TelegramInlineKeyboardButton {
+                    text: String::from("Deny"),
+                    callback_data: approval_callback_data(nonce, TelegramApprovalDecision::Decline),
+                }],
+            ],
+        }
+    }
+
+    fn approval_prompt_text(approval: &ApprovalRequest) -> String {
+        let title = match approval.method.as_str() {
+            "item/commandExecution/requestApproval" | "execCommandApproval" => {
+                "Codex needs permission to run a command"
+            }
+            "item/fileChange/requestApproval" | "applyPatchApproval" => {
+                "Codex needs permission to change files"
+            }
+            "item/permissions/requestApproval" => "Codex requests additional permissions",
+            _ => "Codex requests approval",
+        };
+        let mut lines = vec![String::from(title)];
+        if let Some(reason) = approval.params.get("reason").and_then(Value::as_str) {
+            if !reason.trim().is_empty() {
+                lines.push(format!("reason: {}", truncate_chars(reason.trim(), 400)));
+            }
+        }
+        if let Some(cwd) = approval.params.get("cwd").and_then(Value::as_str) {
+            lines.push(format!("cwd: {cwd}"));
+        }
+        if let Some(command) = approval_command_text(&approval.params) {
+            lines.push(format!("command:\n{command}"));
+        }
+        if let Some(grant_root) = approval.params.get("grantRoot").and_then(Value::as_str) {
+            lines.push(format!("grant root: {grant_root}"));
+        }
+        if approval.method == "item/permissions/requestApproval" {
+            if let Some(permissions) = approval.params.get("permissions") {
+                lines.push(format!(
+                    "permissions:\n{}",
+                    truncate_chars(&format_json_compact(permissions), 1200)
+                ));
+            }
+        }
+        lines.push(String::from(
+            "Choose how cx should answer this approval request.",
+        ));
+        truncate_chars(&lines.join("\n"), 2800)
+    }
+
+    fn approval_command_text(params: &Value) -> Option<String> {
+        if let Some(command) = params.get("command").and_then(Value::as_str) {
+            if !command.trim().is_empty() {
+                return Some(truncate_chars(command.trim(), 1200));
+            }
+        }
+        let command = params.get("command")?.as_array()?;
+        let tokens = command.iter().filter_map(Value::as_str).collect::<Vec<_>>();
+        (!tokens.is_empty()).then(|| truncate_chars(&tokens.join(" "), 1200))
+    }
+
+    fn approval_response_result(
+        approval: &ApprovalRequest,
+        decision: TelegramApprovalDecision,
+    ) -> Result<Value> {
+        match approval.method.as_str() {
+            "item/commandExecution/requestApproval" => Ok(json!({
+                "decision": command_execution_decision(decision),
+            })),
+            "item/fileChange/requestApproval" => Ok(json!({
+                "decision": file_change_decision(decision),
+            })),
+            "execCommandApproval" | "applyPatchApproval" => Ok(json!({
+                "decision": legacy_review_decision(decision),
+            })),
+            "item/permissions/requestApproval" => {
+                let permissions = if decision == TelegramApprovalDecision::Decline {
+                    json!({})
+                } else {
+                    approval
+                        .params
+                        .get("permissions")
+                        .cloned()
+                        .unwrap_or_else(|| json!({}))
+                };
+                let scope = match decision {
+                    TelegramApprovalDecision::AcceptForSession => "session",
+                    TelegramApprovalDecision::AcceptOnce | TelegramApprovalDecision::Decline => {
+                        "turn"
+                    }
+                };
+                Ok(json!({
+                    "permissions": permissions,
+                    "scope": scope,
+                    "strictAutoReview": false,
+                }))
+            }
+            method => anyhow::bail!("unsupported approval request method: {method}"),
+        }
+    }
+
+    fn command_execution_decision(decision: TelegramApprovalDecision) -> &'static str {
+        match decision {
+            TelegramApprovalDecision::AcceptOnce => "accept",
+            TelegramApprovalDecision::AcceptForSession => "acceptForSession",
+            TelegramApprovalDecision::Decline => "decline",
+        }
+    }
+
+    fn file_change_decision(decision: TelegramApprovalDecision) -> &'static str {
+        match decision {
+            TelegramApprovalDecision::AcceptOnce => "accept",
+            TelegramApprovalDecision::AcceptForSession => "acceptForSession",
+            TelegramApprovalDecision::Decline => "decline",
+        }
+    }
+
+    fn legacy_review_decision(decision: TelegramApprovalDecision) -> &'static str {
+        match decision {
+            TelegramApprovalDecision::AcceptOnce => "approved",
+            TelegramApprovalDecision::AcceptForSession => "approved_for_session",
+            TelegramApprovalDecision::Decline => "denied",
+        }
+    }
+
+    fn format_json_compact(value: &Value) -> String {
+        serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
     }
 
     struct TelegramTypingGuard {
@@ -1107,7 +2258,9 @@ pub mod telegram {
     struct TelegramDeltaSink<'a> {
         notifier: &'a TelegramNotifier<'a>,
         route: TelegramRoute,
-        buffer: String,
+        text: String,
+        message_id: Option<i64>,
+        last_sent_chars: usize,
         sent_any: bool,
     }
 
@@ -1116,34 +2269,51 @@ pub mod telegram {
             Self {
                 notifier,
                 route,
-                buffer: String::new(),
+                text: String::new(),
+                message_id: None,
+                last_sent_chars: 0,
                 sent_any: false,
             }
         }
 
         fn push(&mut self, delta: &str) -> Result<()> {
-            self.buffer.push_str(delta);
-            if self.buffer.chars().count() >= 900 || delta.contains('\n') {
-                self.flush()?;
+            self.text.push_str(delta);
+            let current_chars = self.text.chars().count();
+            if current_chars.saturating_sub(self.last_sent_chars) >= 900 || delta.contains('\n') {
+                self.flush(false)?;
             }
             Ok(())
         }
 
         fn finish(&mut self) -> Result<()> {
-            self.flush()
+            self.flush(true)
         }
 
         fn sent_any(&self) -> bool {
             self.sent_any
         }
 
-        fn flush(&mut self) -> Result<()> {
-            if self.buffer.trim().is_empty() {
-                self.buffer.clear();
+        fn flush(&mut self, final_flush: bool) -> Result<()> {
+            if self.text.trim().is_empty() {
                 return Ok(());
             }
-            self.notifier.send(&self.route, &self.buffer)?;
-            self.buffer.clear();
+            let chunks = telegram_text_chunks(&self.text);
+            let first = chunks
+                .first()
+                .expect("telegram_text_chunks returns at least one chunk");
+            match self.message_id {
+                Some(message_id) => self.notifier.edit_one(&self.route, message_id, first)?,
+                None => {
+                    let message_id = self.notifier.send_one(&self.route, first)?;
+                    self.message_id = Some(message_id);
+                }
+            }
+            if final_flush {
+                for chunk in chunks.iter().skip(1) {
+                    self.notifier.send_one(&self.route, chunk)?;
+                }
+            }
+            self.last_sent_chars = self.text.chars().count();
             self.sent_any = true;
             Ok(())
         }
@@ -1262,6 +2432,9 @@ pub mod telegram {
     enum TelegramTextCommand {
         Start,
         Bind { secret: Option<String> },
+        Portal,
+        Attach { thread_id: Option<String> },
+        Takeover,
         New { alias: Option<String> },
         Use { alias: Option<String> },
         Status,
@@ -1281,6 +2454,11 @@ pub mod telegram {
                 "/bind" => Self::Bind {
                     secret: parts.next().map(String::from),
                 },
+                "/portal" | "/history" => Self::Portal,
+                "/attach" => Self::Attach {
+                    thread_id: parts.next().map(String::from),
+                },
+                "/takeover" | "/take" => Self::Takeover,
                 "/new" => Self::New {
                     alias: parts.next().map(String::from),
                 },
@@ -1303,6 +2481,34 @@ pub mod telegram {
             chat_id: route.chat_id,
             message_thread_id: route.message_thread_id,
             text: text.into(),
+            reply_markup: None,
+            edit_message_id: None,
+            remember_panel_message: false,
+        }
+    }
+
+    fn panel_reply_with_keyboard(
+        route: &TelegramRoute,
+        text: impl Into<String>,
+        reply_markup: TelegramInlineKeyboardMarkup,
+        edit_message_id: Option<i64>,
+    ) -> TelegramReply {
+        TelegramReply {
+            chat_id: route.chat_id,
+            message_thread_id: route.message_thread_id,
+            text: text.into(),
+            reply_markup: Some(reply_markup),
+            edit_message_id,
+            remember_panel_message: true,
+        }
+    }
+
+    impl TelegramReply {
+        fn route(&self) -> TelegramRoute {
+            TelegramRoute {
+                chat_id: self.chat_id,
+                message_thread_id: self.message_thread_id,
+            }
         }
     }
 
@@ -1389,7 +2595,16 @@ pub mod telegram {
         chat_id: &'a str,
         text: &'a str,
         #[serde(skip_serializing_if = "Option::is_none")]
+        parse_mode: Option<&'static str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         message_thread_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reply_markup: Option<&'a str>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct TelegramSentMessage {
+        message_id: i64,
     }
 
     fn send_message(
@@ -1398,20 +2613,28 @@ pub mod telegram {
         chat_id: i64,
         message_thread_id: Option<i64>,
         text: &str,
-    ) -> Result<()> {
+        reply_markup: Option<&TelegramInlineKeyboardMarkup>,
+    ) -> Result<i64> {
         let url = telegram_method_url(token, "sendMessage");
         let chat_id = chat_id.to_string();
         let message_thread_id = message_thread_id.map(|thread_id| thread_id.to_string());
+        let reply_markup = reply_markup
+            .map(serde_json::to_string)
+            .transpose()
+            .context("serialize Telegram reply markup")?;
+        let text = telegram_html_text(text);
         let payload = TelegramSendMessage {
             chat_id: chat_id.as_str(),
-            text,
+            text: text.as_str(),
+            parse_mode: Some("HTML"),
             message_thread_id,
+            reply_markup: reply_markup.as_deref(),
         };
         let response = client.post(url).form(&payload).send().map_err(|err| {
             anyhow::anyhow!("Telegram sendMessage request failed: {}", err.without_url())
         })?;
         let response = response
-            .json::<TelegramResponse<serde_json::Value>>()
+            .json::<TelegramResponse<TelegramSentMessage>>()
             .map_err(|err| {
                 anyhow::anyhow!(
                     "decode Telegram sendMessage response failed: {}",
@@ -1421,6 +2644,75 @@ pub mod telegram {
         if !response.ok {
             anyhow::bail!(
                 "Telegram sendMessage failed: {}",
+                response
+                    .description
+                    .unwrap_or_else(|| "unknown error".to_string())
+            );
+        }
+        response
+            .result
+            .map(|message| message.message_id)
+            .ok_or_else(|| anyhow::anyhow!("Telegram sendMessage: no message_id in response"))
+    }
+
+    #[derive(Debug, Serialize)]
+    struct TelegramEditMessageText<'a> {
+        chat_id: &'a str,
+        message_id: &'a str,
+        text: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        parse_mode: Option<&'static str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reply_markup: Option<&'a str>,
+    }
+
+    fn edit_message_text(
+        client: &Client,
+        token: &str,
+        chat_id: i64,
+        message_id: i64,
+        text: &str,
+        reply_markup: Option<&TelegramInlineKeyboardMarkup>,
+    ) -> Result<()> {
+        let url = telegram_method_url(token, "editMessageText");
+        let chat_id = chat_id.to_string();
+        let message_id = message_id.to_string();
+        let reply_markup = reply_markup
+            .map(serde_json::to_string)
+            .transpose()
+            .context("serialize Telegram reply markup")?;
+        let text = telegram_html_text(text);
+        let payload = TelegramEditMessageText {
+            chat_id: chat_id.as_str(),
+            message_id: message_id.as_str(),
+            text: text.as_str(),
+            parse_mode: Some("HTML"),
+            reply_markup: reply_markup.as_deref(),
+        };
+        let response = client.post(url).form(&payload).send().map_err(|err| {
+            anyhow::anyhow!(
+                "Telegram editMessageText request failed: {}",
+                err.without_url()
+            )
+        })?;
+        let response = response
+            .json::<TelegramResponse<serde_json::Value>>()
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    "decode Telegram editMessageText response failed: {}",
+                    err.without_url()
+                )
+            })?;
+        if !response.ok {
+            if response
+                .description
+                .as_deref()
+                .is_some_and(is_telegram_noop_error)
+            {
+                return Ok(());
+            }
+            anyhow::bail!(
+                "Telegram editMessageText failed: {}",
                 response
                     .description
                     .unwrap_or_else(|| "unknown error".to_string())
@@ -1474,27 +2766,27 @@ pub mod telegram {
     }
 
     #[derive(Debug, Serialize)]
-    struct TelegramCloseForumTopicParams<'a> {
+    struct TelegramDeleteForumTopicParams<'a> {
         chat_id: &'a str,
         message_thread_id: &'a str,
     }
 
-    fn close_forum_topic(
+    fn delete_forum_topic(
         client: &Client,
         token: &str,
         chat_id: i64,
         message_thread_id: i64,
     ) -> Result<()> {
-        let url = telegram_method_url(token, "closeForumTopic");
+        let url = telegram_method_url(token, "deleteForumTopic");
         let chat_id = chat_id.to_string();
         let message_thread_id = message_thread_id.to_string();
-        let payload = TelegramCloseForumTopicParams {
+        let payload = TelegramDeleteForumTopicParams {
             chat_id: chat_id.as_str(),
             message_thread_id: message_thread_id.as_str(),
         };
         let response = client.post(url).form(&payload).send().map_err(|err| {
             anyhow::anyhow!(
-                "Telegram closeForumTopic request failed: {}",
+                "Telegram deleteForumTopic request failed: {}",
                 err.without_url()
             )
         })?;
@@ -1502,19 +2794,117 @@ pub mod telegram {
             .json::<TelegramResponse<serde_json::Value>>()
             .map_err(|err| {
                 anyhow::anyhow!(
-                    "decode Telegram closeForumTopic response failed: {}",
+                    "decode Telegram deleteForumTopic response failed: {}",
                     err.without_url()
                 )
             })?;
         if !response.ok {
             anyhow::bail!(
-                "Telegram closeForumTopic failed: {}",
+                "Telegram deleteForumTopic failed: {}",
                 response
                     .description
                     .unwrap_or_else(|| "unknown error".to_string())
             );
         }
         Ok(())
+    }
+
+    #[derive(Debug, Serialize)]
+    struct TelegramEditGeneralForumTopicParams<'a> {
+        chat_id: &'a str,
+        name: &'a str,
+    }
+
+    fn edit_general_forum_topic(
+        client: &Client,
+        token: &str,
+        chat_id: i64,
+        name: &str,
+    ) -> Result<()> {
+        let url = telegram_method_url(token, "editGeneralForumTopic");
+        let chat_id = chat_id.to_string();
+        let payload = TelegramEditGeneralForumTopicParams {
+            chat_id: chat_id.as_str(),
+            name,
+        };
+        let response = client.post(url).form(&payload).send().map_err(|err| {
+            anyhow::anyhow!(
+                "Telegram editGeneralForumTopic request failed: {}",
+                err.without_url()
+            )
+        })?;
+        let response = response
+            .json::<TelegramResponse<serde_json::Value>>()
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    "decode Telegram editGeneralForumTopic response failed: {}",
+                    err.without_url()
+                )
+            })?;
+        if !response.ok {
+            if response
+                .description
+                .as_deref()
+                .is_some_and(is_telegram_noop_error)
+            {
+                return Ok(());
+            }
+            anyhow::bail!(
+                "Telegram editGeneralForumTopic failed: {}",
+                response
+                    .description
+                    .unwrap_or_else(|| "unknown error".to_string())
+            );
+        }
+        Ok(())
+    }
+
+    #[derive(Debug, Serialize)]
+    struct TelegramGeneralForumTopicParams<'a> {
+        chat_id: &'a str,
+    }
+
+    fn unhide_general_forum_topic(client: &Client, token: &str, chat_id: i64) -> Result<()> {
+        let url = telegram_method_url(token, "unhideGeneralForumTopic");
+        let chat_id = chat_id.to_string();
+        let payload = TelegramGeneralForumTopicParams {
+            chat_id: chat_id.as_str(),
+        };
+        let response = client.post(url).form(&payload).send().map_err(|err| {
+            anyhow::anyhow!(
+                "Telegram unhideGeneralForumTopic request failed: {}",
+                err.without_url()
+            )
+        })?;
+        let response = response
+            .json::<TelegramResponse<serde_json::Value>>()
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    "decode Telegram unhideGeneralForumTopic response failed: {}",
+                    err.without_url()
+                )
+            })?;
+        if !response.ok {
+            if response
+                .description
+                .as_deref()
+                .is_some_and(is_telegram_noop_error)
+            {
+                return Ok(());
+            }
+            anyhow::bail!(
+                "Telegram unhideGeneralForumTopic failed: {}",
+                response
+                    .description
+                    .unwrap_or_else(|| "unknown error".to_string())
+            );
+        }
+        Ok(())
+    }
+
+    fn is_telegram_noop_error(description: &str) -> bool {
+        description.contains("message is not modified")
+            || description.contains("TOPIC_NOT_MODIFIED")
     }
 
     #[derive(Debug, Serialize)]
@@ -1623,6 +3013,49 @@ pub mod telegram {
         Ok(())
     }
 
+    #[derive(Debug, Serialize)]
+    struct TelegramAnswerCallbackQuery<'a> {
+        callback_query_id: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        text: Option<&'a str>,
+    }
+
+    fn answer_callback_query(
+        client: &Client,
+        token: &str,
+        callback_query_id: &str,
+        text: Option<&str>,
+    ) -> Result<()> {
+        let url = telegram_method_url(token, "answerCallbackQuery");
+        let payload = TelegramAnswerCallbackQuery {
+            callback_query_id,
+            text,
+        };
+        let response = client.post(url).form(&payload).send().map_err(|err| {
+            anyhow::anyhow!(
+                "Telegram answerCallbackQuery request failed: {}",
+                err.without_url()
+            )
+        })?;
+        let response = response
+            .json::<TelegramResponse<serde_json::Value>>()
+            .map_err(|err| {
+                anyhow::anyhow!(
+                    "decode Telegram answerCallbackQuery response failed: {}",
+                    err.without_url()
+                )
+            })?;
+        if !response.ok {
+            anyhow::bail!(
+                "Telegram answerCallbackQuery failed: {}",
+                response
+                    .description
+                    .unwrap_or_else(|| "unknown error".to_string())
+            );
+        }
+        Ok(())
+    }
+
     fn sync_bot_commands(client: &Client, token: &str) -> Result<()> {
         let url = telegram_method_url(token, "setMyCommands");
         let commands = serde_json::to_string(bot_commands()).context("serialize bot commands")?;
@@ -1659,37 +3092,90 @@ pub mod telegram {
         &[
             TelegramBotCommand {
                 command: "start",
-                description: "Bind or show the current cx session",
+                description: "Bind this chat and open cx",
             },
             TelegramBotCommand {
                 command: "bind",
                 description: "Trust this chat with a one-time secret",
             },
             TelegramBotCommand {
-                command: "new",
-                description: "Create and switch to a named session",
-            },
-            TelegramBotCommand {
-                command: "use",
-                description: "Switch to a named session",
+                command: "portal",
+                description: "Open the Codex handoff portal",
             },
             TelegramBotCommand {
                 command: "status",
-                description: "Show the bound cx session and lease",
-            },
-            TelegramBotCommand {
-                command: "sessions",
-                description: "List Telegram sessions for this chat",
-            },
-            TelegramBotCommand {
-                command: "close",
-                description: "Unbind a named session from this route",
-            },
-            TelegramBotCommand {
-                command: "release",
-                description: "Release this chat's active lease",
+                description: "Show the current handoff status",
             },
         ]
+    }
+
+    fn telegram_html_text(text: &str) -> String {
+        let mut output = String::new();
+        let mut rest = text;
+        while let Some(start) = rest.find("```") {
+            append_inline_code_html(&rest[..start], &mut output);
+            let after_open = &rest[start + 3..];
+            let Some(end) = after_open.find("```") else {
+                push_html_escaped(&mut output, "```");
+                rest = after_open;
+                continue;
+            };
+            let block = markdown_fence_body(&after_open[..end]);
+            output.push_str("<pre>");
+            push_html_escaped(&mut output, block);
+            output.push_str("</pre>");
+            rest = &after_open[end + 3..];
+        }
+        append_inline_code_html(rest, &mut output);
+        output
+    }
+
+    fn append_inline_code_html(mut text: &str, output: &mut String) {
+        while let Some(start) = text.find('`') {
+            let after_open = &text[start + 1..];
+            let Some(end) = after_open.find('`') else {
+                push_html_escaped(output, text);
+                return;
+            };
+            push_html_escaped(output, &text[..start]);
+            output.push_str("<code>");
+            push_html_escaped(output, &after_open[..end]);
+            output.push_str("</code>");
+            text = &after_open[end + 1..];
+        }
+        push_html_escaped(output, text);
+    }
+
+    fn markdown_fence_body(block: &str) -> &str {
+        if let Some(rest) = block.strip_prefix('\n') {
+            return rest;
+        }
+        let Some(newline) = block.find('\n') else {
+            return block;
+        };
+        let language = block[..newline].trim();
+        if !language.is_empty()
+            && language.len() <= 32
+            && language
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '+' | '#' | '.'))
+        {
+            &block[newline + 1..]
+        } else {
+            block
+        }
+    }
+
+    fn push_html_escaped(output: &mut String, text: &str) {
+        for ch in text.chars() {
+            match ch {
+                '&' => output.push_str("&amp;"),
+                '<' => output.push_str("&lt;"),
+                '>' => output.push_str("&gt;"),
+                '"' => output.push_str("&quot;"),
+                _ => output.push(ch),
+            }
+        }
     }
 
     fn send_reply(
@@ -1698,11 +3184,62 @@ pub mod telegram {
         chat_id: i64,
         message_thread_id: Option<i64>,
         text: &str,
-    ) -> Result<()> {
-        for chunk in telegram_text_chunks(text) {
-            send_message(client, token, chat_id, message_thread_id, &chunk)?;
+        reply_markup: Option<&TelegramInlineKeyboardMarkup>,
+    ) -> Result<Option<i64>> {
+        let mut first_message_id = None;
+        for (index, chunk) in telegram_text_chunks(text).into_iter().enumerate() {
+            let markup = if index == 0 { reply_markup } else { None };
+            let message_id =
+                send_message(client, token, chat_id, message_thread_id, &chunk, markup)?;
+            if first_message_id.is_none() {
+                first_message_id = Some(message_id);
+            }
         }
-        Ok(())
+        Ok(first_message_id)
+    }
+
+    fn deliver_reply(client: &Client, token: &str, reply: &TelegramReply) -> Result<Option<i64>> {
+        if let Some(message_id) = reply.edit_message_id {
+            let chunks = telegram_text_chunks(&reply.text);
+            if chunks.len() == 1 {
+                edit_message_text(
+                    client,
+                    token,
+                    reply.chat_id,
+                    message_id,
+                    &chunks[0],
+                    reply.reply_markup.as_ref(),
+                )?;
+                return Ok(Some(message_id));
+            }
+            edit_message_text(
+                client,
+                token,
+                reply.chat_id,
+                message_id,
+                &chunks[0],
+                reply.reply_markup.as_ref(),
+            )?;
+            for chunk in chunks.iter().skip(1) {
+                send_message(
+                    client,
+                    token,
+                    reply.chat_id,
+                    reply.message_thread_id,
+                    chunk,
+                    None,
+                )?;
+            }
+            return Ok(Some(message_id));
+        }
+        send_reply(
+            client,
+            token,
+            reply.chat_id,
+            reply.message_thread_id,
+            &reply.text,
+            reply.reply_markup.as_ref(),
+        )
     }
 
     fn telegram_text_chunks(text: &str) -> Vec<String> {
@@ -1836,6 +3373,7 @@ pub mod telegram {
                 message_id: 1,
                 message_thread_id,
                 text: Some(text.to_string()),
+                forum_topic_edited: None,
             }
         }
 
@@ -1846,6 +3384,8 @@ pub mod telegram {
                 steal: false,
                 authorized_by_bind: false,
                 app_server_timeout: 600.0,
+                callback_data: None,
+                callback_message_id: None,
             }
         }
 
@@ -1861,6 +3401,11 @@ pub mod telegram {
                 channel_id: ChannelId::parse("telegram:42").unwrap(),
                 session_id: SessionId::parse("sess_manual").unwrap(),
                 app_thread_id: None,
+                app_thread_title: None,
+                app_thread_cwd: None,
+                topic_title: None,
+                panel_message_id: None,
+                telegram_paused: false,
                 topic_created_by_adapter: false,
             });
 
@@ -1943,6 +3488,11 @@ pub mod telegram {
                 channel_id: ChannelId::parse("telegram:42").unwrap(),
                 session_id: SessionId::parse("sess_manual").unwrap(),
                 app_thread_id: None,
+                app_thread_title: None,
+                app_thread_cwd: None,
+                topic_title: None,
+                panel_message_id: None,
+                telegram_paused: false,
                 topic_created_by_adapter: false,
             });
             let trusted = trusted_chats(&state, Vec::new());
@@ -1963,6 +3513,11 @@ pub mod telegram {
                 channel_id: ChannelId::parse("telegram:-10042").unwrap(),
                 session_id: SessionId::parse("sess_manual").unwrap(),
                 app_thread_id: None,
+                app_thread_title: None,
+                app_thread_cwd: None,
+                topic_title: None,
+                panel_message_id: None,
+                telegram_paused: false,
                 topic_created_by_adapter: false,
             });
             let trusted = trusted_chats(&state, Vec::new());
@@ -1991,10 +3546,7 @@ pub mod telegram {
                 .map(|command| command.command)
                 .collect::<Vec<_>>();
 
-            assert_eq!(
-                commands,
-                vec!["start", "bind", "new", "use", "status", "sessions", "close", "release"]
-            );
+            assert_eq!(commands, vec!["start", "bind", "portal", "status"]);
         }
 
         #[test]
@@ -2116,6 +3668,7 @@ pub mod telegram {
                     message_id: 1,
                     message_thread_id: Some(7),
                     text: Some(String::from("/start")),
+                    forum_topic_edited: None,
                 }),
                 edited_channel_post: None,
                 callback_query: None,
@@ -2186,6 +3739,7 @@ pub mod telegram {
                 message_id: 1,
                 message_thread_id: None,
                 text: Some("/new Build!".to_string()),
+                forum_topic_edited: None,
             };
 
             let reply = handle_message(&paths, &mut state, message, handle_options())
@@ -2215,6 +3769,7 @@ pub mod telegram {
                 message_id: 1,
                 message_thread_id: Some(99),
                 text: Some("/new config".to_string()),
+                forum_topic_edited: None,
             };
 
             let reply = handle_message(&paths, &mut state, message, handle_options())
@@ -2252,6 +3807,7 @@ pub mod telegram {
                     message_id: 1,
                     message_thread_id: Some(99),
                     text: Some("/close smoke".to_string()),
+                    forum_topic_edited: None,
                 },
                 handle_options(),
             )
@@ -2285,6 +3841,7 @@ pub mod telegram {
                     message_id: 1,
                     message_thread_id: Some(99),
                     text: Some("/close".to_string()),
+                    forum_topic_edited: None,
                 },
                 handle_options(),
             )
@@ -2318,6 +3875,7 @@ pub mod telegram {
                     message_id: 1,
                     message_thread_id: Some(31),
                     text: Some("/close".to_string()),
+                    forum_topic_edited: None,
                 },
                 handle_options(),
             )
@@ -2326,6 +3884,349 @@ pub mod telegram {
 
             assert_eq!(reply.text, "Unbound session `session-2`.");
             assert!(state.binding_for_route(&route, Some("session-2")).is_none());
+
+            let _ = fs::remove_dir_all(paths.serve_dir());
+        }
+
+        #[test]
+        fn deleting_topic_route_removes_all_local_bindings_for_that_topic() {
+            let paths = temp_paths("remove-topic-route");
+            let mut state = TelegramState::empty();
+            let route = TelegramRoute {
+                chat_id: -10042,
+                message_thread_id: Some(31),
+            };
+            state.bind_route(&paths, &route, None).unwrap();
+            state.bind_route(&paths, &route, Some("alpha")).unwrap();
+            state.set_active_route(&route, Some("alpha"));
+
+            assert!(state.remove_all_route_bindings(&route));
+
+            assert!(state.bindings.is_empty());
+            assert!(state.active_routes.is_empty());
+
+            let _ = fs::remove_dir_all(paths.serve_dir());
+        }
+
+        #[test]
+        fn portal_callback_data_parses_attach() {
+            assert_eq!(
+                TelegramCallbackCommand::parse("cx:p"),
+                Some(TelegramCallbackCommand::RefreshPortal)
+            );
+            assert_eq!(
+                TelegramCallbackCommand::parse("cx:w"),
+                Some(TelegramCallbackCommand::RefreshWork)
+            );
+            assert_eq!(
+                TelegramCallbackCommand::parse("cx:t"),
+                Some(TelegramCallbackCommand::Takeover)
+            );
+            assert_eq!(
+                TelegramCallbackCommand::parse("cx:rel"),
+                Some(TelegramCallbackCommand::Release)
+            );
+            assert_eq!(
+                TelegramCallbackCommand::parse("cx:c"),
+                Some(TelegramCallbackCommand::Close)
+            );
+            assert_eq!(
+                TelegramCallbackCommand::parse("cx:a:thread-123"),
+                Some(TelegramCallbackCommand::Attach {
+                    thread_id: "thread-123".to_string()
+                })
+            );
+            assert_eq!(TelegramCallbackCommand::parse("noop"), None);
+        }
+
+        #[test]
+        fn portal_keyboard_uses_attach_callbacks() {
+            let entries = vec![AppThreadPortalEntry {
+                thread_id: "019dfeec-78ca-7cb0-a497-cd3a79f1329a".to_string(),
+                title: Some("Fix Telegram handoff".to_string()),
+                preview: String::new(),
+                cwd: "/Users/yupeit/dev/cx".to_string(),
+                active: true,
+                status: "active".to_string(),
+            }];
+
+            let keyboard = portal_keyboard(&entries);
+
+            assert_eq!(keyboard.inline_keyboard.len(), 2);
+            assert_eq!(
+                keyboard.inline_keyboard[0][0].callback_data,
+                "cx:a:019dfeec-78ca-7cb0-a497-cd3a79f1329a"
+            );
+            assert!(keyboard.inline_keyboard[0][0]
+                .text
+                .starts_with("Take over:"));
+            assert_eq!(keyboard.inline_keyboard[1][0].text, "Refresh");
+            assert_eq!(keyboard.inline_keyboard[1][0].callback_data, "cx:p");
+        }
+
+        #[test]
+        fn work_panel_keyboard_switches_between_takeover_and_release() {
+            let paths = temp_paths("work-panel-keyboard");
+            let mut state = TelegramState::empty();
+            let route = TelegramRoute {
+                chat_id: -10042,
+                message_thread_id: Some(99),
+            };
+            state.bind_route(&paths, &route, None).unwrap();
+            let active = state.active_binding_for_route(&route).unwrap().clone();
+
+            let active_keyboard = work_panel_keyboard(&active, &route);
+
+            assert_eq!(
+                active_keyboard.inline_keyboard[0][0].text,
+                "Release to desktop"
+            );
+            assert_eq!(
+                active_keyboard.inline_keyboard[0][0].callback_data,
+                "cx:rel"
+            );
+
+            state
+                .binding_for_route_mut(&route, None)
+                .unwrap()
+                .telegram_paused = true;
+            let paused = state.active_binding_for_route(&route).unwrap();
+            let paused_keyboard = work_panel_keyboard(paused, &route);
+
+            assert_eq!(
+                paused_keyboard.inline_keyboard[0][0].text,
+                "Take over from desktop"
+            );
+            assert_eq!(paused_keyboard.inline_keyboard[0][0].callback_data, "cx:t");
+
+            let _ = fs::remove_dir_all(paths.serve_dir());
+        }
+
+        #[test]
+        fn telegram_noop_errors_are_success_conditions() {
+            assert!(is_telegram_noop_error(
+                "Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message"
+            ));
+            assert!(is_telegram_noop_error("Bad Request: TOPIC_NOT_MODIFIED"));
+            assert!(!is_telegram_noop_error(
+                "Bad Request: message to edit not found"
+            ));
+        }
+
+        #[test]
+        fn telegram_html_text_renders_code_and_escapes_plain_text() {
+            assert_eq!(
+                telegram_html_text("cwd: `/Users/yupeit/dev/cx` & <ok>"),
+                "cwd: <code>/Users/yupeit/dev/cx</code> &amp; &lt;ok&gt;"
+            );
+            assert_eq!(
+                telegram_html_text("```rust\nlet x = 1 < 2;\n```"),
+                "<pre>let x = 1 &lt; 2;\n</pre>"
+            );
+            assert_eq!(telegram_html_text("unmatched `code"), "unmatched `code");
+        }
+
+        #[test]
+        fn approval_callback_data_round_trips() {
+            let nonce = "abc123";
+
+            let data = approval_callback_data(nonce, TelegramApprovalDecision::AcceptForSession);
+
+            assert_eq!(
+                parse_approval_callback_data(&data, nonce),
+                Some(TelegramApprovalDecision::AcceptForSession)
+            );
+            assert_eq!(parse_approval_callback_data(&data, "other"), None);
+        }
+
+        #[test]
+        fn approval_response_maps_command_and_permissions_requests() {
+            let command = ApprovalRequest {
+                id: json!(1),
+                method: "item/commandExecution/requestApproval".to_string(),
+                params: json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "item-1",
+                    "command": "touch /tmp/x"
+                }),
+            };
+            let command_result =
+                approval_response_result(&command, TelegramApprovalDecision::AcceptForSession)
+                    .unwrap();
+            assert_eq!(
+                command_result,
+                json!({
+                    "decision": "acceptForSession"
+                })
+            );
+
+            let permissions = ApprovalRequest {
+                id: json!("request-1"),
+                method: "item/permissions/requestApproval".to_string(),
+                params: json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "item-1",
+                    "cwd": "/tmp",
+                    "permissions": {
+                        "network": { "enabled": true },
+                        "fileSystem": null
+                    }
+                }),
+            };
+            let permissions_result =
+                approval_response_result(&permissions, TelegramApprovalDecision::AcceptOnce)
+                    .unwrap();
+            assert_eq!(permissions_result["scope"], json!("turn"));
+            assert_eq!(
+                permissions_result["permissions"],
+                permissions.params["permissions"]
+            );
+        }
+
+        #[test]
+        fn forum_router_route_creates_work_topic_even_when_bound() {
+            let paths = temp_paths("router-create-topic");
+            let mut state = TelegramState::empty();
+            let route = TelegramRoute {
+                chat_id: -10042,
+                message_thread_id: None,
+            };
+            state.bind_route(&paths, &route, None).unwrap();
+
+            assert!(should_create_work_topic(&state, &route, true));
+
+            let _ = fs::remove_dir_all(paths.serve_dir());
+        }
+
+        #[test]
+        fn release_pauses_telegram_handoff_without_active_lease() {
+            let paths = temp_paths("release-pauses");
+            let mut state = TelegramState::empty();
+            let route = TelegramRoute {
+                chat_id: 42,
+                message_thread_id: None,
+            };
+            state.bind_route(&paths, &route, None).unwrap();
+
+            let reply = handle_message(
+                &paths,
+                &mut state,
+                text_message(42, None, "/release"),
+                handle_options(),
+            )
+            .unwrap()
+            .unwrap();
+
+            assert!(reply.text.contains("Telegram handoff paused."));
+            assert!(state
+                .active_binding_for_route(&route)
+                .is_some_and(|binding| binding.telegram_paused));
+
+            let _ = fs::remove_dir_all(paths.serve_dir());
+        }
+
+        #[test]
+        fn paused_handoff_blocks_normal_message() {
+            let paths = temp_paths("paused-blocks");
+            let mut state = TelegramState::empty();
+            let route = TelegramRoute {
+                chat_id: 42,
+                message_thread_id: None,
+            };
+            state.bind_route(&paths, &route, None).unwrap();
+            state
+                .binding_for_route_mut(&route, None)
+                .unwrap()
+                .telegram_paused = true;
+
+            let reply = handle_message(
+                &paths,
+                &mut state,
+                text_message(42, None, "continue this"),
+                handle_options(),
+            )
+            .unwrap()
+            .unwrap();
+
+            assert!(reply
+                .text
+                .starts_with("Telegram handoff is paused for this topic."));
+            assert_eq!(
+                reply.reply_markup.unwrap().inline_keyboard[0][0].callback_data,
+                "cx:t"
+            );
+
+            let _ = fs::remove_dir_all(paths.serve_dir());
+        }
+
+        #[test]
+        fn plain_text_in_forum_router_returns_portal_panel() {
+            let paths = temp_paths("router-text-panel");
+            let mut state = TelegramState::empty();
+            let message = TelegramMessage {
+                chat: TelegramChat {
+                    id: -10042,
+                    is_forum: true,
+                },
+                message_id: 1,
+                message_thread_id: None,
+                text: Some("show me threads".to_string()),
+                forum_topic_edited: None,
+            };
+
+            let reply = handle_message(&paths, &mut state, message, handle_options())
+                .unwrap()
+                .unwrap();
+
+            assert!(reply.text.contains("Codex portal is unavailable."));
+            assert!(reply.remember_panel_message);
+            assert_eq!(
+                reply.reply_markup.unwrap().inline_keyboard[0][0].callback_data,
+                "cx:p"
+            );
+            assert!(state.bindings.is_empty());
+
+            let _ = fs::remove_dir_all(paths.serve_dir());
+        }
+
+        #[test]
+        fn forum_topic_edit_updates_title_metadata() {
+            let paths = temp_paths("topic-title-edit");
+            let mut state = TelegramState::empty();
+            let route = TelegramRoute {
+                chat_id: -10042,
+                message_thread_id: Some(99),
+            };
+            state.bind_route(&paths, &route, None).unwrap();
+
+            let reply = handle_message(
+                &paths,
+                &mut state,
+                TelegramMessage {
+                    chat: TelegramChat {
+                        id: -10042,
+                        is_forum: true,
+                    },
+                    message_id: 1,
+                    message_thread_id: Some(99),
+                    text: None,
+                    forum_topic_edited: Some(TelegramForumTopicEdited {
+                        name: Some("mobile handoff".to_string()),
+                    }),
+                },
+                handle_options(),
+            )
+            .unwrap();
+
+            assert!(reply.is_none());
+            assert_eq!(
+                state
+                    .binding_for_route(&route, None)
+                    .and_then(|binding| binding.topic_title.as_deref()),
+                Some("mobile handoff")
+            );
 
             let _ = fs::remove_dir_all(paths.serve_dir());
         }

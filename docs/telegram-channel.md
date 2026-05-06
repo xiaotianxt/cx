@@ -99,17 +99,13 @@ macOS:
 cx service install --start
 ```
 
-`run` and `bind` also synchronize the bot's Telegram command menu with:
+`run` and `bind` also keep the bot's Telegram command menu intentionally small:
 
 ```text
 /start
 /bind
-/new
-/use
+/portal
 /status
-/sessions
-/close
-/release
 ```
 
 To sync only the menu and exit:
@@ -142,17 +138,45 @@ telegram:<chat_id>:topic:<message_thread_id>
 telegram:<chat_id>:topic:<message_thread_id>:session:<alias>
 ```
 
-Private chats normally use one default route. Telegram forum groups get one
-route per topic because Telegram includes `message_thread_id` on topic messages.
-That gives each topic an independent cx session and Codex app-server thread.
+Private chats normally use one default route. Telegram forum groups use the
+chat-level or General topic route as the portal/admin surface, and work topics
+as handoff rooms. A work topic binds to one cx session and one Codex app-server
+thread. Topic titles are display metadata; the stable identity is the Telegram
+`chat_id` plus `message_thread_id`.
+
 Binding the chat-level group route also trusts topic routes inside that group,
-so one group bind is enough before creating per-topic sessions.
+so one group bind is enough before creating per-topic handoff rooms.
 The bot API can create topics only inside an existing forum supergroup where
 the bot is an administrator with topic-management permission; it cannot create
 the supergroup itself. Create the forum group in Telegram first, enable Topics,
 add the bot, then bind the group or a topic with `/bind <secret>`.
 
-Inside any route, use named sessions for parallel work:
+The portal is click-first. Open it with `/portal` when needed, or let service
+startup refresh the saved portal panel:
+
+```text
+/portal
+```
+
+The portal lists recent app-server threads with inline buttons and a Refresh
+button. Tapping a thread creates a forum work topic when needed, binds that
+topic to the selected Codex thread, and resumes messages in that topic against
+the same thread and captured cwd. If the selected thread is active, cx tries to
+interrupt the active turn before marking the Telegram handoff active.
+
+Work topics also get a small control panel. The active panel offers Release to
+desktop, Refresh, and Close topic. A released panel offers Take over from
+desktop, Refresh, and Close topic. Plain text in the portal/router route shows
+the portal panel instead of starting a Codex turn.
+
+When `cx channel telegram run` starts, it refreshes locally known portal routes:
+it syncs the command menu, tries to unhide and rename the General forum topic
+to `cx portal`, and edits the saved portal panel in place. If the saved panel
+message no longer exists, it sends a fresh one and records that message id.
+Telegram's Bot API does not expose a method for listing every forum topic, so
+startup reconciliation is limited to routes already present in local cx state.
+
+Inside any route, named sessions are still available for parallel work:
 
 ```text
 /new build
@@ -164,6 +188,13 @@ Inside any route, use named sessions for parallel work:
 Aliases are normalized to lowercase ASCII letters, numbers, `.`, `_`, and `-`,
 then capped at 32 characters. If `/new` has no name, cx creates `session-1`,
 `session-2`, and so on for that route.
+
+`/close` in a work topic archives the bound Codex app-server thread, asks
+Telegram to delete that forum topic, and removes the local binding only after
+Telegram accepts the delete request. If Telegram rejects the delete request,
+the binding stays active so the adapter can retry after the bot receives the
+right admin permissions. In private chats or non-topic routes, `/close` only
+unbinds the local route.
 
 After at least one chat is trusted, `run` does not create a new bind secret. It
 listens only to trusted bindings and any explicit `--allow-chat` values:
@@ -191,9 +222,15 @@ permissions or message type.
 
 While a normal text message is being processed by Codex, the adapter sends
 Telegram `typing` chat actions in the same private chat, group, channel, or
-forum topic. Assistant deltas from the Codex app-server are flushed back to the
-same route in small chunks as they arrive; the final answer is not sent again
-when streaming chunks were already delivered.
+forum topic. Assistant deltas from the Codex app-server are streamed into one
+Telegram message by editing it in place. If the final answer is longer than a
+single Telegram message, cx sends the overflow chunks after the turn completes.
+
+If Codex asks for command, file-change, or permission approval during a
+Telegram-started turn, cx sends an approval panel into the same route and waits
+inside that turn for a button click. Allow once grants only the current request,
+Allow session grants the matching request for the app-server session when the
+upstream protocol supports it, and Deny returns a rejection to Codex.
 
 Use a custom token environment variable:
 
@@ -236,17 +273,25 @@ telegram update update_id=123 source=message chat_id=12345 text=present allowed=
 
 ## Commands In Telegram
 
-The adapter recognizes these Telegram messages:
+The visible Telegram command menu is intentionally small:
 
 ```text
 /start
 /bind <secret>
+/portal
+/status
+```
+
+The adapter still accepts these text commands as fallback controls:
+
+```text
 /new [name]
 /use <name>
-/status
 /sessions
 /close [name]
 /release
+/takeover
+/attach <thread-id>
 ```
 
 Behavior:
@@ -254,18 +299,31 @@ Behavior:
 - `/bind <secret>` trusts a new chat when the secret matches the one printed by
   `run` onboarding or `cx channel telegram bind`.
 - `/start` creates or reuses a binding only for already trusted chats.
+- `/portal` opens the handoff portal with inline buttons for recent local Codex
+  app-server threads.
+- `/history` is an alias for `/portal`.
+- `/attach <thread-id>` binds the current route to a visible app-server thread.
+- `/takeover` resumes Telegram control for a paused handoff topic and tries to
+  interrupt the active app-server turn.
 - `/new [name]` creates a named cx session for the current private chat, group,
   or forum topic route and switches to it.
 - `/use <name>` switches the current route to an existing named session.
 - `/status` reports the bound session and current lease holder.
 - `/sessions` lists Telegram-bound sessions for the current chat.
 - `/close [name]` unbinds a named session from the current route. Without a
-  name, it unbinds the default session for that route.
-- `/release` releases the Telegram lease when Telegram currently holds it.
-- Any other text creates or reuses a binding, records a
+  name, it unbinds the active session for that route. In a work topic, cx
+  archives the bound app-server thread and deletes the Telegram forum topic.
+- `/release` pauses Telegram handoff for the topic and releases the Telegram
+  lease when Telegram currently holds it. Messages in the topic are held until
+  the work panel's Take over button or `/takeover` is used.
+- Approval panels are click-only and are scoped to the route and message that
+  requested approval. Stale approval button clicks are answered as no longer
+  pending.
+- Any other text in a work topic creates or reuses a binding, records a
   `channel-message-received` event without storing the text, then submits the
   text to the running Codex app-server and replies with the assistant's final
-  message.
+  message. Any other text in the portal/router route refreshes the portal
+  panel instead of starting a Codex turn.
 
 ## Inspect Locally
 

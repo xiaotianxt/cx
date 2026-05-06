@@ -1,0 +1,69 @@
+use serde::Deserialize;
+use serde::Serialize;
+use serde_json::Value;
+
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct ClientRequest<P> {
+    pub id: u64,
+    pub method: &'static str,
+    pub params: P,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub(super) enum ServerMessage {
+    Response(ServerResponse),
+    Notification {
+        #[serde(rename = "method")]
+        _method: String,
+        #[serde(default, rename = "params")]
+        _params: Option<Value>,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct ServerResponse {
+    pub id: u64,
+    #[serde(default)]
+    pub result: Option<Value>,
+    #[serde(default)]
+    pub error: Option<RpcError>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct RpcError {
+    pub code: i64,
+    pub message: String,
+    #[serde(default)]
+    pub data: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct InitializeParams {
+    pub client_info: ClientInfo,
+    pub capabilities: serde_json::Map<String, Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ClientInfo {
+    pub name: String,
+    pub version: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct InitializeResponse {
+    pub user_agent: String,
+    pub codex_home: String,
+    pub platform_family: String,
+    pub platform_os: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ThreadListParams {
+    pub limit: u64,
+    pub use_state_db_only: bool,
+}

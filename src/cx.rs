@@ -10,7 +10,7 @@ use anyhow::Context;
 use anyhow::Result;
 
 pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
-    if io::stdin().is_terminal() {
+    if io::stdin().is_terminal() || crate::run::should_skip_stdin_wrapper(&args) {
         return crate::run::run_from_args(args);
     }
 

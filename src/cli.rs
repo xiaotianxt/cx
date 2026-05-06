@@ -36,6 +36,10 @@ pub enum Command {
     Remove(RemoveArgs),
     /// Run `codex login` inside a slot.
     Login(LoginArgs),
+    /// Start and manage a local Codex app-server.
+    Serve(ServeArgs),
+    /// Inspect and export Codex App Server protocol bindings.
+    Protocol(ProtocolArgs),
     /// Manage target-specific slot groups and overrides.
     Target(TargetArgs),
     /// Validate the local profile-manager layout.
@@ -235,6 +239,144 @@ mod tests {
         };
         assert_eq!(args.query.target, Some(String::from("work")));
     }
+
+    #[test]
+    fn protocol_export_accepts_format_subset() {
+        let cli = Cli::parse_from([
+            "cx",
+            "protocol",
+            "export",
+            "--out",
+            "/tmp/protocol",
+            "--json-schema",
+        ]);
+
+        let Command::Protocol(args) = cli.command else {
+            panic!("expected protocol command");
+        };
+        let ProtocolCommand::Export(args) = args.command;
+        assert_eq!(args.out, PathBuf::from("/tmp/protocol"));
+        assert!(args.json_schema);
+        assert!(!args.typescript);
+    }
+
+    #[test]
+    fn serve_stop_accepts_force_and_json() {
+        let cli = Cli::parse_from([
+            "cx",
+            "serve",
+            "stop",
+            "--wait-timeout",
+            "0.5",
+            "--force",
+            "--json",
+        ]);
+
+        let Command::Serve(args) = cli.command else {
+            panic!("expected serve command");
+        };
+        let ServeCommand::Stop(args) = args.command else {
+            panic!("expected serve stop command");
+        };
+        assert_eq!(args.wait_timeout, 0.5);
+        assert!(args.force);
+        assert!(args.json);
+    }
+
+    #[test]
+    fn serve_ping_accepts_timeout_and_json() {
+        let cli = Cli::parse_from(["cx", "serve", "ping", "--timeout", "0.5", "--json"]);
+
+        let Command::Serve(args) = cli.command else {
+            panic!("expected serve command");
+        };
+        let ServeCommand::Ping(args) = args.command else {
+            panic!("expected serve ping command");
+        };
+        assert_eq!(args.timeout, 0.5);
+        assert!(args.json);
+    }
+
+    #[test]
+    fn serve_session_create_accepts_id_channel_and_json() {
+        let cli = Cli::parse_from([
+            "cx",
+            "serve",
+            "session",
+            "create",
+            "--id",
+            "sess_manual",
+            "--channel",
+            "telegram:12345",
+            "--json",
+        ]);
+
+        let Command::Serve(args) = cli.command else {
+            panic!("expected serve command");
+        };
+        let ServeCommand::Session(args) = args.command else {
+            panic!("expected serve session command");
+        };
+        let ServeSessionCommand::Create(args) = args.command else {
+            panic!("expected serve session create command");
+        };
+        assert_eq!(args.id, Some(String::from("sess_manual")));
+        assert_eq!(args.channel, "telegram:12345");
+        assert!(args.json);
+    }
+
+    #[test]
+    fn serve_lease_acquire_accepts_session_channel_and_json() {
+        let cli = Cli::parse_from([
+            "cx",
+            "serve",
+            "lease",
+            "acquire",
+            "--session",
+            "sess_manual",
+            "--channel",
+            "terminal",
+            "--steal",
+            "--json",
+        ]);
+
+        let Command::Serve(args) = cli.command else {
+            panic!("expected serve command");
+        };
+        let ServeCommand::Lease(args) = args.command else {
+            panic!("expected serve lease command");
+        };
+        let ServeLeaseCommand::Acquire(args) = args.command else {
+            panic!("expected serve lease acquire command");
+        };
+        assert_eq!(args.session, "sess_manual");
+        assert_eq!(args.channel, "terminal");
+        assert!(args.steal);
+        assert!(args.json);
+    }
+
+    #[test]
+    fn serve_event_list_accepts_session_filter_and_json() {
+        let cli = Cli::parse_from([
+            "cx",
+            "serve",
+            "event",
+            "list",
+            "--session",
+            "sess_manual",
+            "--json",
+        ]);
+
+        let Command::Serve(args) = cli.command else {
+            panic!("expected serve command");
+        };
+        let ServeCommand::Event(args) = args.command else {
+            panic!("expected serve event command");
+        };
+        let ServeEventCommand::List(args) = args.command;
+        assert_eq!(args.session, Some(String::from("sess_manual")));
+        assert!(args.json);
+    }
 }
 
 #[derive(Debug, Clone, Args)]
@@ -293,6 +435,359 @@ pub struct LoginArgs {
     /// Extra args forwarded to `codex login`.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ServeArgs {
+    #[command(subcommand)]
+    pub command: ServeCommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum ServeCommand {
+    /// Start the foreground cx control daemon on a private local socket.
+    Daemon(ServeDaemonArgs),
+    /// Ping the local cx control daemon.
+    Ping(ServePingArgs),
+    /// Ask the local cx control daemon to exit.
+    Shutdown(ServeShutdownArgs),
+    /// Create and inspect cx-owned sessions through the control daemon.
+    Session(ServeSessionArgs),
+    /// Acquire or release cx session channel leases.
+    Lease(ServeLeaseArgs),
+    /// Inspect cx control-plane events.
+    Event(ServeEventArgs),
+    /// Start a foreground Codex app-server through a selected slot.
+    Start(ServeStartArgs),
+    /// Stop the recorded foreground app-server or clean stale serve state.
+    Stop(ServeStopArgs),
+    /// Show the last recorded foreground app-server state.
+    Status(ServeStatusArgs),
+    /// Connect to a running app-server and verify the Codex protocol handshake.
+    Probe(ServeProbeArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ServeDaemonArgs {
+    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
+    pub manager_dir: Option<PathBuf>,
+
+    /// Print daemon startup metadata as JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ServePingArgs {
+    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
+    pub manager_dir: Option<PathBuf>,
+
+    /// Seconds to wait for the daemon response.
+    #[arg(long, default_value_t = 2.0)]
+    pub timeout: f32,
+
+    /// Print JSON instead of human output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ServeShutdownArgs {
+    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
+    pub manager_dir: Option<PathBuf>,
+
+    /// Seconds to wait for the daemon response.
+    #[arg(long, default_value_t = 2.0)]
+    pub timeout: f32,
+
+    /// Print JSON instead of human output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ServeSessionArgs {
+    #[command(subcommand)]
+    pub command: ServeSessionCommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum ServeSessionCommand {
+    /// Create a cx session and append a session-created event.
+    Create(ServeSessionCreateArgs),
+    /// List cx sessions from the control daemon.
+    List(ServeSessionListArgs),
+    /// Show one cx session.
+    Show(ServeSessionShowArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ServeSessionCreateArgs {
+    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
+    pub manager_dir: Option<PathBuf>,
+
+    /// Optional session id. Generated when omitted.
+    #[arg(long)]
+    pub id: Option<String>,
+
+    /// Channel creating the session.
+    #[arg(long, default_value = "terminal")]
+    pub channel: String,
+
+    /// Seconds to wait for the daemon response.
+    #[arg(long, default_value_t = 2.0)]
+    pub timeout: f32,
+
+    /// Print JSON instead of human output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ServeSessionListArgs {
+    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
+    pub manager_dir: Option<PathBuf>,
+
+    /// Seconds to wait for the daemon response.
+    #[arg(long, default_value_t = 2.0)]
+    pub timeout: f32,
+
+    /// Print JSON instead of human output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ServeSessionShowArgs {
+    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
+    pub manager_dir: Option<PathBuf>,
+
+    /// Seconds to wait for the daemon response.
+    #[arg(long, default_value_t = 2.0)]
+    pub timeout: f32,
+
+    /// Print JSON instead of human output.
+    #[arg(long)]
+    pub json: bool,
+
+    /// cx session id.
+    pub session_id: String,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ServeLeaseArgs {
+    #[command(subcommand)]
+    pub command: ServeLeaseCommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum ServeLeaseCommand {
+    /// Acquire control of a cx session for a channel.
+    Acquire(ServeLeaseAcquireArgs),
+    /// Release the active lease for a cx session.
+    Release(ServeLeaseReleaseArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ServeLeaseAcquireArgs {
+    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
+    pub manager_dir: Option<PathBuf>,
+
+    /// cx session id.
+    #[arg(long)]
+    pub session: String,
+
+    /// Channel acquiring the lease.
+    #[arg(long, default_value = "terminal")]
+    pub channel: String,
+
+    /// Acquire even when another channel currently holds the lease.
+    #[arg(long)]
+    pub steal: bool,
+
+    /// Seconds to wait for the daemon response.
+    #[arg(long, default_value_t = 2.0)]
+    pub timeout: f32,
+
+    /// Print JSON instead of human output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ServeLeaseReleaseArgs {
+    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
+    pub manager_dir: Option<PathBuf>,
+
+    /// cx session id.
+    #[arg(long)]
+    pub session: String,
+
+    /// Lease token returned by `cx serve lease acquire`.
+    #[arg(long)]
+    pub token: String,
+
+    /// Seconds to wait for the daemon response.
+    #[arg(long, default_value_t = 2.0)]
+    pub timeout: f32,
+
+    /// Print JSON instead of human output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ServeEventArgs {
+    #[command(subcommand)]
+    pub command: ServeEventCommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum ServeEventCommand {
+    /// List append-only cx control-plane events.
+    List(ServeEventListArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ServeEventListArgs {
+    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
+    pub manager_dir: Option<PathBuf>,
+
+    /// Filter events to one cx session id.
+    #[arg(long)]
+    pub session: Option<String>,
+
+    /// Seconds to wait for the daemon response.
+    #[arg(long, default_value_t = 2.0)]
+    pub timeout: f32,
+
+    /// Print JSON instead of human output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ServeStartArgs {
+    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
+    pub manager_dir: Option<PathBuf>,
+
+    /// Path to the real Codex binary.
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
+    pub codex_bin: Option<PathBuf>,
+
+    /// Force a specific slot instead of selecting from rotation or target.
+    #[arg(long)]
+    pub slot: Option<String>,
+
+    /// Target config from targets/<name>.toml.
+    #[arg(long)]
+    pub target: Option<String>,
+
+    /// WebSocket listen URL for Codex app-server. Only loopback ws:// URLs are accepted.
+    #[arg(long, default_value = "ws://127.0.0.1:0")]
+    pub listen: String,
+
+    /// Seconds to wait for the app-server ready endpoint.
+    #[arg(long, default_value_t = 10.0)]
+    pub ready_timeout: f32,
+
+    /// Extra args forwarded after `codex app-server --listen <url>`.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ServeStopArgs {
+    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
+    pub manager_dir: Option<PathBuf>,
+
+    /// Seconds to wait for the app-server process to exit.
+    #[arg(long, default_value_t = 5.0)]
+    pub wait_timeout: f32,
+
+    /// Send SIGKILL if the graceful stop does not finish before --wait-timeout.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Print JSON instead of human output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ServeStatusArgs {
+    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
+    pub manager_dir: Option<PathBuf>,
+
+    /// Print JSON instead of human output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ServeProbeArgs {
+    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
+    pub manager_dir: Option<PathBuf>,
+
+    /// Probe this loopback app-server URL instead of the saved serve state.
+    #[arg(long)]
+    pub listen: Option<String>,
+
+    /// Seconds to wait for the WebSocket protocol probe.
+    #[arg(long, default_value_t = 5.0)]
+    pub timeout: f32,
+
+    /// Print JSON instead of human output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ProtocolArgs {
+    #[command(subcommand)]
+    pub command: ProtocolCommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum ProtocolCommand {
+    /// Export version-matched Codex App Server schema and TypeScript bindings.
+    Export(ProtocolExportArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ProtocolExportArgs {
+    /// Path to the real Codex binary.
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
+    pub codex_bin: Option<PathBuf>,
+
+    /// Output directory. Subdirectories are created for each exported format.
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
+    pub out: PathBuf,
+
+    /// Export JSON Schema only unless another format flag is also supplied.
+    #[arg(long)]
+    pub json_schema: bool,
+
+    /// Export TypeScript bindings only unless another format flag is also supplied.
+    #[arg(long)]
+    pub typescript: bool,
+
+    /// Include experimental protocol methods and fields.
+    #[arg(long)]
+    pub experimental: bool,
 }
 
 #[derive(Debug, Clone, Args)]

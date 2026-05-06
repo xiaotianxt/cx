@@ -1,13 +1,18 @@
+mod app_server;
 mod auth;
 mod cli;
 mod completion;
+mod control;
 mod cx;
 mod envfile;
 mod install;
 mod output;
 mod paths;
+mod protocol_export;
 mod run;
 mod selector;
+mod serve;
+mod session;
 mod slot;
 mod stats;
 mod target;
@@ -21,6 +26,8 @@ use clap::CommandFactory;
 use clap::Parser;
 use cli::Cli;
 use cli::Command;
+use cli::ProtocolCommand;
+use cli::ServeCommand;
 use cli::StatusSort;
 use cli::TargetCommand;
 
@@ -98,6 +105,21 @@ fn entry() -> Result<()> {
             slot::ensure_slot_layout(&paths, &args.slot)?;
             run::exec_slot_login(&paths, args)?;
         }
+        Command::Serve(args) => match args.command {
+            ServeCommand::Daemon(args) => control::daemon(args)?,
+            ServeCommand::Ping(args) => control::ping(args)?,
+            ServeCommand::Shutdown(args) => control::shutdown(args)?,
+            ServeCommand::Session(args) => control::session(args)?,
+            ServeCommand::Lease(args) => control::lease(args)?,
+            ServeCommand::Event(args) => control::event(args)?,
+            ServeCommand::Start(args) => serve::start(args)?,
+            ServeCommand::Stop(args) => serve::stop(args)?,
+            ServeCommand::Status(args) => serve::status(args)?,
+            ServeCommand::Probe(args) => serve::probe(args)?,
+        },
+        Command::Protocol(args) => match args.command {
+            ProtocolCommand::Export(args) => protocol_export::export(args)?,
+        },
         Command::Target(args) => match args.command {
             TargetCommand::List(args) => {
                 let paths = paths::ManagerPaths::new(args.manager_dir)?;

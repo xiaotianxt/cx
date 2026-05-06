@@ -1,4 +1,6 @@
+use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -42,10 +44,42 @@ struct RunOptions {
     first_non_option: Option<String>,
 }
 
+pub(crate) struct RuntimeSelection {
+    pub slot: String,
+    pub target: Option<TargetSpec>,
+}
+
+pub(crate) struct CodexCommandSpec {
+    program: PathBuf,
+    codex_home: PathBuf,
+    envs: BTreeMap<String, String>,
+    args: Vec<OsString>,
+    slot: String,
+    target_name: Option<String>,
+}
+
+impl CodexCommandSpec {
+    pub(crate) fn slot(&self) -> &str {
+        &self.slot
+    }
+
+    pub(crate) fn target_name(&self) -> Option<&str> {
+        self.target_name.as_deref()
+    }
+
+    pub(crate) fn into_command(self) -> Command {
+        let mut command = Command::new(self.program);
+        command.env("CODEX_HOME", self.codex_home);
+        command.envs(self.envs);
+        command.args(self.args);
+        command
+    }
+}
+
 pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
     let options = parse_run_args(args)?;
     let paths = ManagerPaths::new(options.manager_dir.clone())?;
-    let real_codex = resolve_codex_bin(options.codex_bin.as_ref())?;
+    let real_codex = resolve_codex_bin(options.codex_bin.as_deref())?;
 
     if std::env::var_os("CODEX_HOME").is_some()
         && options.slot.is_none()
@@ -101,7 +135,7 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
 }
 
 pub fn exec_slot_login(paths: &ManagerPaths, args: LoginArgs) -> Result<()> {
-    let real_codex = resolve_codex_bin(args.codex_bin.as_ref())?;
+    let real_codex = resolve_codex_bin(args.codex_bin.as_deref())?;
     let slot_home = paths.slot_home(&args.slot);
     let mut command = Command::new(real_codex);
     command.env("CODEX_HOME", slot_home);
@@ -110,13 +144,51 @@ pub fn exec_slot_login(paths: &ManagerPaths, args: LoginArgs) -> Result<()> {
     exec(command)
 }
 
-fn exec_slot_codex(
+pub(crate) fn should_skip_stdin_wrapper(args: &[OsString]) -> bool {
+    first_forwarded_non_option(args).is_some_and(|arg| BYPASS_SUBCOMMANDS.contains(&arg.as_str()))
+}
+
+pub(crate) fn select_runtime(
     paths: &ManagerPaths,
-    real_codex: &PathBuf,
+    slot: Option<&str>,
+    target_name: Option<&str>,
+    debug: bool,
+) -> Result<RuntimeSelection> {
+    let target = crate::target::load_optional_target(paths, target_name)?;
+    if let Some(slot) = slot {
+        return Ok(RuntimeSelection {
+            slot: slot.to_string(),
+            target,
+        });
+    }
+
+    let candidates = if let Some(target) = &target {
+        target.slots_or_rotation(paths)?
+    } else {
+        slot::load_rotation(paths)?
+    };
+    if candidates.is_empty() {
+        anyhow::bail!("no configured slots for serve");
+    }
+
+    let results = selector::query_slots(paths, &candidates, usage_timeout())?;
+    let selected = selector::choose_result(&results);
+    if debug || std::env::var_os("CX_SLOT_DEBUG").is_some() {
+        crate::output::print_report(&results, selected.map(|result| result.slot.as_str()), false)?;
+    }
+    let slot = selected
+        .map(|result| result.slot.clone())
+        .context("no usable Codex slot found")?;
+    Ok(RuntimeSelection { slot, target })
+}
+
+pub(crate) fn build_slot_command_spec(
+    paths: &ManagerPaths,
+    real_codex: PathBuf,
     selected_slot: &str,
     target: Option<&TargetSpec>,
-    options: RunOptions,
-) -> Result<()> {
+    codex_args: Vec<OsString>,
+) -> Result<CodexCommandSpec> {
     let slot_home = paths.slot_home(selected_slot);
     if !slot_home.is_dir() {
         anyhow::bail!(
@@ -130,29 +202,55 @@ fn exec_slot_codex(
     let slot_dir = paths.slot_dir(selected_slot);
     let mut overrides = slot::read_override_lines(&slot_dir)?;
     let mut envs = envfile::read_env_file(&slot_dir.join("env.conf"))?;
+    let target_name = target.map(|target| target.name().to_string());
     if let Some(target) = target {
         overrides.extend(target.overrides().iter().cloned());
         envs.extend(target.env().clone());
     }
 
+    let mut args = Vec::new();
+    for override_line in overrides {
+        args.push(OsString::from("-c"));
+        args.push(OsString::from(override_line));
+    }
+    args.extend(codex_args);
+
+    Ok(CodexCommandSpec {
+        program: real_codex,
+        codex_home: slot_home,
+        envs,
+        args,
+        slot: selected_slot.to_string(),
+        target_name,
+    })
+}
+
+fn exec_slot_codex(
+    paths: &ManagerPaths,
+    real_codex: &Path,
+    selected_slot: &str,
+    target: Option<&TargetSpec>,
+    options: RunOptions,
+) -> Result<()> {
+    let spec = build_slot_command_spec(
+        paths,
+        real_codex.to_path_buf(),
+        selected_slot,
+        target,
+        options.codex_args,
+    )?;
+
     if !options.quiet {
-        eprintln!("codex slot: {selected_slot}");
-        if let Some(target) = target {
-            eprintln!("codex target: {}", target.name());
+        eprintln!("codex slot: {}", spec.slot());
+        if let Some(target) = spec.target_name() {
+            eprintln!("codex target: {target}");
         }
     }
 
-    let mut command = Command::new(real_codex);
-    command.env("CODEX_HOME", slot_home);
-    command.envs(envs);
-    for override_line in overrides {
-        command.arg("-c").arg(override_line);
-    }
-    command.args(options.codex_args);
-    exec(command)
+    exec(spec.into_command())
 }
 
-fn exec_real_codex(real_codex: &PathBuf, args: Vec<OsString>) -> Result<()> {
+fn exec_real_codex(real_codex: &Path, args: Vec<OsString>) -> Result<()> {
     let mut command = Command::new(real_codex);
     command.args(args);
     exec(command)
@@ -171,9 +269,9 @@ fn exec(mut command: Command) -> Result<()> {
     }
 }
 
-fn resolve_codex_bin(override_path: Option<&PathBuf>) -> Result<PathBuf> {
+pub(crate) fn resolve_codex_bin(override_path: Option<&Path>) -> Result<PathBuf> {
     if let Some(path) = override_path {
-        return Ok(path.clone());
+        return Ok(path.to_path_buf());
     }
     if let Some(path) = std::env::var_os("CX_CODEX_BIN") {
         return Ok(PathBuf::from(path));
@@ -191,6 +289,27 @@ fn resolve_codex_bin(override_path: Option<&PathBuf>) -> Result<PathBuf> {
         return Ok(fallback);
     }
     Ok(PathBuf::from("codex"))
+}
+
+fn first_forwarded_non_option(args: &[OsString]) -> Option<String> {
+    let mut iter = args.iter().peekable();
+    while let Some(arg) = iter.next() {
+        let arg_text = arg.to_string_lossy();
+        match arg_text.as_ref() {
+            "--" => return iter.next().map(|value| value.to_string_lossy().to_string()),
+            "--slot" | "--target" | "--manager-dir" | "--codex-bin" | "-s" => {
+                let _ = iter.next();
+            }
+            "--cx-quiet" | "--cx-debug" => {}
+            _ if arg_text.starts_with("--slot=")
+                || arg_text.starts_with("--target=")
+                || arg_text.starts_with("--manager-dir=")
+                || arg_text.starts_with("--codex-bin=") => {}
+            _ if arg_text.starts_with('-') => {}
+            _ => return Some(arg_text.to_string()),
+        }
+    }
+    None
 }
 
 fn usage_timeout() -> f32 {
@@ -326,6 +445,16 @@ mod tests {
             options.codex_args,
             vec![OsString::from("-m"), OsString::from("gpt-5.5")]
         );
+    }
+
+    #[test]
+    fn app_server_subcommand_skips_stdin_wrapper() {
+        assert!(should_skip_stdin_wrapper(&[
+            OsString::from("--slot"),
+            OsString::from("bus1"),
+            OsString::from("app-server"),
+            OsString::from("--help"),
+        ]));
     }
 
     #[test]

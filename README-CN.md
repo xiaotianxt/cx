@@ -12,6 +12,11 @@ cx 是一个本地 Codex 入口：负责启动 Codex、处理 stdin pipe、管�
 - `cx stats`：从本地 `state_5.sqlite` 汇总 Codex token 消耗。
 - `cx add` / `cx login` / `cx remove`：管理独立 slot。
 - `cx --target <name>`：使用命名 target 的 slot 组和覆盖策略启动 Codex。
+- `cx serve start` / `cx serve stop`：通过选中的 slot 管理前台 loopback Codex
+  app-server。
+- `cx serve daemon` / `cx serve ping`：运行并检查本地 cx control socket。
+- `cx protocol export`：导出与当前 Codex binary 匹配的 App Server schema 和 TypeScript
+  bindings。
 - `cx completions`：生成 shell completion，支持动态补全 slot 和 model。
 
 ## 工作方式
@@ -207,6 +212,78 @@ CX_EXPERIMENT = "research"
 `overrides.conf` 后面，target env 会排在 slot `env.conf` 后面，因此 target 策略会覆盖
 slot 默认值。`cx target show` 只显示环境变量名，不打印值，并会对看起来敏感的 override
 值做脱敏。
+
+## App Server 基础能力
+
+通过 cx 的 slot 和 target 选择逻辑启动前台 Codex app-server：
+
+```bash
+cx serve start
+cx serve start --target research
+cx serve start --slot bus1 --listen ws://127.0.0.1:17654
+cx serve stop
+cx serve stop --force --json
+cx serve status
+cx serve status --json
+cx serve probe
+cx serve probe --listen ws://127.0.0.1:17654 --json
+```
+
+`cx serve start` 只接受 loopback `ws://127.0.0.1:<port>` 或
+`ws://localhost:<port>` 监听地址。端口 `0` 会先解析成一个具体的空闲 loopback 端口，
+然后再启动 Codex，等待 app-server `/readyz` 可用，并在 profile-manager 目录下写入
+`serve/default.json`。
+
+`cx serve stop` 会读取这个 state 文件，确认记录的进程和 ready endpoint 仍然匹配，然后
+发出 graceful stop signal。如果 state 已经过期，它只清理 cx 的 state 文件。`--force`
+会在 `--wait-timeout` 后升级到 SIGKILL。
+
+`cx serve probe` 会连接保存的或显式传入的 loopback WebSocket URL，发送 Codex App
+Server `initialize` 握手，然后用 `thread/list` 做一次只读 state-db 探测。这个命令用于
+确认 app-server 协议路径可用，不会启动模型 turn。
+
+运行本地 cx control daemon：
+
+```bash
+cx serve daemon
+cx serve daemon --json
+cx serve ping
+cx serve ping --json
+cx serve session create
+cx serve session create --channel telegram:12345 --json
+cx serve session list
+cx serve session show <session-id>
+cx serve lease acquire --session <session-id> --channel terminal --json
+cx serve lease acquire --session <session-id> --channel telegram:12345 --steal
+cx serve lease release --session <session-id> --token <lease-token>
+cx serve event list --session <session-id> --json
+cx serve shutdown
+```
+
+daemon 会绑定 `<profile-manager>/serve/control.sock`，保持 serve 目录私有，并使用一个
+很小的 versioned JSON line 协议。`cx serve session create` 会创建 cx 自己的 session
+id，写入 `serve/sessions/<session-id>.json`，并向 `serve/events.ndjson` 追加一条
+`session-created` 事件。`cx serve lease acquire` 会记录当前持有 session 的 channel，
+递增 `leaseEpoch`，返回 lease token，并追加 lease event。如果 session 已经有 active
+lease，新的 acquire 默认失败，只有显式 `--steal` 才会抢占。`cx serve event list`
+会通过同一个 control socket 读取 journal。这是未来 adapter 的入口，但现在还不负责
+turn 或 approval broker。
+
+这只是未来 daemon/control-plane 层的本地基础能力。Telegram、WeChat、远程 terminal 等
+adapter 最终都应该接入 cx，而不是直接拿 raw Codex app-server WebSocket；这样 cx 才能
+统一负责 slot 轮转、lease、approval routing 和审计状态。
+
+导出 Codex App Server 协议定义，供下游 client 生成类型或做 schema 校验：
+
+```bash
+cx protocol export --out /tmp/codex-app-protocol
+cx protocol export --out /tmp/codex-app-protocol --json-schema
+cx protocol export --out /tmp/codex-app-protocol --typescript
+```
+
+如果不指定格式，cx 会在输出目录下同时写入 `json-schema/` 和 `typescript/`。这个命令
+会调用当前选中的 Codex binary 的 `app-server generate-json-schema` 和
+`app-server generate-ts`。
 
 如果参数和 cx 子命令冲突，用 `--` 强制进入 Codex：
 

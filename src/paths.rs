@@ -31,6 +31,17 @@ impl ManagerPaths {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_roots(base_codex_home: PathBuf, manager_dir: PathBuf) -> Self {
+        Self {
+            slots_dir: manager_dir.join("slots"),
+            targets_dir: manager_dir.join("targets"),
+            rotation_file: manager_dir.join("rotation.txt"),
+            manager_dir,
+            base_codex_home,
+        }
+    }
+
     pub fn slot_dir(&self, slot: &str) -> PathBuf {
         self.slots_dir.join(slot)
     }
@@ -41,6 +52,30 @@ impl ManagerPaths {
 
     pub fn target_file(&self, target: &str) -> PathBuf {
         self.targets_dir.join(format!("{target}.toml"))
+    }
+
+    pub fn serve_dir(&self) -> PathBuf {
+        self.manager_dir.join("serve")
+    }
+
+    pub fn serve_state_file(&self) -> PathBuf {
+        self.serve_dir().join("default.json")
+    }
+
+    pub fn serve_control_socket(&self) -> PathBuf {
+        self.serve_dir().join("control.sock")
+    }
+
+    pub fn serve_sessions_dir(&self) -> PathBuf {
+        self.serve_dir().join("sessions")
+    }
+
+    pub fn serve_session_file(&self, session_id: &str) -> PathBuf {
+        self.serve_sessions_dir().join(format!("{session_id}.json"))
+    }
+
+    pub fn serve_event_journal_file(&self) -> PathBuf {
+        self.serve_dir().join("events.ndjson")
     }
 }
 

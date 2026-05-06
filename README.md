@@ -17,6 +17,12 @@ live usage.
 - `cx select`: print the best slot name for scripts.
 - `cx --target <name>`: launch through a named target-specific slot group and
   override set.
+- `cx serve start` / `cx serve stop`: manage a foreground loopback Codex
+  app-server through a selected slot.
+- `cx serve daemon` / `cx serve ping`: run and check the local cx control
+  socket.
+- `cx protocol export`: export version-matched Codex App Server schemas and
+  TypeScript bindings.
 - `cx completions`: generate shell completion scripts with dynamic slot/model
   candidates.
 
@@ -224,6 +230,84 @@ are passed after slot `overrides.conf`, and target env values are merged after
 slot `env.conf`, so target policy wins over slot defaults. `cx target show`
 prints env variable names rather than values and redacts sensitive-looking
 override values.
+
+## App Server Foundation
+
+Start a foreground Codex app-server through cx's slot and target selection:
+
+```bash
+cx serve start
+cx serve start --target research
+cx serve start --slot bus1 --listen ws://127.0.0.1:17654
+cx serve stop
+cx serve stop --force --json
+cx serve status
+cx serve status --json
+cx serve probe
+cx serve probe --listen ws://127.0.0.1:17654 --json
+```
+
+`cx serve start` only accepts loopback `ws://127.0.0.1:<port>` or
+`ws://localhost:<port>` listeners. Port `0` is resolved to a concrete free
+loopback port before Codex is spawned, then cx waits for app-server `/readyz`
+and writes `serve/default.json` under the profile manager directory.
+
+`cx serve stop` reads that state file, verifies the recorded process and ready
+endpoint still match, then sends a graceful stop signal. If the state is stale,
+it cleans only the cx state file. `--force` escalates to SIGKILL after
+`--wait-timeout`.
+
+`cx serve probe` connects to the saved or explicit loopback WebSocket URL,
+sends the Codex App Server `initialize` handshake, then calls `thread/list` with
+a one-row local state-db probe. This verifies the app-server protocol path
+without starting a model turn.
+
+Run the local cx control daemon on a private Unix socket:
+
+```bash
+cx serve daemon
+cx serve daemon --json
+cx serve ping
+cx serve ping --json
+cx serve session create
+cx serve session create --channel telegram:12345 --json
+cx serve session list
+cx serve session show <session-id>
+cx serve lease acquire --session <session-id> --channel terminal --json
+cx serve lease acquire --session <session-id> --channel telegram:12345 --steal
+cx serve lease release --session <session-id> --token <lease-token>
+cx serve event list --session <session-id> --json
+cx serve shutdown
+```
+
+The daemon binds `<profile-manager>/serve/control.sock`, keeps the serve
+directory private, and speaks a small versioned JSON line protocol. `cx serve
+session create` creates a cx-owned session id, writes
+`serve/sessions/<session-id>.json`, and appends a `session-created` record to
+`serve/events.ndjson`. `cx serve lease acquire` records the channel that
+currently owns the session, increments `leaseEpoch`, returns a lease token, and
+appends a lease event. Acquiring a session with an active lease fails unless
+`--steal` is explicit. `cx serve event list` reads the journal through the same
+control socket. This is the future adapter entry point; it does not yet broker
+turns or approvals.
+
+This is only the local foundation for a future daemon/control-plane layer.
+Telegram, WeChat, remote terminal, and other adapters must eventually talk to cx
+rather than to the raw Codex app-server WebSocket, so cx can own slot rotation,
+leases, approval routing, and audit state.
+
+Export the Codex App Server protocol definitions for downstream clients:
+
+```bash
+cx protocol export --out /tmp/codex-app-protocol
+cx protocol export --out /tmp/codex-app-protocol --json-schema
+cx protocol export --out /tmp/codex-app-protocol --typescript
+```
+
+When no format flag is supplied, cx writes both `json-schema/` and
+`typescript/` under the output directory by delegating to the selected Codex
+binary's `app-server generate-json-schema` and `app-server generate-ts`
+commands.
 
 If a Codex prompt or argument conflicts with a cx management command, use `--`
 to force launcher mode:

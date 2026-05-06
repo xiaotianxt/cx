@@ -79,6 +79,15 @@ final process is the real Codex binary with:
 - repeated target `set`/`overrides` lines, appended after slot overrides
 - the user's original Codex args
 
+Before `exec`, a clean launch with no prompt, pipe, or forwarded Codex args
+passes through an auto-resume policy. `cx` reads the selected slot's shared
+`state_5.sqlite`, finds the latest unarchived `cli` or `vscode` thread for the
+process cwd, and checks the thread's rollout file with `lsof`. If the file is
+not open, `cx` appends `resume <session-id>` after slot and target overrides. If
+the file is open, missing, or the active-state probe is inconclusive, `cx`
+leaves the arguments unchanged and Codex starts a new session. Explicit Codex
+subcommands, help/version, and `--remote` launches bypass this policy.
+
 Target-specific execution resolves in this order:
 
 1. `--slot` wins when supplied.

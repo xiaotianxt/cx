@@ -1,5 +1,6 @@
 mod app_server;
 mod auth;
+mod autoresume;
 mod cli;
 mod completion;
 mod control;

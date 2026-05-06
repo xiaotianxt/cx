@@ -121,6 +121,14 @@ cx --slot bus1 -m gpt-5.4
 cx --target research -m gpt-5.5
 ```
 
+For a clean `cx` launch with no prompt, pipe, or forwarded Codex args, `cx`
+checks the latest unarchived Codex session for the current working directory. If
+that session is not currently open in another Codex TUI, `cx` runs
+`codex resume <session-id>` automatically. If the latest session is active, `cx`
+leaves the arguments unchanged so Codex starts a new session. Explicit Codex
+subcommands such as `resume`, `exec`, `review`, `help`, and remote app-server
+launches are never rewritten.
+
 Pipe context into Codex:
 
 ```bash

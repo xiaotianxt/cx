@@ -103,6 +103,13 @@ cx --slot bus1 -m gpt-5.4
 cx --target research -m gpt-5.5
 ```
 
+只有干净的 `cx` 启动，也就是没有 prompt、pipe、或 forwarded Codex args 时，
+`cx` 才会检查当前工作目录下最新的、未归档的 Codex session。如果这个 session
+没有被另一个 Codex TUI 打开，`cx` 会自动执行 `codex resume <session-id>`；
+如果这个 session 仍然活跃，就保持原参数，让 Codex 新开一个 session。显式的
+Codex 子命令，比如 `resume`、`exec`、`review`、`help`，以及 remote
+app-server 启动，不会被改写。
+
 stdin pipe：
 
 ```bash

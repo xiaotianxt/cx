@@ -7,6 +7,7 @@ use std::process::Command;
 use anyhow::Context;
 use anyhow::Result;
 
+use crate::autoresume;
 use crate::cli::LoginArgs;
 use crate::envfile;
 use crate::paths;
@@ -232,7 +233,8 @@ fn exec_slot_codex(
     target: Option<&TargetSpec>,
     options: RunOptions,
 ) -> Result<()> {
-    let spec = build_slot_command_spec(
+    let should_consider_auto_resume = options.codex_args.is_empty();
+    let mut spec = build_slot_command_spec(
         paths,
         real_codex.to_path_buf(),
         selected_slot,
@@ -240,10 +242,25 @@ fn exec_slot_codex(
         options.codex_args,
     )?;
 
+    let mut resumed_session_id = None;
+    if should_consider_auto_resume {
+        if let Some(plan) = auto_resume_plan(&spec.args)? {
+            if let Some(session_id) =
+                autoresume::inactive_latest_session_id(&spec.codex_home, &plan.workspace)
+            {
+                insert_resume_args(&mut spec.args, plan.insert_index, &session_id);
+                resumed_session_id = Some(session_id);
+            }
+        }
+    }
+
     if !options.quiet {
         eprintln!("codex slot: {}", spec.slot());
         if let Some(target) = spec.target_name() {
             eprintln!("codex target: {target}");
+        }
+        if let Some(session_id) = resumed_session_id {
+            eprintln!("codex resume: {session_id}");
         }
     }
 
@@ -310,6 +327,167 @@ fn first_forwarded_non_option(args: &[OsString]) -> Option<String> {
         }
     }
     None
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AutoResumePlan {
+    insert_index: usize,
+    workspace: PathBuf,
+}
+
+fn auto_resume_plan(args: &[OsString]) -> Result<Option<AutoResumePlan>> {
+    let mut workspace = None;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        let arg_text = arg.to_string_lossy();
+        if matches!(arg_text.as_ref(), "-h" | "--help" | "-V" | "--version") {
+            return Ok(None);
+        }
+        if arg_text == "--remote" {
+            return Ok(None);
+        }
+        if arg_text.starts_with("--remote=") {
+            return Ok(None);
+        }
+        if matches!(arg_text.as_ref(), "-C" | "--cd") {
+            index += 1;
+            let value = args
+                .get(index)
+                .with_context(|| format!("{arg_text} requires a value"))?;
+            workspace = Some(PathBuf::from(value));
+            index += 1;
+            continue;
+        }
+        if let Some(value) = arg_text.strip_prefix("--cd=") {
+            workspace = Some(PathBuf::from(value));
+            index += 1;
+            continue;
+        }
+        if arg_text.starts_with('-') {
+            match codex_option_kind(arg_text.as_ref()) {
+                CodexOptionKind::Flag => {
+                    index += 1;
+                    continue;
+                }
+                CodexOptionKind::Value => {
+                    if args.get(index + 1).is_none() {
+                        return Ok(None);
+                    }
+                    index += 2;
+                    continue;
+                }
+                CodexOptionKind::Unknown => return Ok(None),
+            }
+        }
+        if is_codex_subcommand(arg_text.as_ref()) {
+            return Ok(None);
+        }
+        return Ok(None);
+    }
+
+    Ok(Some(AutoResumePlan {
+        insert_index: args.len(),
+        workspace: resolve_workspace(workspace)?,
+    }))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexOptionKind {
+    Flag,
+    Value,
+    Unknown,
+}
+
+fn codex_option_kind(arg: &str) -> CodexOptionKind {
+    if arg.contains('=') {
+        let name = arg.split_once('=').map(|(name, _)| name).unwrap_or(arg);
+        return match name {
+            "--config"
+            | "--enable"
+            | "--disable"
+            | "--remote-auth-token-env"
+            | "--image"
+            | "--model"
+            | "--local-provider"
+            | "--profile"
+            | "--sandbox"
+            | "--cd"
+            | "--add-dir"
+            | "--ask-for-approval" => CodexOptionKind::Flag,
+            _ => CodexOptionKind::Unknown,
+        };
+    }
+
+    match arg {
+        "--oss" | "--dangerously-bypass-approvals-and-sandbox" | "--search" | "--no-alt-screen" => {
+            CodexOptionKind::Flag
+        }
+        "-c"
+        | "--config"
+        | "--enable"
+        | "--disable"
+        | "--remote-auth-token-env"
+        | "-i"
+        | "--image"
+        | "-m"
+        | "--model"
+        | "--local-provider"
+        | "-p"
+        | "--profile"
+        | "-s"
+        | "--sandbox"
+        | "--add-dir"
+        | "-a"
+        | "--ask-for-approval" => CodexOptionKind::Value,
+        _ => CodexOptionKind::Unknown,
+    }
+}
+
+fn is_codex_subcommand(arg: &str) -> bool {
+    matches!(
+        arg,
+        "exec"
+            | "e"
+            | "review"
+            | "login"
+            | "logout"
+            | "mcp"
+            | "plugin"
+            | "mcp-server"
+            | "app-server"
+            | "app"
+            | "completion"
+            | "update"
+            | "sandbox"
+            | "debug"
+            | "apply"
+            | "a"
+            | "resume"
+            | "fork"
+            | "cloud"
+            | "exec-server"
+            | "features"
+            | "help"
+    )
+}
+
+fn resolve_workspace(workspace: Option<PathBuf>) -> Result<PathBuf> {
+    let cwd = std::env::current_dir().context("resolve current directory")?;
+    let workspace = match workspace {
+        Some(workspace) if workspace.is_absolute() => workspace,
+        Some(workspace) => cwd.join(workspace),
+        None => cwd,
+    };
+    match std::fs::canonicalize(&workspace) {
+        Ok(path) => Ok(path),
+        Err(_) => Ok(workspace),
+    }
+}
+
+fn insert_resume_args(args: &mut Vec<OsString>, insert_index: usize, session_id: &str) {
+    args.insert(insert_index, OsString::from("resume"));
+    args.insert(insert_index + 1, OsString::from(session_id));
 }
 
 fn usage_timeout() -> f32 {
@@ -473,6 +651,69 @@ mod tests {
                 OsString::from("-s"),
                 OsString::from("workspace-write"),
                 OsString::from("hello")
+            ]
+        );
+    }
+
+    #[test]
+    fn auto_resume_plan_skips_prompt() {
+        let args = vec![
+            OsString::from("-m"),
+            OsString::from("gpt-5.5"),
+            OsString::from("continue"),
+        ];
+
+        let plan = auto_resume_plan(&args).unwrap();
+
+        assert_eq!(plan, None);
+    }
+
+    #[test]
+    fn auto_resume_plan_uses_current_workspace_for_clean_launch() {
+        let cwd = std::env::current_dir().unwrap();
+        let args = Vec::new();
+
+        let plan = auto_resume_plan(&args).unwrap().unwrap();
+
+        assert_eq!(plan.insert_index, 0);
+        assert_eq!(plan.workspace, cwd);
+    }
+
+    #[test]
+    fn auto_resume_plan_skips_explicit_subcommands() {
+        let args = vec![OsString::from("resume"), OsString::from("--last")];
+
+        let plan = auto_resume_plan(&args).unwrap();
+
+        assert_eq!(plan, None);
+    }
+
+    #[test]
+    fn auto_resume_plan_skips_remote_and_help() {
+        assert_eq!(
+            auto_resume_plan(&[
+                OsString::from("--remote"),
+                OsString::from("ws://127.0.0.1:1")
+            ])
+            .unwrap(),
+            None
+        );
+        assert_eq!(auto_resume_plan(&[OsString::from("-h")]).unwrap(), None);
+    }
+
+    #[test]
+    fn insert_resume_args_appends_after_overrides() {
+        let mut args = vec![OsString::from("-c"), OsString::from("model=\"gpt-5.5\"")];
+
+        insert_resume_args(&mut args, 2, "019dfdd3-debc-7da2-88fc-b15b73f5e138");
+
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("-c"),
+                OsString::from("model=\"gpt-5.5\""),
+                OsString::from("resume"),
+                OsString::from("019dfdd3-debc-7da2-88fc-b15b73f5e138"),
             ]
         );
     }

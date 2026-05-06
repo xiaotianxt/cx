@@ -85,6 +85,22 @@ impl ManagerPaths {
     pub fn telegram_channel_state_file(&self) -> PathBuf {
         self.serve_channels_dir().join("telegram.json")
     }
+
+    pub fn service_dir(&self) -> PathBuf {
+        self.manager_dir.join("service")
+    }
+
+    pub fn service_state_file(&self) -> PathBuf {
+        self.service_dir().join("default.json")
+    }
+
+    pub fn service_log_file(&self) -> PathBuf {
+        self.service_dir().join("default.log")
+    }
+
+    pub fn service_launchd_plist_file(&self) -> Result<PathBuf> {
+        Ok(home_dir()?.join("Library/LaunchAgents/dev.xiaotian.cx.service.plist"))
+    }
 }
 
 pub fn home_dir() -> Result<PathBuf> {

@@ -15,6 +15,7 @@ cx 是一个本地 Codex 入口：负责启动 Codex、处理 stdin pipe、管�
 - `cx --target <name>`：使用命名 target 的 slot 组和覆盖策略启动 Codex。
 - `cx serve start` / `cx serve stop`：通过选中的 slot 管理前台 loopback Codex
   app-server。
+- `cx service start`：用一个本地后台 supervisor 同时运行 app-server 和 Telegram adapter。
 - `cx serve daemon` / `cx serve ping`：运行并检查本地 cx control socket。
 - `cx channel telegram run`：把 allowlist 里的 Telegram chat 接入 cx session 和 lease。
 - `cx protocol export`：导出与当前 Codex binary 匹配的 App Server schema 和 TypeScript
@@ -303,6 +304,33 @@ turn 或 approval broker。
 adapter 最终都应该接入 cx，而不是直接拿 raw Codex app-server WebSocket；这样 cx 才能
 统一负责 slot 轮转、lease、approval routing 和审计状态。
 
+## Background Service
+
+用一个 cx supervisor 后台运行 app-server 和 Telegram adapter：
+
+```bash
+cx service start --telegram-token-op-ref 'op://Private/Telegram/codex_xiaotian_bot'
+cx service status
+cx service logs
+cx service stop
+```
+
+`cx service start` 默认会启动 Telegram。它先启动 `cx serve start`，等待 app-server
+state 就绪，然后启动 `cx channel telegram run`。如果只想后台跑 app-server，用
+`--no-telegram`。token 不写入源码、state 或 log：可以用 `--telegram-bot-token-env`
+指定环境变量，也可以用 `--telegram-token-op-ref` 传 1Password 引用，supervisor 只会把
+读取到的 token 注入 Telegram 子进程。
+
+macOS 登录自启可以安装 launchd agent：
+
+```bash
+cx service install --telegram-token-op-ref 'op://Private/Telegram/codex_xiaotian_bot' --start
+cx service uninstall
+```
+
+service state 和 log 写在 `<profile-manager>/service/`。supervisor 会在子进程退出时重启；
+`cx service stop` 会停止 state 里记录的子进程和 supervisor。
+
 ## Telegram Channel
 
 启动 Telegram adapter。第一次使用时，如果本地还没有可信 chat，`run` 会打印一个一次性的
@@ -313,6 +341,7 @@ export TELEGRAM_BOT_TOKEN=...
 cx serve start
 cx channel telegram run
 cx channel telegram run --acquire-lease
+cx service start --telegram-token-op-ref 'op://Private/Telegram/codex_xiaotian_bot'
 cx channel telegram bind
 cx channel telegram menu
 cx channel telegram status --json

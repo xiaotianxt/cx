@@ -15,6 +15,7 @@ mod protocol_export;
 mod run;
 mod selector;
 mod serve;
+mod service;
 mod session;
 mod slot;
 mod stats;
@@ -32,6 +33,7 @@ use cli::Cli;
 use cli::Command;
 use cli::ProtocolCommand;
 use cli::ServeCommand;
+use cli::ServiceCommand;
 use cli::StatusSort;
 use cli::TargetCommand;
 use cli::TelegramCommand;
@@ -133,6 +135,15 @@ fn entry() -> Result<()> {
             ServeCommand::Status(args) => serve::status(args)?,
             ServeCommand::Probe(args) => serve::probe(args)?,
             ServeCommand::Threads(args) => serve::threads(args)?,
+        },
+        Command::Service(args) => match args.command {
+            ServiceCommand::Start(args) => service::start(args)?,
+            ServiceCommand::Run(args) => service::run(args)?,
+            ServiceCommand::Stop(args) => service::stop(args)?,
+            ServiceCommand::Status(args) => service::status(args)?,
+            ServiceCommand::Logs(args) => service::logs(args)?,
+            ServiceCommand::Install(args) => service::install(args)?,
+            ServiceCommand::Uninstall(args) => service::uninstall(args)?,
         },
         Command::Protocol(args) => match args.command {
             ProtocolCommand::Export(args) => protocol_export::export(args)?,

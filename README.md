@@ -20,6 +20,8 @@ live usage.
   override set.
 - `cx serve start` / `cx serve stop`: manage a foreground loopback Codex
   app-server through a selected slot.
+- `cx service start`: run app-server and the Telegram adapter under one local
+  background supervisor.
 - `cx serve daemon` / `cx serve ping`: run and check the local cx control
   socket.
 - `cx channel telegram run`: bridge allowed Telegram chats into cx sessions and
@@ -331,6 +333,36 @@ Telegram, WeChat, remote terminal, and other adapters must eventually talk to cx
 rather than to the raw Codex app-server WebSocket, so cx can own slot rotation,
 leases, approval routing, and audit state.
 
+## Background Service
+
+Run the app-server and Telegram adapter under one cx-owned supervisor:
+
+```bash
+cx service start --telegram-token-op-ref 'op://Private/Telegram/codex_xiaotian_bot'
+cx service status
+cx service logs
+cx service stop
+```
+
+`cx service start` defaults to Telegram. It starts `cx serve start`, waits for
+the app-server state, then starts `cx channel telegram run`. Use `--no-telegram`
+when only the background app-server is wanted. Token handling stays out of
+source control and logs: pass a normal token environment variable with
+`--telegram-bot-token-env`, or pass a 1Password reference with
+`--telegram-token-op-ref` and the supervisor will inject the token only into the
+Telegram child process.
+
+For login startup on macOS, install a launchd agent:
+
+```bash
+cx service install --telegram-token-op-ref 'op://Private/Telegram/codex_xiaotian_bot' --start
+cx service uninstall
+```
+
+The service writes state and logs under `<profile-manager>/service/`. The
+supervisor restarts child processes if they exit; `cx service stop` stops the
+recorded children and then the supervisor.
+
 ## Telegram Channel
 
 Run the Telegram adapter. On first use, when no chats are trusted yet, `run`
@@ -341,6 +373,7 @@ export TELEGRAM_BOT_TOKEN=...
 cx serve start
 cx channel telegram run
 cx channel telegram run --acquire-lease
+cx service start --telegram-token-op-ref 'op://Private/Telegram/codex_xiaotian_bot'
 cx channel telegram bind
 cx channel telegram menu
 cx channel telegram status --json

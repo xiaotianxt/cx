@@ -236,16 +236,19 @@ pub mod telegram {
         }
 
         fn active_binding_for_route(&self, route: &TelegramRoute) -> Option<&TelegramBinding> {
-            let active_alias = self
-                .active_routes
+            let active_alias = self.active_alias_for_route(route);
+            self.binding_for_route(route, active_alias)
+                .or_else(|| self.binding_for_route(route, None))
+        }
+
+        fn active_alias_for_route(&self, route: &TelegramRoute) -> Option<&str> {
+            self.active_routes
                 .iter()
                 .find(|active| {
                     active.chat_id == route.chat_id
                         && active.message_thread_id == route.message_thread_id
                 })
-                .and_then(|active| active.alias.as_deref());
-            self.binding_for_route(route, active_alias)
-                .or_else(|| self.binding_for_route(route, None))
+                .and_then(|active| active.alias.as_deref())
         }
 
         fn binding_for_route_mut(
@@ -692,7 +695,7 @@ pub mod telegram {
         match command {
             TelegramTextCommand::Status => {
                 let Some(binding) = state.active_binding_for_route(&route) else {
-                    return Ok(Some(reply(&route, "No cx session is bound to this route.")));
+                    return Ok(Some(reply(&route, no_session_bound_message(state, &route))));
                 };
                 let session = session::show_session(paths, &binding.session_id)?;
                 Ok(Some(reply(
@@ -715,13 +718,16 @@ pub mod telegram {
             TelegramTextCommand::Sessions => {
                 let lines = route_session_lines(state, chat_id);
                 if lines.is_empty() {
-                    return Ok(Some(reply(&route, "No Telegram routes are bound.")));
+                    return Ok(Some(reply(
+                        &route,
+                        "No Telegram sessions are bound for this chat. Send /start to create one.",
+                    )));
                 }
                 Ok(Some(reply(&route, lines.join("\n"))))
             }
             TelegramTextCommand::Release => {
                 let Some(binding) = state.active_binding_for_route(&route) else {
-                    return Ok(Some(reply(&route, "No cx session is bound to this route.")));
+                    return Ok(Some(reply(&route, no_session_bound_message(state, &route))));
                 };
                 let session = session::show_session(paths, &binding.session_id)?;
                 let Some(active_lease) = session.active_lease else {
@@ -872,7 +878,8 @@ pub mod telegram {
                 Ok(Some(reply(&route, format!("Using session `{alias}`."))))
             }
             TelegramTextCommand::Close { alias } => {
-                let alias = normalize_alias(alias.as_deref());
+                let alias = normalize_alias(alias.as_deref())
+                    .or_else(|| state.active_alias_for_route(&route).map(str::to_string));
                 if let Some(binding) = state.binding_for_route(&route, alias.as_deref()) {
                     if let (Some(thread_id), Some(notifier)) =
                         (binding.message_thread_id, options.notifier)
@@ -900,11 +907,7 @@ pub mod telegram {
                 } else {
                     Ok(Some(reply(
                         &route,
-                        format!(
-                            "No session `{}` is bound to route {}.",
-                            alias.as_deref().unwrap_or("default"),
-                            route.display()
-                        ),
+                        missing_session_message(state, &route, alias.as_deref()),
                     )))
                 }
             }
@@ -912,7 +915,7 @@ pub mod telegram {
                 if text.trim().is_empty() {
                     return Ok(Some(reply(
                         &route,
-                        "Send a text message for Codex to answer.",
+                        "Send a message for Codex to answer, or use /new <name>, /use <name>, /sessions, /status, /close.",
                     )));
                 }
                 let binding = state
@@ -1147,7 +1150,7 @@ pub mod telegram {
     }
 
     fn route_session_lines(state: &TelegramState, chat_id: i64) -> Vec<String> {
-        state
+        let mut lines = state
             .bindings
             .iter()
             .filter(|binding| binding.chat_id == chat_id)
@@ -1156,13 +1159,75 @@ pub mod telegram {
                     chat_id: binding.chat_id,
                     message_thread_id: binding.message_thread_id,
                 };
+                let active = state
+                    .active_binding_for_route(&route)
+                    .is_some_and(|active| {
+                        active.alias == binding.alias
+                            && active.message_thread_id == binding.message_thread_id
+                    });
+                let marker = if active { "*" } else { " " };
                 format!(
-                    "{}\t{}\t{}",
+                    "{marker} {}\n  route: {}\n  session: {}",
                     binding.alias.as_deref().unwrap_or("default"),
                     route.display(),
                     binding.session_id
                 )
             })
+            .collect::<Vec<_>>();
+        if !lines.is_empty() {
+            lines.push(String::from(
+                "Commands: /use <name>, /new <name>, /close [name], /status",
+            ));
+        }
+        lines
+    }
+
+    fn no_session_bound_message(state: &TelegramState, route: &TelegramRoute) -> String {
+        let available = route_aliases(state, route);
+        if available.is_empty() {
+            format!(
+                "No cx session is bound to route {}. Send /start to create the default session or /new <name> to create a named one.",
+                route.display()
+            )
+        } else {
+            format!(
+                "No active cx session is bound to route {}. Available sessions: {}. Use /use <name> or send /start to create the default session.",
+                route.display(),
+                available.join(", ")
+            )
+        }
+    }
+
+    fn missing_session_message(
+        state: &TelegramState,
+        route: &TelegramRoute,
+        alias: Option<&str>,
+    ) -> String {
+        let label = alias.unwrap_or("default");
+        let available = route_aliases(state, route);
+        if available.is_empty() {
+            format!(
+                "No session `{label}` is bound to route {}. Send /start to create the default session or /new <name> to create a named one.",
+                route.display()
+            )
+        } else {
+            format!(
+                "No session `{label}` is bound to route {}. Available sessions: {}. Use /close <name> or /use <name>.",
+                route.display(),
+                available.join(", ")
+            )
+        }
+    }
+
+    fn route_aliases(state: &TelegramState, route: &TelegramRoute) -> Vec<String> {
+        state
+            .bindings
+            .iter()
+            .filter(|binding| {
+                binding.chat_id == route.chat_id
+                    && binding.message_thread_id == route.message_thread_id
+            })
+            .map(|binding| binding.alias.as_deref().unwrap_or("default").to_string())
             .collect()
     }
 
@@ -1838,7 +1903,10 @@ pub mod telegram {
                 .unwrap()
                 .unwrap();
 
-            assert_eq!(reply.text, "No cx session is bound to this route.");
+            assert_eq!(
+                reply.text,
+                "No cx session is bound to route 42. Send /start to create the default session or /new <name> to create a named one."
+            );
 
             let _ = fs::remove_dir_all(paths.serve_dir());
         }
@@ -2225,6 +2293,39 @@ pub mod telegram {
 
             assert_eq!(reply.text, "Unbound session `default`.");
             assert!(state.binding_for_route(&route, None).is_none());
+
+            let _ = fs::remove_dir_all(paths.serve_dir());
+        }
+
+        #[test]
+        fn close_without_alias_unbinds_active_named_session() {
+            let paths = temp_paths("close-active-named");
+            let mut state = TelegramState::empty();
+            let route = TelegramRoute {
+                chat_id: -10042,
+                message_thread_id: Some(31),
+            };
+            state.bind_route(&paths, &route, Some("session-2")).unwrap();
+
+            let reply = handle_message(
+                &paths,
+                &mut state,
+                TelegramMessage {
+                    chat: TelegramChat {
+                        id: -10042,
+                        is_forum: true,
+                    },
+                    message_id: 1,
+                    message_thread_id: Some(31),
+                    text: Some("/close".to_string()),
+                },
+                handle_options(),
+            )
+            .unwrap()
+            .unwrap();
+
+            assert_eq!(reply.text, "Unbound session `session-2`.");
+            assert!(state.binding_for_route(&route, Some("session-2")).is_none());
 
             let _ = fs::remove_dir_all(paths.serve_dir());
         }

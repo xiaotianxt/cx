@@ -352,7 +352,9 @@ binds chats to cx sessions, records `channel-message-received` metadata events
 without storing message text, and sends ordinary text into the running Codex
 app-server. `run` and `bind` also synchronize the Telegram command menu. See
 [Telegram Channel Adapter](docs/telegram-channel.md) for the command flow and
-state file shape.
+state file shape. Forum group topics are routed independently, and `/new`,
+`/use`, `/sessions`, and `/close` provide named session routing inside a chat or
+topic.
 
 Export the Codex App Server protocol definitions for downstream clients:
 

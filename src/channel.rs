@@ -38,16 +38,38 @@ pub mod telegram {
         #[serde(skip_serializing_if = "Option::is_none")]
         last_update_id: Option<i64>,
         bindings: Vec<TelegramBinding>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        active_routes: Vec<TelegramActiveRoute>,
     }
 
     #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
     #[serde(rename_all = "camelCase")]
     struct TelegramBinding {
         chat_id: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_thread_id: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        alias: Option<String>,
         channel_id: ChannelId,
         session_id: SessionId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         app_thread_id: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+    #[serde(rename_all = "camelCase")]
+    struct TelegramActiveRoute {
+        chat_id: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message_thread_id: Option<i64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        alias: Option<String>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    struct TelegramRoute {
+        chat_id: i64,
+        message_thread_id: Option<i64>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -77,6 +99,7 @@ pub mod telegram {
     #[derive(Debug, Clone, Deserialize)]
     struct TelegramMessage {
         chat: TelegramChat,
+        message_thread_id: Option<i64>,
         text: Option<String>,
     }
 
@@ -187,30 +210,57 @@ pub mod telegram {
                 schema_version: TELEGRAM_STATE_SCHEMA_VERSION,
                 last_update_id: None,
                 bindings: Vec::new(),
+                active_routes: Vec::new(),
             }
         }
 
-        fn binding_for_chat(&self, chat_id: i64) -> Option<&TelegramBinding> {
-            self.bindings
+        fn binding_for_route(
+            &self,
+            route: &TelegramRoute,
+            alias: Option<&str>,
+        ) -> Option<&TelegramBinding> {
+            self.bindings.iter().find(|binding| {
+                binding.chat_id == route.chat_id
+                    && binding.message_thread_id == route.message_thread_id
+                    && binding.alias.as_deref() == alias
+            })
+        }
+
+        fn active_binding_for_route(&self, route: &TelegramRoute) -> Option<&TelegramBinding> {
+            let active_alias = self
+                .active_routes
                 .iter()
-                .find(|binding| binding.chat_id == chat_id)
+                .find(|active| {
+                    active.chat_id == route.chat_id
+                        && active.message_thread_id == route.message_thread_id
+                })
+                .and_then(|active| active.alias.as_deref());
+            self.binding_for_route(route, active_alias)
+                .or_else(|| self.binding_for_route(route, None))
         }
 
-        fn binding_for_chat_mut(&mut self, chat_id: i64) -> Option<&mut TelegramBinding> {
-            self.bindings
-                .iter_mut()
-                .find(|binding| binding.chat_id == chat_id)
+        fn binding_for_route_mut(
+            &mut self,
+            route: &TelegramRoute,
+            alias: Option<&str>,
+        ) -> Option<&mut TelegramBinding> {
+            self.bindings.iter_mut().find(|binding| {
+                binding.chat_id == route.chat_id
+                    && binding.message_thread_id == route.message_thread_id
+                    && binding.alias.as_deref() == alias
+            })
         }
 
-        fn bind_chat(
+        fn bind_route(
             &mut self,
             paths: &ManagerPaths,
-            chat_id: i64,
-            channel_id: ChannelId,
+            route: &TelegramRoute,
+            alias: Option<&str>,
         ) -> Result<TelegramBinding> {
-            if let Some(binding) = self.binding_for_chat(chat_id) {
+            if let Some(binding) = self.binding_for_route(route, alias) {
                 return Ok(binding.clone());
             }
+            let channel_id = route.channel_id(alias)?;
             let result = session::create_session(
                 paths,
                 CreateSessionRequest {
@@ -219,13 +269,77 @@ pub mod telegram {
                 },
             )?;
             let binding = TelegramBinding {
-                chat_id,
+                chat_id: route.chat_id,
+                message_thread_id: route.message_thread_id,
+                alias: alias.map(str::to_string),
                 channel_id,
                 session_id: result.session.session_id,
                 app_thread_id: None,
             };
             self.bindings.push(binding.clone());
+            self.set_active_route(route, alias);
             Ok(binding)
+        }
+
+        fn set_active_route(&mut self, route: &TelegramRoute, alias: Option<&str>) {
+            if let Some(active) = self.active_routes.iter_mut().find(|active| {
+                active.chat_id == route.chat_id
+                    && active.message_thread_id == route.message_thread_id
+            }) {
+                active.alias = alias.map(str::to_string);
+                return;
+            }
+            self.active_routes.push(TelegramActiveRoute {
+                chat_id: route.chat_id,
+                message_thread_id: route.message_thread_id,
+                alias: alias.map(str::to_string),
+            });
+        }
+
+        fn remove_route_binding(&mut self, route: &TelegramRoute, alias: Option<&str>) -> bool {
+            let original_len = self.bindings.len();
+            self.bindings.retain(|binding| {
+                !(binding.chat_id == route.chat_id
+                    && binding.message_thread_id == route.message_thread_id
+                    && binding.alias.as_deref() == alias)
+            });
+            if original_len != self.bindings.len() {
+                self.active_routes.retain(|active| {
+                    !(active.chat_id == route.chat_id
+                        && active.message_thread_id == route.message_thread_id
+                        && active.alias.as_deref() == alias)
+                });
+                return true;
+            }
+            false
+        }
+    }
+
+    impl TelegramRoute {
+        fn from_message(message: &TelegramMessage) -> Self {
+            Self {
+                chat_id: message.chat.id,
+                message_thread_id: message.message_thread_id,
+            }
+        }
+
+        fn channel_id(&self, alias: Option<&str>) -> Result<ChannelId> {
+            let mut raw = format!("telegram:{}", self.chat_id);
+            if let Some(thread_id) = self.message_thread_id {
+                raw.push_str(&format!(":topic:{thread_id}"));
+            }
+            if let Some(alias) = alias {
+                raw.push_str(":session:");
+                raw.push_str(alias);
+            }
+            ChannelId::parse(raw)
+        }
+
+        fn display(&self) -> String {
+            match self.message_thread_id {
+                Some(thread_id) => format!("{} topic {}", self.chat_id, thread_id),
+                None => self.chat_id.to_string(),
+            }
         }
     }
 
@@ -271,8 +385,8 @@ pub mod telegram {
                     trust_existing: true,
                 },
             )?;
-            if bind_secret.is_some() && outcome.bound_chat.is_some() {
-                println!("telegram chat bound; continuing adapter run");
+            if bind_secret.is_some() && outcome.bound_route.is_some() {
+                println!("telegram route bound; continuing adapter run");
                 bind_secret = None;
             }
         }
@@ -314,8 +428,8 @@ pub mod telegram {
                     trust_existing: false,
                 },
             )?;
-            if let Some(chat_id) = outcome.bound_chat {
-                println!("trusted Telegram chat {chat_id}");
+            if let Some(route) = outcome.bound_route {
+                println!("trusted Telegram route {}", route.display());
                 return Ok(());
             }
         }
@@ -354,8 +468,13 @@ pub mod telegram {
             for binding in state.bindings {
                 let app_thread = binding.app_thread_id.as_deref().unwrap_or("<none>");
                 println!(
-                    "{}\t{}\t{}\t{}",
-                    binding.chat_id, binding.channel_id, binding.session_id, app_thread
+                    "{}\t{}\t{}\t{}\t{}\t{}",
+                    binding.chat_id,
+                    binding.message_thread_id.unwrap_or_default(),
+                    binding.alias.as_deref().unwrap_or("default"),
+                    binding.channel_id,
+                    binding.session_id,
+                    app_thread
                 );
             }
         }
@@ -363,7 +482,7 @@ pub mod telegram {
     }
 
     struct PollOutcome {
-        bound_chat: Option<i64>,
+        bound_route: Option<TelegramRoute>,
     }
 
     struct PollOptions<'a> {
@@ -381,10 +500,10 @@ pub mod telegram {
         client: &Client,
         token: &str,
         state: &mut TelegramState,
-        trusted: &mut BTreeSet<i64>,
+        trusted: &mut BTreeSet<TelegramRoute>,
         options: PollOptions<'_>,
     ) -> Result<PollOutcome> {
-        let mut bound_chat = None;
+        let mut bound_route = None;
         let updates = get_updates(
             client,
             token,
@@ -416,8 +535,9 @@ pub mod telegram {
                 continue;
             }
             if matches!(access, MessageAccess::AuthorizedByBind) {
-                trusted.insert(message.chat.id);
-                bound_chat = Some(message.chat.id);
+                let route = TelegramRoute::from_message(&message);
+                trusted.insert(route.clone());
+                bound_route = Some(route);
             }
             let reply = handle_message(
                 paths,
@@ -430,11 +550,17 @@ pub mod telegram {
             )?;
             write_state(paths, state)?;
             if let Some(reply) = reply {
-                send_reply(client, token, reply.chat_id, &reply.text)?;
+                send_reply(
+                    client,
+                    token,
+                    reply.chat_id,
+                    reply.message_thread_id,
+                    &reply.text,
+                )?;
             }
         }
         write_state(paths, state)?;
-        Ok(PollOutcome { bound_chat })
+        Ok(PollOutcome { bound_route })
     }
 
     fn validate_timeouts(poll_timeout: u64, request_timeout: f32) -> Result<()> {
@@ -455,12 +581,18 @@ pub mod telegram {
         Ok(token)
     }
 
-    fn trusted_chats(state: &TelegramState, allow_chats: Vec<i64>) -> BTreeSet<i64> {
+    fn trusted_chats(state: &TelegramState, allow_chats: Vec<i64>) -> BTreeSet<TelegramRoute> {
         state
             .bindings
             .iter()
-            .map(|binding| binding.chat_id)
-            .chain(allow_chats)
+            .map(|binding| TelegramRoute {
+                chat_id: binding.chat_id,
+                message_thread_id: binding.message_thread_id,
+            })
+            .chain(allow_chats.into_iter().map(|chat_id| TelegramRoute {
+                chat_id,
+                message_thread_id: None,
+            }))
             .collect()
     }
 
@@ -474,6 +606,7 @@ pub mod telegram {
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct TelegramReply {
         chat_id: i64,
+        message_thread_id: Option<i64>,
         text: String,
     }
 
@@ -488,13 +621,13 @@ pub mod telegram {
     fn message_access(
         message: &TelegramMessage,
         state: &TelegramState,
-        allowed: &BTreeSet<i64>,
+        allowed: &BTreeSet<TelegramRoute>,
         bind_secret: Option<&str>,
         trust_existing: bool,
     ) -> MessageAccess {
-        let chat_id = message.chat.id;
+        let route = TelegramRoute::from_message(message);
         if trust_existing
-            && (allowed.contains(&chat_id) || state.binding_for_chat(chat_id).is_some())
+            && (allowed.contains(&route) || state.active_binding_for_route(&route).is_some())
         {
             return MessageAccess::Allowed;
         }
@@ -521,22 +654,24 @@ pub mod telegram {
         authorized_by_bind: bool,
         app_server_timeout: f32,
     ) -> Result<Option<TelegramReply>> {
-        let chat_id = message.chat.id;
-        let channel_id = ChannelId::parse(format!("telegram:{chat_id}"))?;
+        let route = TelegramRoute::from_message(&message);
+        let chat_id = route.chat_id;
         let text = message.text.unwrap_or_default();
         let command = TelegramTextCommand::parse(&text);
 
         match command {
             TelegramTextCommand::Status => {
-                let Some(binding) = state.binding_for_chat(chat_id) else {
-                    return Ok(Some(reply(chat_id, "No cx session is bound to this chat.")));
+                let Some(binding) = state.active_binding_for_route(&route) else {
+                    return Ok(Some(reply(&route, "No cx session is bound to this route.")));
                 };
                 let session = session::show_session(paths, &binding.session_id)?;
                 Ok(Some(reply(
-                    chat_id,
+                    &route,
                     format!(
-                        "session: {}\nchannel: {}\nlease_epoch: {}\nactive_lease: {}",
+                        "session: {}\nalias: {}\nroute: {}\nchannel: {}\nlease_epoch: {}\nactive_lease: {}",
                         session.session_id,
+                        binding.alias.as_deref().unwrap_or("default"),
+                        route.display(),
                         session.current_channel_id,
                         session.lease_epoch,
                         session
@@ -548,30 +683,23 @@ pub mod telegram {
                 )))
             }
             TelegramTextCommand::Sessions => {
-                let sessions = session::list_sessions(paths)?;
-                if sessions.is_empty() {
-                    return Ok(Some(reply(chat_id, "No cx sessions.")));
+                let lines = route_session_lines(state, chat_id);
+                if lines.is_empty() {
+                    return Ok(Some(reply(&route, "No Telegram routes are bound.")));
                 }
-                let mut lines = Vec::new();
-                for session in sessions {
-                    lines.push(format!(
-                        "{}\t{}\tepoch {}",
-                        session.session_id, session.current_channel_id, session.lease_epoch
-                    ));
-                }
-                Ok(Some(reply(chat_id, lines.join("\n"))))
+                Ok(Some(reply(&route, lines.join("\n"))))
             }
             TelegramTextCommand::Release => {
-                let Some(binding) = state.binding_for_chat(chat_id) else {
-                    return Ok(Some(reply(chat_id, "No cx session is bound to this chat.")));
+                let Some(binding) = state.active_binding_for_route(&route) else {
+                    return Ok(Some(reply(&route, "No cx session is bound to this route.")));
                 };
                 let session = session::show_session(paths, &binding.session_id)?;
                 let Some(active_lease) = session.active_lease else {
-                    return Ok(Some(reply(chat_id, "This session has no active lease.")));
+                    return Ok(Some(reply(&route, "This session has no active lease.")));
                 };
                 if active_lease.channel_id != binding.channel_id {
                     return Ok(Some(reply(
-                        chat_id,
+                        &route,
                         format!("Lease is held by {}.", active_lease.channel_id),
                     )));
                 }
@@ -582,18 +710,18 @@ pub mod telegram {
                         lease_token: active_lease.lease_token,
                     },
                 )?;
-                Ok(Some(reply(chat_id, "Released Telegram lease.")))
+                Ok(Some(reply(&route, "Released Telegram lease.")))
             }
             TelegramTextCommand::Bind { .. } if !authorized_by_bind => {
-                Ok(Some(reply(chat_id, "Invalid or disabled bind secret.")))
+                Ok(Some(reply(&route, "Invalid or disabled bind secret.")))
             }
             TelegramTextCommand::Start | TelegramTextCommand::Bind { .. } => {
-                let binding = state.bind_chat(paths, chat_id, channel_id.clone())?;
+                let binding = state.bind_route(paths, &route, None)?;
                 session::record_channel_message(
                     paths,
                     RecordChannelMessageRequest {
                         session_id: binding.session_id.clone(),
-                        channel_id: channel_id.clone(),
+                        channel_id: binding.channel_id.clone(),
                     },
                 )?;
                 if acquire_lease {
@@ -601,14 +729,14 @@ pub mod telegram {
                         paths,
                         AcquireLeaseRequest {
                             session_id: binding.session_id.clone(),
-                            channel_id,
+                            channel_id: binding.channel_id.clone(),
                             steal,
                         },
                     ) {
                         Ok(_) => {}
                         Err(err) => {
                             return Ok(Some(reply(
-                                chat_id,
+                                &route,
                                 format!(
                                     "Session is controlled elsewhere. Use --steal on the adapter if this Telegram channel should take over.\n{err:#}"
                                 ),
@@ -617,23 +745,81 @@ pub mod telegram {
                     }
                 }
                 Ok(Some(reply(
-                    chat_id,
-                    format!("Bound to cx session {}.", binding.session_id),
+                    &route,
+                    format!(
+                        "Bound route {} to cx session {}.",
+                        route.display(),
+                        binding.session_id
+                    ),
                 )))
+            }
+            TelegramTextCommand::New { alias } => {
+                let alias = normalize_alias(alias.as_deref())
+                    .unwrap_or_else(|| next_route_alias(state, &route));
+                let binding = state.bind_route(paths, &route, Some(&alias))?;
+                Ok(Some(reply(
+                    &route,
+                    format!(
+                        "Created session `{alias}` for route {}: {}.",
+                        route.display(),
+                        binding.session_id
+                    ),
+                )))
+            }
+            TelegramTextCommand::Use { alias } => {
+                let Some(alias) = normalize_alias(alias.as_deref()) else {
+                    return Ok(Some(reply(&route, "Usage: /use <name>")));
+                };
+                if state.binding_for_route(&route, Some(&alias)).is_none() {
+                    return Ok(Some(reply(
+                        &route,
+                        format!(
+                            "No session named `{alias}` is bound to route {}.",
+                            route.display()
+                        ),
+                    )));
+                }
+                state.set_active_route(&route, Some(&alias));
+                Ok(Some(reply(&route, format!("Using session `{alias}`."))))
+            }
+            TelegramTextCommand::Close { alias } => {
+                let alias = normalize_alias(alias.as_deref());
+                if state.remove_route_binding(&route, alias.as_deref()) {
+                    Ok(Some(reply(
+                        &route,
+                        format!(
+                            "Unbound session `{}`.",
+                            alias.as_deref().unwrap_or("default")
+                        ),
+                    )))
+                } else {
+                    Ok(Some(reply(
+                        &route,
+                        format!(
+                            "No session `{}` is bound to route {}.",
+                            alias.as_deref().unwrap_or("default"),
+                            route.display()
+                        ),
+                    )))
+                }
             }
             TelegramTextCommand::Message => {
                 if text.trim().is_empty() {
                     return Ok(Some(reply(
-                        chat_id,
+                        &route,
                         "Send a text message for Codex to answer.",
                     )));
                 }
-                let binding = state.bind_chat(paths, chat_id, channel_id.clone())?;
+                let binding = state
+                    .active_binding_for_route(&route)
+                    .cloned()
+                    .map(Ok)
+                    .unwrap_or_else(|| state.bind_route(paths, &route, None))?;
                 session::record_channel_message(
                     paths,
                     RecordChannelMessageRequest {
                         session_id: binding.session_id.clone(),
-                        channel_id: channel_id.clone(),
+                        channel_id: binding.channel_id.clone(),
                     },
                 )?;
                 if acquire_lease {
@@ -641,14 +827,14 @@ pub mod telegram {
                         paths,
                         AcquireLeaseRequest {
                             session_id: binding.session_id.clone(),
-                            channel_id,
+                            channel_id: binding.channel_id.clone(),
                             steal,
                         },
                     ) {
                         Ok(_) => {}
                         Err(err) => {
                             return Ok(Some(reply(
-                                chat_id,
+                                &route,
                                 format!(
                                     "Session is controlled elsewhere. Use --steal on the adapter if this Telegram channel should take over.\n{err:#}"
                                 ),
@@ -656,13 +842,13 @@ pub mod telegram {
                         }
                     }
                 }
-                match run_codex_turn(paths, state, chat_id, text, app_server_timeout) {
+                match run_codex_turn(paths, state, &route, binding.alias.as_deref(), text, app_server_timeout) {
                     Ok(answer) if answer.trim().is_empty() => {
-                        Ok(Some(reply(chat_id, "Codex completed without a text reply.")))
+                        Ok(Some(reply(&route, "Codex completed without a text reply.")))
                     }
-                    Ok(answer) => Ok(Some(reply(chat_id, answer))),
+                    Ok(answer) => Ok(Some(reply(&route, answer))),
                     Err(err) => Ok(Some(reply(
-                        chat_id,
+                        &route,
                         format!("Codex turn failed.\n{err:#}\n\nStart app-server with `cx serve start` and keep it running, then retry."),
                     ))),
                 }
@@ -673,7 +859,8 @@ pub mod telegram {
     fn run_codex_turn(
         paths: &ManagerPaths,
         state: &mut TelegramState,
-        chat_id: i64,
+        route: &TelegramRoute,
+        alias: Option<&str>,
         prompt: String,
         timeout_secs: f32,
     ) -> Result<String> {
@@ -683,15 +870,15 @@ pub mod telegram {
         client.initialize("cx-telegram", env!("CARGO_PKG_VERSION"))?;
 
         let thread_id = match state
-            .binding_for_chat(chat_id)
+            .binding_for_route(route, alias)
             .and_then(|binding| binding.app_thread_id.clone())
         {
             Some(thread_id) => thread_id,
             None => {
                 let thread = client.thread_start()?;
                 let binding = state
-                    .binding_for_chat_mut(chat_id)
-                    .with_context(|| format!("Telegram chat {chat_id} is not bound"))?;
+                    .binding_for_route_mut(route, alias)
+                    .with_context(|| format!("Telegram route {} is not bound", route.display()))?;
                 binding.app_thread_id = Some(thread.upstream_thread_id.clone());
                 thread.upstream_thread_id
             }
@@ -700,12 +887,62 @@ pub mod telegram {
         Ok(turn.assistant_text)
     }
 
+    fn route_session_lines(state: &TelegramState, chat_id: i64) -> Vec<String> {
+        state
+            .bindings
+            .iter()
+            .filter(|binding| binding.chat_id == chat_id)
+            .map(|binding| {
+                let route = TelegramRoute {
+                    chat_id: binding.chat_id,
+                    message_thread_id: binding.message_thread_id,
+                };
+                format!(
+                    "{}\t{}\t{}",
+                    binding.alias.as_deref().unwrap_or("default"),
+                    route.display(),
+                    binding.session_id
+                )
+            })
+            .collect()
+    }
+
+    fn normalize_alias(alias: Option<&str>) -> Option<String> {
+        let alias = alias?.trim().to_ascii_lowercase();
+        if alias.is_empty() {
+            return None;
+        }
+        let normalized = alias
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+            .collect::<String>();
+        let normalized = normalized.chars().take(32).collect::<String>();
+        if normalized.is_empty() {
+            None
+        } else {
+            Some(normalized)
+        }
+    }
+
+    fn next_route_alias(state: &TelegramState, route: &TelegramRoute) -> String {
+        for index in 1.. {
+            let alias = format!("session-{index}");
+            if state.binding_for_route(route, Some(&alias)).is_none() {
+                return alias;
+            }
+        }
+        unreachable!("unbounded alias search should always find a free alias")
+    }
+
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum TelegramTextCommand {
         Start,
         Bind { secret: Option<String> },
+        New { alias: Option<String> },
+        Use { alias: Option<String> },
         Status,
         Sessions,
+        Close { alias: Option<String> },
         Release,
         Message,
     }
@@ -720,22 +957,36 @@ pub mod telegram {
                 "/bind" => Self::Bind {
                     secret: parts.next().map(String::from),
                 },
+                "/new" => Self::New {
+                    alias: parts.next().map(String::from),
+                },
+                "/use" => Self::Use {
+                    alias: parts.next().map(String::from),
+                },
                 "/status" => Self::Status,
                 "/sessions" => Self::Sessions,
+                "/close" => Self::Close {
+                    alias: parts.next().map(String::from),
+                },
                 "/release" => Self::Release,
                 _ => Self::Message,
             }
         }
     }
 
-    fn reply(chat_id: i64, text: impl Into<String>) -> TelegramReply {
+    fn reply(route: &TelegramRoute, text: impl Into<String>) -> TelegramReply {
         TelegramReply {
-            chat_id,
+            chat_id: route.chat_id,
+            message_thread_id: route.message_thread_id,
             text: text.into(),
         }
     }
 
-    fn log_update_summary(update_id: i64, view: &TelegramUpdateView, allowed: &BTreeSet<i64>) {
+    fn log_update_summary(
+        update_id: i64,
+        view: &TelegramUpdateView,
+        allowed: &BTreeSet<TelegramRoute>,
+    ) {
         let chat_id = view
             .chat_id
             .map(|id| id.to_string())
@@ -752,15 +1003,20 @@ pub mod telegram {
                 }
             })
             .unwrap_or("none");
-        let allowed = view
-            .chat_id
-            .map(|id| allowed.contains(&id).to_string())
+        let route = view.message.as_ref().map(TelegramRoute::from_message);
+        let allowed = route
+            .as_ref()
+            .map(|route| allowed.contains(route).to_string())
             .unwrap_or_else(|| String::from("false"));
+        let route = route
+            .map(|route| route.display())
+            .unwrap_or_else(|| String::from("<none>"));
         eprintln!(
-            "telegram update update_id={} source={} chat_id={} text={} allowed={}",
+            "telegram update update_id={} source={} chat_id={} route={} text={} allowed={}",
             update_id,
             view.source.as_str(),
             chat_id,
+            route,
             text,
             allowed
         );
@@ -804,16 +1060,32 @@ pub mod telegram {
         Ok(response.result.unwrap_or_default())
     }
 
-    fn send_message(client: &Client, token: &str, chat_id: i64, text: &str) -> Result<()> {
+    #[derive(Debug, Serialize)]
+    struct TelegramSendMessage<'a> {
+        chat_id: &'a str,
+        text: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        message_thread_id: Option<String>,
+    }
+
+    fn send_message(
+        client: &Client,
+        token: &str,
+        chat_id: i64,
+        message_thread_id: Option<i64>,
+        text: &str,
+    ) -> Result<()> {
         let url = telegram_method_url(token, "sendMessage");
         let chat_id = chat_id.to_string();
-        let response = client
-            .post(url)
-            .form(&[("chat_id", chat_id.as_str()), ("text", text)])
-            .send()
-            .map_err(|err| {
-                anyhow::anyhow!("Telegram sendMessage request failed: {}", err.without_url())
-            })?;
+        let message_thread_id = message_thread_id.map(|thread_id| thread_id.to_string());
+        let payload = TelegramSendMessage {
+            chat_id: chat_id.as_str(),
+            text,
+            message_thread_id,
+        };
+        let response = client.post(url).form(&payload).send().map_err(|err| {
+            anyhow::anyhow!("Telegram sendMessage request failed: {}", err.without_url())
+        })?;
         let response = response
             .json::<TelegramResponse<serde_json::Value>>()
             .map_err(|err| {
@@ -876,12 +1148,24 @@ pub mod telegram {
                 description: "Trust this chat with a one-time secret",
             },
             TelegramBotCommand {
+                command: "new",
+                description: "Create and switch to a named session",
+            },
+            TelegramBotCommand {
+                command: "use",
+                description: "Switch to a named session",
+            },
+            TelegramBotCommand {
                 command: "status",
                 description: "Show the bound cx session and lease",
             },
             TelegramBotCommand {
                 command: "sessions",
-                description: "List local cx sessions",
+                description: "List Telegram sessions for this chat",
+            },
+            TelegramBotCommand {
+                command: "close",
+                description: "Unbind a named session from this route",
             },
             TelegramBotCommand {
                 command: "release",
@@ -890,9 +1174,15 @@ pub mod telegram {
         ]
     }
 
-    fn send_reply(client: &Client, token: &str, chat_id: i64, text: &str) -> Result<()> {
+    fn send_reply(
+        client: &Client,
+        token: &str,
+        chat_id: i64,
+        message_thread_id: Option<i64>,
+        text: &str,
+    ) -> Result<()> {
         for chunk in telegram_text_chunks(text) {
-            send_message(client, token, chat_id, &chunk)?;
+            send_message(client, token, chat_id, message_thread_id, &chunk)?;
         }
         Ok(())
     }
@@ -1015,6 +1305,18 @@ pub mod telegram {
             ManagerPaths::from_roots(root.join("codex"), root.join("profile-manager"))
         }
 
+        fn text_message(
+            chat_id: i64,
+            message_thread_id: Option<i64>,
+            text: &str,
+        ) -> TelegramMessage {
+            TelegramMessage {
+                chat: TelegramChat { id: chat_id },
+                message_thread_id,
+                text: Some(text.to_string()),
+            }
+        }
+
         #[test]
         fn telegram_state_round_trips_without_token() {
             let paths = temp_paths("state");
@@ -1022,6 +1324,8 @@ pub mod telegram {
             state.last_update_id = Some(123);
             state.bindings.push(TelegramBinding {
                 chat_id: 42,
+                message_thread_id: None,
+                alias: None,
                 channel_id: ChannelId::parse("telegram:42").unwrap(),
                 session_id: SessionId::parse("sess_manual").unwrap(),
                 app_thread_id: None,
@@ -1042,17 +1346,14 @@ pub mod telegram {
         fn start_message_creates_session_binding() {
             let paths = temp_paths("start");
             let mut state = TelegramState::empty();
-            let message = TelegramMessage {
-                chat: TelegramChat { id: 42 },
-                text: Some(String::from("/start")),
-            };
+            let message = text_message(42, None, "/start");
 
             let reply = handle_message(&paths, &mut state, message, false, false, false, 600.0)
                 .unwrap()
                 .unwrap();
 
             assert_eq!(reply.chat_id, 42);
-            assert!(reply.text.contains("Bound to cx session"));
+            assert!(reply.text.contains("Bound route 42 to cx session"));
             assert_eq!(state.bindings.len(), 1);
             assert_eq!(session::list_sessions(&paths).unwrap().len(), 1);
 
@@ -1063,16 +1364,13 @@ pub mod telegram {
         fn release_reports_missing_binding() {
             let paths = temp_paths("release-missing");
             let mut state = TelegramState::empty();
-            let message = TelegramMessage {
-                chat: TelegramChat { id: 42 },
-                text: Some(String::from("/release")),
-            };
+            let message = text_message(42, None, "/release");
 
             let reply = handle_message(&paths, &mut state, message, false, false, false, 600.0)
                 .unwrap()
                 .unwrap();
 
-            assert_eq!(reply.text, "No cx session is bound to this chat.");
+            assert_eq!(reply.text, "No cx session is bound to this route.");
 
             let _ = fs::remove_dir_all(paths.serve_dir());
         }
@@ -1081,10 +1379,7 @@ pub mod telegram {
         fn bind_command_trusts_matching_secret_for_unknown_chat() {
             let state = TelegramState::empty();
             let trusted = BTreeSet::new();
-            let message = TelegramMessage {
-                chat: TelegramChat { id: 42 },
-                text: Some(String::from("/bind secret-123")),
-            };
+            let message = text_message(42, None, "/bind secret-123");
 
             let access = message_access(&message, &state, &trusted, Some("secret-123"), true);
 
@@ -1095,10 +1390,7 @@ pub mod telegram {
         fn bind_command_rejects_wrong_secret_for_unknown_chat() {
             let state = TelegramState::empty();
             let trusted = BTreeSet::new();
-            let message = TelegramMessage {
-                chat: TelegramChat { id: 42 },
-                text: Some(String::from("/bind wrong")),
-            };
+            let message = text_message(42, None, "/bind wrong");
 
             let access = message_access(&message, &state, &trusted, Some("secret-123"), true);
 
@@ -1110,13 +1402,18 @@ pub mod telegram {
             let mut state = TelegramState::empty();
             state.bindings.push(TelegramBinding {
                 chat_id: 42,
+                message_thread_id: None,
+                alias: None,
                 channel_id: ChannelId::parse("telegram:42").unwrap(),
                 session_id: SessionId::parse("sess_manual").unwrap(),
                 app_thread_id: None,
             });
             let trusted = trusted_chats(&state, Vec::new());
 
-            assert!(trusted.contains(&42));
+            assert!(trusted.contains(&TelegramRoute {
+                chat_id: 42,
+                message_thread_id: None
+            }));
         }
 
         #[test]
@@ -1128,8 +1425,119 @@ pub mod telegram {
 
             assert_eq!(
                 commands,
-                vec!["start", "bind", "status", "sessions", "release"]
+                vec!["start", "bind", "new", "use", "status", "sessions", "close", "release"]
             );
+        }
+
+        #[test]
+        fn topic_route_channel_id_includes_thread_id() {
+            let route = TelegramRoute {
+                chat_id: -10042,
+                message_thread_id: Some(99),
+            };
+
+            assert_eq!(
+                route.channel_id(Some("build")).unwrap().to_string(),
+                "telegram:-10042:topic:99:session:build"
+            );
+        }
+
+        #[test]
+        fn topic_reply_preserves_message_thread_id() {
+            let paths = temp_paths("topic-reply");
+            let mut state = TelegramState::empty();
+            let message = text_message(-10042, Some(99), "/new Build!");
+
+            let reply = handle_message(&paths, &mut state, message, false, false, false, 600.0)
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(reply.chat_id, -10042);
+            assert_eq!(reply.message_thread_id, Some(99));
+
+            let _ = fs::remove_dir_all(paths.serve_dir());
+        }
+
+        #[test]
+        fn new_command_creates_named_route_session_and_marks_active() {
+            let paths = temp_paths("new");
+            let mut state = TelegramState::empty();
+            let message = text_message(42, None, "/new Build!");
+
+            let reply = handle_message(&paths, &mut state, message, false, false, false, 600.0)
+                .unwrap()
+                .unwrap();
+
+            assert!(reply.text.contains("Created session `build`"));
+            assert!(state
+                .binding_for_route(
+                    &TelegramRoute {
+                        chat_id: 42,
+                        message_thread_id: None
+                    },
+                    Some("build")
+                )
+                .is_some());
+            assert_eq!(state.active_routes[0].alias.as_deref(), Some("build"));
+
+            let _ = fs::remove_dir_all(paths.serve_dir());
+        }
+
+        #[test]
+        fn use_command_switches_active_route_session() {
+            let paths = temp_paths("use");
+            let mut state = TelegramState::empty();
+            let route = TelegramRoute {
+                chat_id: 42,
+                message_thread_id: None,
+            };
+            state.bind_route(&paths, &route, Some("alpha")).unwrap();
+            state.bind_route(&paths, &route, Some("beta")).unwrap();
+
+            let reply = handle_message(
+                &paths,
+                &mut state,
+                text_message(42, None, "/use alpha"),
+                false,
+                false,
+                false,
+                600.0,
+            )
+            .unwrap()
+            .unwrap();
+
+            assert_eq!(reply.text, "Using session `alpha`.");
+            assert_eq!(state.active_routes[0].alias.as_deref(), Some("alpha"));
+
+            let _ = fs::remove_dir_all(paths.serve_dir());
+        }
+
+        #[test]
+        fn close_command_unbinds_named_route_session() {
+            let paths = temp_paths("close");
+            let mut state = TelegramState::empty();
+            let route = TelegramRoute {
+                chat_id: 42,
+                message_thread_id: None,
+            };
+            state.bind_route(&paths, &route, Some("alpha")).unwrap();
+
+            let reply = handle_message(
+                &paths,
+                &mut state,
+                text_message(42, None, "/close alpha"),
+                false,
+                false,
+                false,
+                600.0,
+            )
+            .unwrap()
+            .unwrap();
+
+            assert_eq!(reply.text, "Unbound session `alpha`.");
+            assert!(state.binding_for_route(&route, Some("alpha")).is_none());
+
+            let _ = fs::remove_dir_all(paths.serve_dir());
         }
 
         #[test]
@@ -1140,6 +1548,7 @@ pub mod telegram {
                 edited_message: None,
                 channel_post: Some(TelegramMessage {
                     chat: TelegramChat { id: -10042 },
+                    message_thread_id: Some(7),
                     text: Some(String::from("/start")),
                 }),
                 edited_channel_post: None,

@@ -321,7 +321,9 @@ cx channel telegram status --json
 本地已有可信 chat 后，`run` 只监听可信 binding 和显式传入的 `--allow-chat`。adapter
 使用 Telegram long polling，把 chat 绑定到 cx session，并记录 `channel-message-received`
 元数据事件；消息正文不会写入 cx state。普通文本会发送给正在运行的 Codex app-server，并把
-assistant 最终回复发回 Telegram。`run` 和 `bind` 也会同步 Telegram command menu。完整命令流和 state 文件结构见 [Telegram Channel
+assistant 最终回复发回 Telegram。`run` 和 `bind` 也会同步 Telegram command menu。Telegram
+forum group topic 会自动独立路由，`/new`、`/use`、`/sessions`、`/close` 支持在一个 chat
+或 topic 里管理多个命名 session。完整命令流和 state 文件结构见 [Telegram Channel
 Adapter](docs/telegram-channel.md)。
 
 导出 Codex App Server 协议定义，供下游 client 生成类型或做 schema 校验：

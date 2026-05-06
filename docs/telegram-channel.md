@@ -1,8 +1,8 @@
 # Telegram Channel Adapter
 
 `cx channel telegram` is the first remote channel adapter for cx. It connects a
-Telegram bot to cx's local session, lease, and event journal. It does not start
-Codex turns yet.
+Telegram bot to cx's local session, lease, event journal, and Codex app-server
+turns.
 
 ## Boundaries
 
@@ -32,8 +32,18 @@ The file stores:
   "bindings": [
     {
       "chatId": 12345,
+      "messageThreadId": 99,
+      "alias": "build",
       "channelId": "telegram:12345",
-      "sessionId": "sess_abc123"
+      "sessionId": "sess_abc123",
+      "appThreadId": "019d..."
+    }
+  ],
+  "activeRoutes": [
+    {
+      "chatId": 12345,
+      "messageThreadId": 99,
+      "alias": "build"
     }
   ]
 }
@@ -73,8 +83,11 @@ text back to Telegram. Long replies are split into Telegram-sized messages.
 ```text
 /start
 /bind
+/new
+/use
 /status
 /sessions
+/close
 /release
 ```
 
@@ -97,6 +110,33 @@ Send that `/bind <secret>` message to the bot from Telegram. The adapter records
 that `chat.id` as a trusted local binding, creates a cx session for it, and then
 continues running. The secret is generated in memory and is not written to the
 state file.
+
+## Routing Model
+
+The adapter routes messages by Telegram route scope:
+
+```text
+telegram:<chat_id>
+telegram:<chat_id>:topic:<message_thread_id>
+telegram:<chat_id>:topic:<message_thread_id>:session:<alias>
+```
+
+Private chats normally use one default route. Telegram forum groups get one
+route per topic because Telegram includes `message_thread_id` on topic messages.
+That gives each topic an independent cx session and Codex app-server thread.
+
+Inside any route, use named sessions for parallel work:
+
+```text
+/new build
+/use build
+/sessions
+/close build
+```
+
+Aliases are normalized to lowercase ASCII letters, numbers, `.`, `_`, and `-`,
+then capped at 32 characters. If `/new` has no name, cx creates `session-1`,
+`session-2`, and so on for that route.
 
 After at least one chat is trusted, `run` does not create a new bind secret. It
 listens only to trusted bindings and any explicit `--allow-chat` values:
@@ -161,8 +201,11 @@ The adapter recognizes these Telegram messages:
 ```text
 /start
 /bind <secret>
+/new [name]
+/use <name>
 /status
 /sessions
+/close [name]
 /release
 ```
 
@@ -171,8 +214,13 @@ Behavior:
 - `/bind <secret>` trusts a new chat when the secret matches the one printed by
   `run` onboarding or `cx channel telegram bind`.
 - `/start` creates or reuses a binding only for already trusted chats.
+- `/new [name]` creates a named cx session for the current private chat, group,
+  or forum topic route and switches to it.
+- `/use <name>` switches the current route to an existing named session.
 - `/status` reports the bound session and current lease holder.
-- `/sessions` lists cx sessions known to the local profile manager.
+- `/sessions` lists Telegram-bound sessions for the current chat.
+- `/close [name]` unbinds a named session from the current route. Without a
+  name, it unbinds the default session for that route.
 - `/release` releases the Telegram lease when Telegram currently holds it.
 - Any other text creates or reuses a binding, records a
   `channel-message-received` event without storing the text, then submits the

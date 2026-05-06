@@ -45,6 +45,17 @@ pub(crate) struct AppThreadSummary {
     pub updated_at_unix: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StartedThread {
+    pub upstream_thread_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StartedTurn {
+    pub turn_id: String,
+    pub assistant_text: String,
+}
+
 impl ThreadListInfo {
     fn from_response(response: &Value) -> Self {
         let thread_count = response
@@ -131,7 +142,47 @@ impl AppServerClient {
         })
     }
 
+    pub(crate) fn thread_start(&mut self) -> Result<StartedThread> {
+        let response = self.request(
+            "thread/start",
+            protocol::ThreadStartParams {
+                session_start_source: Some(String::from("startup")),
+            },
+        )?;
+        let response = serde_json::from_value::<protocol::ThreadStartResponse>(response)
+            .context("decode thread/start response")?;
+        Ok(StartedThread {
+            upstream_thread_id: response.thread.id,
+        })
+    }
+
+    pub(crate) fn turn_start_collect(
+        &mut self,
+        thread_id: &str,
+        prompt: String,
+    ) -> Result<StartedTurn> {
+        let request_id = self.send_request(
+            "turn/start",
+            protocol::TurnStartParams {
+                thread_id: thread_id.to_string(),
+                input: vec![protocol::UserInput::Text {
+                    text: prompt,
+                    text_elements: Vec::new(),
+                }],
+            },
+        )?;
+        self.collect_turn_start(request_id, thread_id)
+    }
+
     fn request<P>(&mut self, method: &'static str, params: P) -> Result<Value>
+    where
+        P: Serialize,
+    {
+        let id = self.send_request(method, params)?;
+        self.read_response(method, id)
+    }
+
+    fn send_request<P>(&mut self, method: &'static str, params: P) -> Result<u64>
     where
         P: Serialize,
     {
@@ -143,7 +194,10 @@ impl AppServerClient {
         let request = protocol::ClientRequest { id, method, params };
         let text = serde_json::to_string(&request).context("encode app-server request")?;
         self.websocket.send_text(&text)?;
+        Ok(id)
+    }
 
+    fn read_response(&mut self, method: &'static str, id: u64) -> Result<Value> {
         loop {
             let text = self.websocket.read_text()?;
             let message = serde_json::from_str::<ServerMessage>(&text)
@@ -175,6 +229,103 @@ impl AppServerClient {
             }
         }
     }
+
+    fn collect_turn_start(&mut self, request_id: u64, thread_id: &str) -> Result<StartedTurn> {
+        let mut turn_id = None::<String>;
+        let mut assistant_text = String::new();
+        let mut completed = false;
+        loop {
+            let frame = self.websocket.read_text()?;
+            let message = serde_json::from_str::<ServerMessage>(&frame)
+                .context("decode app-server turn notification")?;
+            match message {
+                ServerMessage::Response(response) if response.id == request_id => {
+                    if let Some(error) = response.error {
+                        anyhow::bail!(
+                            "app-server request turn/start failed: {} ({})",
+                            error.message,
+                            error.code
+                        );
+                    }
+                    let response = response
+                        .result
+                        .context("app-server response for turn/start omitted result")?;
+                    let response = serde_json::from_value::<protocol::TurnStartResponse>(response)
+                        .context("decode turn/start response")?;
+                    let response_turn_id = response.turn.id;
+                    if completed {
+                        return Ok(StartedTurn {
+                            turn_id: response_turn_id,
+                            assistant_text,
+                        });
+                    }
+                    turn_id = Some(response_turn_id);
+                }
+                ServerMessage::Notification { method, params } => {
+                    if method == "item/agentMessage/delta" {
+                        if let Some(delta) =
+                            notification_delta(&params, thread_id, turn_id.as_deref())
+                        {
+                            assistant_text.push_str(delta);
+                        }
+                    } else if method == "turn/completed" {
+                        if let Some(completed_turn_id) = completed_turn_id(&params, thread_id) {
+                            if turn_id.as_deref().is_none_or(|id| id == completed_turn_id) {
+                                completed = true;
+                                if let Some(turn_id) = turn_id {
+                                    return Ok(StartedTurn {
+                                        turn_id,
+                                        assistant_text,
+                                    });
+                                }
+                            }
+                        }
+                    } else if method == "error" {
+                        if let Some(params) = params {
+                            anyhow::bail!("app-server turn error: {params}");
+                        }
+                        anyhow::bail!("app-server turn error");
+                    }
+                }
+                ServerMessage::Response(response) => {
+                    anyhow::bail!(
+                        "app-server returned unexpected response id {} while waiting for turn completion",
+                        response.id
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn notification_delta<'a>(
+    params: &'a Option<Value>,
+    thread_id: &str,
+    turn_id: Option<&str>,
+) -> Option<&'a str> {
+    let params = params.as_ref()?;
+    if params.get("threadId").and_then(Value::as_str)? != thread_id {
+        return None;
+    }
+    if let Some(turn_id) = turn_id {
+        if params.get("turnId").and_then(Value::as_str)? != turn_id {
+            return None;
+        }
+    }
+    params.get("delta").and_then(Value::as_str)
+}
+
+fn completed_turn_id<'a>(params: &'a Option<Value>, thread_id: &str) -> Option<&'a str> {
+    let Some(params) = params else {
+        return None;
+    };
+    if params.get("threadId").and_then(Value::as_str) != Some(thread_id) {
+        return None;
+    }
+    params
+        .get("turn")
+        .and_then(|turn| turn.get("id"))
+        .and_then(Value::as_str)
 }
 
 impl From<protocol::ThreadSummary> for AppThreadSummary {

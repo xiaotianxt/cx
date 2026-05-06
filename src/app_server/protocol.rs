@@ -14,10 +14,9 @@ pub(super) struct ClientRequest<P> {
 pub(super) enum ServerMessage {
     Response(ServerResponse),
     Notification {
-        #[serde(rename = "method")]
-        _method: String,
+        method: String,
         #[serde(default, rename = "params")]
-        _params: Option<Value>,
+        params: Option<Value>,
     },
 }
 
@@ -90,4 +89,48 @@ pub(super) struct ThreadSummary {
     pub status: Value,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ThreadStartParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_start_source: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct ThreadStartResponse {
+    pub thread: ThreadIdOnly,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct ThreadIdOnly {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct TurnStartParams {
+    pub thread_id: String,
+    pub input: Vec<UserInput>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type")]
+pub(super) enum UserInput {
+    #[serde(rename = "text")]
+    Text {
+        text: String,
+        text_elements: Vec<Value>,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct TurnStartResponse {
+    pub turn: TurnIdOnly,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct TurnIdOnly {
+    pub id: String,
 }

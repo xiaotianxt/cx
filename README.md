@@ -22,6 +22,8 @@ live usage.
   app-server through a selected slot.
 - `cx serve daemon` / `cx serve ping`: run and check the local cx control
   socket.
+- `cx channel telegram run`: bridge allowed Telegram chats into cx sessions and
+  leases.
 - `cx protocol export`: export version-matched Codex App Server schemas and
   TypeScript bindings.
 - `cx completions`: generate shell completion scripts with dynamic slot/model
@@ -328,6 +330,29 @@ This is only the local foundation for a future daemon/control-plane layer.
 Telegram, WeChat, remote terminal, and other adapters must eventually talk to cx
 rather than to the raw Codex app-server WebSocket, so cx can own slot rotation,
 leases, approval routing, and audit state.
+
+## Telegram Channel
+
+Run the Telegram adapter. On first use, when no chats are trusted yet, `run`
+prints a one-time `/bind <secret>` message for onboarding:
+
+```bash
+export TELEGRAM_BOT_TOKEN=...
+cx serve start
+cx channel telegram run
+cx channel telegram run --acquire-lease
+cx channel telegram bind
+cx channel telegram menu
+cx channel telegram status --json
+```
+
+After at least one chat is trusted, `run` listens only to trusted local bindings
+and any explicit `--allow-chat` values. The adapter uses Telegram long polling,
+binds chats to cx sessions, records `channel-message-received` metadata events
+without storing message text, and sends ordinary text into the running Codex
+app-server. `run` and `bind` also synchronize the Telegram command menu. See
+[Telegram Channel Adapter](docs/telegram-channel.md) for the command flow and
+state file shape.
 
 Export the Codex App Server protocol definitions for downstream clients:
 

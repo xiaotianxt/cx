@@ -16,6 +16,7 @@ cx 是一个本地 Codex 入口：负责启动 Codex、处理 stdin pipe、管�
 - `cx serve start` / `cx serve stop`：通过选中的 slot 管理前台 loopback Codex
   app-server。
 - `cx serve daemon` / `cx serve ping`：运行并检查本地 cx control socket。
+- `cx channel telegram run`：把 allowlist 里的 Telegram chat 接入 cx session 和 lease。
 - `cx protocol export`：导出与当前 Codex binary 匹配的 App Server schema 和 TypeScript
   bindings。
 - `cx completions`：生成 shell completion，支持动态补全 slot 和 model。
@@ -301,6 +302,27 @@ turn 或 approval broker。
 这只是未来 daemon/control-plane 层的本地基础能力。Telegram、WeChat、远程 terminal 等
 adapter 最终都应该接入 cx，而不是直接拿 raw Codex app-server WebSocket；这样 cx 才能
 统一负责 slot 轮转、lease、approval routing 和审计状态。
+
+## Telegram Channel
+
+启动 Telegram adapter。第一次使用时，如果本地还没有可信 chat，`run` 会打印一个一次性的
+`/bind <secret>` onboarding 消息：
+
+```bash
+export TELEGRAM_BOT_TOKEN=...
+cx serve start
+cx channel telegram run
+cx channel telegram run --acquire-lease
+cx channel telegram bind
+cx channel telegram menu
+cx channel telegram status --json
+```
+
+本地已有可信 chat 后，`run` 只监听可信 binding 和显式传入的 `--allow-chat`。adapter
+使用 Telegram long polling，把 chat 绑定到 cx session，并记录 `channel-message-received`
+元数据事件；消息正文不会写入 cx state。普通文本会发送给正在运行的 Codex app-server，并把
+assistant 最终回复发回 Telegram。`run` 和 `bind` 也会同步 Telegram command menu。完整命令流和 state 文件结构见 [Telegram Channel
+Adapter](docs/telegram-channel.md)。
 
 导出 Codex App Server 协议定义，供下游 client 生成类型或做 schema 校验：
 

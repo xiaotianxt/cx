@@ -51,6 +51,11 @@ struct ServeStateFile {
     started_at_unix: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReadyAppServer {
+    pub(crate) listen_url: String,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ServeStatusReport {
@@ -436,6 +441,19 @@ pub fn threads(args: ServeThreadsArgs) -> Result<()> {
         backwards_cursor: page.backwards_cursor,
     };
     print_threads(report, args.json)
+}
+
+pub(crate) fn ready_app_server(paths: &ManagerPaths) -> Result<ReadyAppServer> {
+    let state_file = paths.serve_state_file();
+    let state = read_state_if_exists(&state_file)?
+        .with_context(|| format!("serve state not found: {}", state_file.display()))?;
+    LoopbackWsUrl::parse(&state.listen_url)?;
+    if !state_is_ready(&state) {
+        anyhow::bail!("serve state is stale: {}", state_file.display());
+    }
+    Ok(ReadyAppServer {
+        listen_url: state.listen_url,
+    })
 }
 
 fn wait_for_ready(

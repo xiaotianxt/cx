@@ -47,6 +47,7 @@ pub enum JournalEventKind {
     SessionCreated,
     LeaseAcquired,
     LeaseReleased,
+    ChannelMessageReceived,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -108,6 +109,12 @@ pub struct AcquireLeaseRequest {
 pub struct ReleaseLeaseRequest {
     pub session_id: SessionId,
     pub lease_token: LeaseToken,
+}
+
+#[derive(Debug, Clone)]
+pub struct RecordChannelMessageRequest {
+    pub session_id: SessionId,
+    pub channel_id: ChannelId,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -366,6 +373,24 @@ pub fn release_lease(paths: &ManagerPaths, request: ReleaseLeaseRequest) -> Resu
     write_session_replace(paths, &session)?;
     append_event(paths, &event)?;
     Ok(LeaseResult { session, event })
+}
+
+pub fn record_channel_message(
+    paths: &ManagerPaths,
+    request: RecordChannelMessageRequest,
+) -> Result<JournalEvent> {
+    let now = unix_now_secs()?;
+    let _ = show_session(paths, &request.session_id)?;
+    let event = JournalEvent {
+        schema_version: JOURNAL_SCHEMA_VERSION,
+        event_id: EventId::generated(paths)?,
+        event_kind: JournalEventKind::ChannelMessageReceived,
+        session_id: request.session_id,
+        channel_id: request.channel_id,
+        occurred_at_unix: now,
+    };
+    append_event(paths, &event)?;
+    Ok(event)
 }
 
 pub fn list_sessions(paths: &ManagerPaths) -> Result<Vec<SessionRecord>> {
@@ -821,6 +846,35 @@ mod tests {
             stolen.session.current_channel_id,
             ChannelId::parse("telegram:12345").unwrap()
         );
+
+        let _ = fs::remove_dir_all(&paths.manager_dir);
+    }
+
+    #[test]
+    fn record_channel_message_appends_metadata_only_event() {
+        let paths = temp_paths("message");
+        create_session(
+            &paths,
+            CreateSessionRequest {
+                session_id: Some(SessionId::parse("sess_manual").unwrap()),
+                channel_id: ChannelId::parse("telegram:42").unwrap(),
+            },
+        )
+        .unwrap();
+
+        let event = record_channel_message(
+            &paths,
+            RecordChannelMessageRequest {
+                session_id: SessionId::parse("sess_manual").unwrap(),
+                channel_id: ChannelId::parse("telegram:42").unwrap(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(event.event_kind, JournalEventKind::ChannelMessageReceived);
+        let journal = fs::read_to_string(paths.serve_event_journal_file()).unwrap();
+        assert!(journal.contains("\"eventKind\":\"channel-message-received\""));
+        assert!(!journal.contains("message text"));
 
         let _ = fs::remove_dir_all(&paths.manager_dir);
     }

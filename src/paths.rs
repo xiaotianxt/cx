@@ -77,6 +77,14 @@ impl ManagerPaths {
     pub fn serve_event_journal_file(&self) -> PathBuf {
         self.serve_dir().join("events.ndjson")
     }
+
+    pub fn serve_channels_dir(&self) -> PathBuf {
+        self.serve_dir().join("channels")
+    }
+
+    pub fn telegram_channel_state_file(&self) -> PathBuf {
+        self.serve_channels_dir().join("telegram.json")
+    }
 }
 
 pub fn home_dir() -> Result<PathBuf> {

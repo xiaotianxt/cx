@@ -1,6 +1,7 @@
 mod app_server;
 mod auth;
 mod autoresume;
+mod channel;
 mod cli;
 mod completion;
 mod control;
@@ -26,12 +27,14 @@ use anyhow::Context;
 use anyhow::Result;
 use clap::CommandFactory;
 use clap::Parser;
+use cli::ChannelCommand;
 use cli::Cli;
 use cli::Command;
 use cli::ProtocolCommand;
 use cli::ServeCommand;
 use cli::StatusSort;
 use cli::TargetCommand;
+use cli::TelegramCommand;
 
 fn main() -> ExitCode {
     match entry() {
@@ -110,6 +113,14 @@ fn entry() -> Result<()> {
         Command::Desktop(args) => {
             desktop::launch(args)?;
         }
+        Command::Channel(args) => match args.command {
+            ChannelCommand::Telegram(args) => match args.command {
+                TelegramCommand::Run(args) => channel::telegram::run(args)?,
+                TelegramCommand::Bind(args) => channel::telegram::bind(args)?,
+                TelegramCommand::Menu(args) => channel::telegram::menu(args)?,
+                TelegramCommand::Status(args) => channel::telegram::status(args)?,
+            },
+        },
         Command::Serve(args) => match args.command {
             ServeCommand::Daemon(args) => control::daemon(args)?,
             ServeCommand::Ping(args) => control::ping(args)?,

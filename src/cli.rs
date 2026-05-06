@@ -38,6 +38,8 @@ pub enum Command {
     Login(LoginArgs),
     /// Launch Codex Desktop through a selected slot.
     Desktop(DesktopArgs),
+    /// Run external channel adapters.
+    Channel(ChannelArgs),
     /// Start and manage a local Codex app-server.
     Serve(ServeArgs),
     /// Inspect and export Codex App Server protocol bindings.
@@ -305,6 +307,90 @@ mod tests {
         };
         assert_eq!(args.listen, Some(String::from("ws://127.0.0.1:17654")));
         assert_eq!(args.limit, 5);
+    }
+
+    #[test]
+    fn telegram_run_accepts_allow_chat_and_token_env() {
+        let cli = Cli::parse_from([
+            "cx",
+            "channel",
+            "telegram",
+            "run",
+            "--allow-chat",
+            "12345",
+            "--bot-token-env",
+            "CX_TG_TOKEN",
+            "--acquire-lease",
+            "--log-updates",
+            "--app-server-timeout",
+            "120",
+        ]);
+
+        let Command::Channel(args) = cli.command else {
+            panic!("expected channel command");
+        };
+        let ChannelCommand::Telegram(args) = args.command;
+        let TelegramCommand::Run(args) = args.command else {
+            panic!("expected telegram run command");
+        };
+        assert_eq!(args.allow_chats, vec![12345]);
+        assert_eq!(args.bot_token_env, "CX_TG_TOKEN");
+        assert_eq!(args.app_server_timeout, 120.0);
+        assert!(args.acquire_lease);
+        assert!(args.log_updates);
+    }
+
+    #[test]
+    fn telegram_bind_accepts_token_env_and_timeouts() {
+        let cli = Cli::parse_from([
+            "cx",
+            "channel",
+            "telegram",
+            "bind",
+            "--bot-token-env",
+            "CX_TG_TOKEN",
+            "--poll-timeout",
+            "5",
+            "--request-timeout",
+            "10",
+            "--log-updates",
+        ]);
+
+        let Command::Channel(args) = cli.command else {
+            panic!("expected channel command");
+        };
+        let ChannelCommand::Telegram(args) = args.command;
+        let TelegramCommand::Bind(args) = args.command else {
+            panic!("expected telegram bind command");
+        };
+        assert_eq!(args.bot_token_env, "CX_TG_TOKEN");
+        assert_eq!(args.poll_timeout, 5);
+        assert_eq!(args.request_timeout, 10.0);
+        assert!(args.log_updates);
+    }
+
+    #[test]
+    fn telegram_menu_accepts_token_env_and_timeout() {
+        let cli = Cli::parse_from([
+            "cx",
+            "channel",
+            "telegram",
+            "menu",
+            "--bot-token-env",
+            "CX_TG_TOKEN",
+            "--request-timeout",
+            "10",
+        ]);
+
+        let Command::Channel(args) = cli.command else {
+            panic!("expected channel command");
+        };
+        let ChannelCommand::Telegram(args) = args.command;
+        let TelegramCommand::Menu(args) = args.command else {
+            panic!("expected telegram menu command");
+        };
+        assert_eq!(args.bot_token_env, "CX_TG_TOKEN");
+        assert_eq!(args.request_timeout, 10.0);
     }
 
     #[test]
@@ -861,6 +947,120 @@ pub struct ServeThreadsArgs {
     /// Seconds to wait for the WebSocket protocol request.
     #[arg(long, default_value_t = 5.0)]
     pub timeout: f32,
+
+    /// Print JSON instead of human output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ChannelArgs {
+    #[command(subcommand)]
+    pub command: ChannelCommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum ChannelCommand {
+    /// Run the Telegram channel adapter.
+    Telegram(TelegramArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct TelegramArgs {
+    #[command(subcommand)]
+    pub command: TelegramCommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum TelegramCommand {
+    /// Poll Telegram and bridge allowed chats into cx sessions.
+    Run(TelegramRunArgs),
+    /// Generate a one-time /bind secret and trust the first matching chat.
+    Bind(TelegramBindArgs),
+    /// Sync the Telegram bot command menu and exit.
+    Menu(TelegramMenuArgs),
+    /// Show local Telegram adapter state.
+    Status(TelegramStatusArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct TelegramRunArgs {
+    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
+    pub manager_dir: Option<PathBuf>,
+
+    /// Environment variable containing the Telegram bot token.
+    #[arg(long, default_value = "TELEGRAM_BOT_TOKEN")]
+    pub bot_token_env: String,
+
+    /// Allowed Telegram chat id. Repeat for multiple chats.
+    #[arg(long = "allow-chat")]
+    pub allow_chats: Vec<i64>,
+
+    /// Long-poll timeout passed to Telegram getUpdates.
+    #[arg(long, default_value_t = 30)]
+    pub poll_timeout: u64,
+
+    /// HTTP request timeout in seconds.
+    #[arg(long, default_value_t = 35.0)]
+    pub request_timeout: f32,
+
+    /// App-server WebSocket timeout in seconds for Codex turns.
+    #[arg(long, default_value_t = 600.0)]
+    pub app_server_timeout: f32,
+
+    /// Acquire an active lease for incoming messages.
+    #[arg(long)]
+    pub acquire_lease: bool,
+
+    /// Steal an existing lease when acquiring for Telegram.
+    #[arg(long)]
+    pub steal: bool,
+
+    /// Log safe Telegram update summaries to stderr.
+    #[arg(long)]
+    pub log_updates: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct TelegramBindArgs {
+    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
+    pub manager_dir: Option<PathBuf>,
+
+    /// Environment variable containing the Telegram bot token.
+    #[arg(long, default_value = "TELEGRAM_BOT_TOKEN")]
+    pub bot_token_env: String,
+
+    /// Long-poll timeout passed to Telegram getUpdates.
+    #[arg(long, default_value_t = 30)]
+    pub poll_timeout: u64,
+
+    /// HTTP request timeout in seconds.
+    #[arg(long, default_value_t = 35.0)]
+    pub request_timeout: f32,
+
+    /// Log safe Telegram update summaries to stderr.
+    #[arg(long)]
+    pub log_updates: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct TelegramMenuArgs {
+    /// Environment variable containing the Telegram bot token.
+    #[arg(long, default_value = "TELEGRAM_BOT_TOKEN")]
+    pub bot_token_env: String,
+
+    /// HTTP request timeout in seconds.
+    #[arg(long, default_value_t = 35.0)]
+    pub request_timeout: f32,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct TelegramStatusArgs {
+    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
+    pub manager_dir: Option<PathBuf>,
 
     /// Print JSON instead of human output.
     #[arg(long)]

@@ -18,6 +18,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::app_server::AppServerClient;
+use crate::app_server::AppThreadSummary;
 use crate::app_server::InitializeInfo;
 use crate::app_server::LoopbackWsUrl;
 use crate::app_server::ThreadListInfo;
@@ -25,6 +26,7 @@ use crate::cli::ServeProbeArgs;
 use crate::cli::ServeStartArgs;
 use crate::cli::ServeStatusArgs;
 use crate::cli::ServeStopArgs;
+use crate::cli::ServeThreadsArgs;
 use crate::paths::ManagerPaths;
 use crate::run;
 
@@ -103,6 +105,40 @@ struct ThreadListProbeReport {
     thread_count: usize,
     has_next_cursor: bool,
     has_backwards_cursor: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ServeThreadsReport {
+    schema_version: u64,
+    listen_url: String,
+    ready: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state_file: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    slot: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target: Option<String>,
+    threads: Vec<ThreadReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backwards_cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadReport {
+    upstream_thread_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    preview: String,
+    cwd: String,
+    source: String,
+    status: String,
+    active: bool,
+    created_at_unix: i64,
+    updated_at_unix: i64,
 }
 
 impl ListenUrl {
@@ -353,6 +389,55 @@ pub fn probe(args: ServeProbeArgs) -> Result<()> {
     print_probe(report, args.json)
 }
 
+pub fn threads(args: ServeThreadsArgs) -> Result<()> {
+    if args.timeout <= 0.0 {
+        anyhow::bail!("--timeout must be positive");
+    }
+    if !(1..=100).contains(&args.limit) {
+        anyhow::bail!("--limit must be between 1 and 100");
+    }
+
+    let paths = ManagerPaths::new(args.manager_dir)?;
+    let state_file = paths.serve_state_file();
+    let explicit_listen = args.listen.is_some();
+    let (listen_url, state) = match args.listen {
+        Some(listen_url) => (listen_url, None),
+        None => {
+            let state = read_state_if_exists(&state_file)?
+                .with_context(|| format!("serve state not found: {}", state_file.display()))?;
+            (state.listen_url.clone(), Some(state))
+        }
+    };
+    LoopbackWsUrl::parse(&listen_url)?;
+
+    let ready = if let Some(state) = &state {
+        state_is_ready(state)
+    } else {
+        ListenUrl::parse(&listen_url)
+            .map(|listen| probe_ready(&listen.readyz_url()))
+            .unwrap_or(false)
+    };
+    if !ready && !explicit_listen {
+        anyhow::bail!("serve state is stale: {}", state_file.display());
+    }
+
+    let mut client = AppServerClient::connect(&listen_url, Duration::from_secs_f32(args.timeout))?;
+    client.initialize("cx-threads", env!("CARGO_PKG_VERSION"))?;
+    let page = client.thread_list(args.limit)?;
+    let report = ServeThreadsReport {
+        schema_version: SERVE_STATE_SCHEMA_VERSION,
+        listen_url,
+        ready,
+        state_file: state.as_ref().map(|_| state_file.display().to_string()),
+        slot: state.as_ref().map(|state| state.slot.clone()),
+        target: state.as_ref().and_then(|state| state.target.clone()),
+        threads: page.threads.into_iter().map(ThreadReport::from).collect(),
+        next_cursor: page.next_cursor,
+        backwards_cursor: page.backwards_cursor,
+    };
+    print_threads(report, args.json)
+}
+
 fn wait_for_ready(
     readyz_url: &str,
     timeout_secs: f32,
@@ -594,6 +679,33 @@ fn print_probe(report: ServeProbeReport, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn print_threads(report: ServeThreadsReport, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    println!("cx serve threads: {}", report.threads.len());
+    println!("listen: {}", report.listen_url);
+    println!("ready: {}", report.ready);
+    if let Some(state_file) = report.state_file {
+        println!("state: {state_file}");
+    }
+    if let Some(slot) = report.slot {
+        println!("slot: {slot}");
+    }
+    if let Some(target) = report.target {
+        println!("target: {target}");
+    }
+    for thread in report.threads {
+        let title = thread.title.as_deref().unwrap_or("");
+        println!(
+            "{}\t{}\t{}\t{}\t{}",
+            thread.upstream_thread_id, thread.status, thread.source, thread.updated_at_unix, title
+        );
+    }
+    Ok(())
+}
+
 fn unix_now() -> Result<u64> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -618,6 +730,22 @@ impl From<ThreadListInfo> for ThreadListProbeReport {
             thread_count: info.thread_count,
             has_next_cursor: info.has_next_cursor,
             has_backwards_cursor: info.has_backwards_cursor,
+        }
+    }
+}
+
+impl From<AppThreadSummary> for ThreadReport {
+    fn from(thread: AppThreadSummary) -> Self {
+        Self {
+            upstream_thread_id: thread.upstream_thread_id,
+            title: thread.title,
+            preview: thread.preview,
+            cwd: thread.cwd,
+            source: thread.source,
+            status: thread.status,
+            active: thread.active,
+            created_at_unix: thread.created_at_unix,
+            updated_at_unix: thread.updated_at_unix,
         }
     }
 }

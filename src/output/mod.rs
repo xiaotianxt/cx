@@ -150,17 +150,25 @@ pub fn print_doctor(paths: &ManagerPaths, slots: &[String]) -> Result<()> {
     }
     for slot in slots {
         let slot_home = paths.slot_home(slot);
-        let auth_path = slot_home.join("auth.json");
-        let status = if slot_home.is_dir() {
-            if auth_path.exists() {
-                "ok"
-            } else {
-                "missing auth"
-            }
-        } else {
+        let audit = crate::slot::audit_slot_layout(paths, slot)?;
+        let status = if audit.issues.is_empty() {
+            "ok"
+        } else if !audit.home_exists {
             "missing home"
+        } else if !audit.auth_exists {
+            "missing auth"
+        } else {
+            "layout issues"
         };
         println!("  {slot}: {status}");
+        for issue in audit.issues {
+            let relative_path = issue.path.strip_prefix(&slot_home).unwrap_or(&issue.path);
+            println!(
+                "    warning: {}: {}",
+                relative_path.display(),
+                issue.message
+            );
+        }
     }
     Ok(())
 }

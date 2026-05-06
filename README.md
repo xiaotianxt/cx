@@ -273,6 +273,7 @@ cx serve status
 cx serve status --json
 cx serve probe
 cx serve probe --listen ws://127.0.0.1:17654 --json
+cx serve threads --limit 20 --json
 ```
 
 `cx serve start` only accepts loopback `ws://127.0.0.1:<port>` or
@@ -289,6 +290,10 @@ it cleans only the cx state file. `--force` escalates to SIGKILL after
 sends the Codex App Server `initialize` handshake, then calls `thread/list` with
 a one-row local state-db probe. This verifies the app-server protocol path
 without starting a model turn.
+
+`cx serve threads` uses the same app-server WebSocket adapter to list thread
+summaries with `thread/list`. See [Codex App Server WebSocket](docs/app-server-ws.md)
+for the complete command flow, raw message shape, and schema export workflow.
 
 Run the local cx control daemon on a private Unix socket:
 

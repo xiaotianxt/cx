@@ -251,6 +251,7 @@ cx serve status
 cx serve status --json
 cx serve probe
 cx serve probe --listen ws://127.0.0.1:17654 --json
+cx serve threads --limit 20 --json
 ```
 
 `cx serve start` 只接受 loopback `ws://127.0.0.1:<port>` 或
@@ -265,6 +266,10 @@ cx serve probe --listen ws://127.0.0.1:17654 --json
 `cx serve probe` 会连接保存的或显式传入的 loopback WebSocket URL，发送 Codex App
 Server `initialize` 握手，然后用 `thread/list` 做一次只读 state-db 探测。这个命令用于
 确认 app-server 协议路径可用，不会启动模型 turn。
+
+`cx serve threads` 使用同一个 app-server WebSocket adapter，通过 `thread/list` 列出
+thread 摘要。完整命令流、原始消息结构和 schema 导出流程见
+[Codex App Server WebSocket](docs/app-server-ws.md)。
 
 运行本地 cx control daemon：
 

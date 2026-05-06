@@ -25,6 +25,26 @@ pub(crate) struct ThreadListInfo {
     pub has_backwards_cursor: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ThreadListPage {
+    pub threads: Vec<AppThreadSummary>,
+    pub next_cursor: Option<String>,
+    pub backwards_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AppThreadSummary {
+    pub upstream_thread_id: String,
+    pub title: Option<String>,
+    pub preview: String,
+    pub cwd: String,
+    pub source: String,
+    pub status: String,
+    pub active: bool,
+    pub created_at_unix: i64,
+    pub updated_at_unix: i64,
+}
+
 impl ThreadListInfo {
     fn from_response(response: &Value) -> Self {
         let thread_count = response
@@ -90,6 +110,27 @@ impl AppServerClient {
         Ok(ThreadListInfo::from_response(&response))
     }
 
+    pub(crate) fn thread_list(&mut self, limit: u64) -> Result<ThreadListPage> {
+        let response = self.request(
+            "thread/list",
+            protocol::ThreadListParams {
+                limit,
+                use_state_db_only: true,
+            },
+        )?;
+        let response = serde_json::from_value::<protocol::ThreadListResponse>(response)
+            .context("decode thread/list response")?;
+        Ok(ThreadListPage {
+            threads: response
+                .data
+                .into_iter()
+                .map(AppThreadSummary::from)
+                .collect(),
+            next_cursor: response.next_cursor,
+            backwards_cursor: response.backwards_cursor,
+        })
+    }
+
     fn request<P>(&mut self, method: &'static str, params: P) -> Result<Value>
     where
         P: Serialize,
@@ -136,6 +177,44 @@ impl AppServerClient {
     }
 }
 
+impl From<protocol::ThreadSummary> for AppThreadSummary {
+    fn from(thread: protocol::ThreadSummary) -> Self {
+        let status = status_type(&thread.status);
+        Self {
+            upstream_thread_id: thread.id,
+            title: thread.name,
+            preview: thread.preview,
+            cwd: thread.cwd,
+            source: source_kind(&thread.source),
+            active: status == "active",
+            status,
+            created_at_unix: thread.created_at,
+            updated_at_unix: thread.updated_at,
+        }
+    }
+}
+
+fn status_type(status: &Value) -> String {
+    status
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn source_kind(source: &Value) -> String {
+    if let Some(source) = source.as_str() {
+        return source.to_string();
+    }
+    if source.get("custom").is_some() {
+        return "custom".to_string();
+    }
+    if source.get("subAgent").is_some() {
+        return "subAgent".to_string();
+    }
+    "unknown".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,5 +237,26 @@ mod tests {
                 has_backwards_cursor: false,
             }
         );
+    }
+
+    #[test]
+    fn thread_summary_maps_private_protocol_to_stable_fields() {
+        let thread = protocol::ThreadSummary {
+            id: String::from("thread-1"),
+            name: Some(String::from("Fix build")),
+            preview: String::from("please fix"),
+            cwd: String::from("/tmp/project"),
+            source: serde_json::json!({ "custom": "cx" }),
+            status: serde_json::json!({ "type": "active", "activeFlags": [] }),
+            created_at: 10,
+            updated_at: 20,
+        };
+
+        let summary = AppThreadSummary::from(thread);
+
+        assert_eq!(summary.upstream_thread_id, "thread-1");
+        assert_eq!(summary.source, "custom");
+        assert_eq!(summary.status, "active");
+        assert!(summary.active);
     }
 }

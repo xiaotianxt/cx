@@ -121,6 +121,7 @@ fn entry() -> Result<()> {
             ServeCommand::Stop(args) => serve::stop(args)?,
             ServeCommand::Status(args) => serve::status(args)?,
             ServeCommand::Probe(args) => serve::probe(args)?,
+            ServeCommand::Threads(args) => serve::threads(args)?,
         },
         Command::Protocol(args) => match args.command {
             ProtocolCommand::Export(args) => protocol_export::export(args)?,

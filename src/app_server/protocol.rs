@@ -67,3 +67,27 @@ pub(super) struct ThreadListParams {
     pub limit: u64,
     pub use_state_db_only: bool,
 }
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ThreadListResponse {
+    pub data: Vec<ThreadSummary>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    #[serde(default)]
+    pub backwards_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ThreadSummary {
+    pub id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    pub preview: String,
+    pub cwd: String,
+    pub source: Value,
+    pub status: Value,
+    pub created_at: i64,
+    pub updated_at: i64,
+}

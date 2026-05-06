@@ -286,6 +286,28 @@ mod tests {
     }
 
     #[test]
+    fn serve_threads_accepts_limit_and_listen_url() {
+        let cli = Cli::parse_from([
+            "cx",
+            "serve",
+            "threads",
+            "--listen",
+            "ws://127.0.0.1:17654",
+            "--limit",
+            "5",
+        ]);
+
+        let Command::Serve(args) = cli.command else {
+            panic!("expected serve command");
+        };
+        let ServeCommand::Threads(args) = args.command else {
+            panic!("expected serve threads command");
+        };
+        assert_eq!(args.listen, Some(String::from("ws://127.0.0.1:17654")));
+        assert_eq!(args.limit, 5);
+    }
+
+    #[test]
     fn serve_ping_accepts_timeout_and_json() {
         let cli = Cli::parse_from(["cx", "serve", "ping", "--timeout", "0.5", "--json"]);
 
@@ -530,6 +552,8 @@ pub enum ServeCommand {
     Status(ServeStatusArgs),
     /// Connect to a running app-server and verify the Codex protocol handshake.
     Probe(ServeProbeArgs),
+    /// List Codex app-server threads through the cx protocol adapter.
+    Threads(ServeThreadsArgs),
 }
 
 #[derive(Debug, Clone, Args)]
@@ -812,6 +836,29 @@ pub struct ServeProbeArgs {
     pub listen: Option<String>,
 
     /// Seconds to wait for the WebSocket protocol probe.
+    #[arg(long, default_value_t = 5.0)]
+    pub timeout: f32,
+
+    /// Print JSON instead of human output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ServeThreadsArgs {
+    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
+    pub manager_dir: Option<PathBuf>,
+
+    /// Query this loopback app-server URL instead of the saved serve state.
+    #[arg(long)]
+    pub listen: Option<String>,
+
+    /// Maximum number of threads to return.
+    #[arg(long, default_value_t = 20)]
+    pub limit: u64,
+
+    /// Seconds to wait for the WebSocket protocol request.
     #[arg(long, default_value_t = 5.0)]
     pub timeout: f32,
 

@@ -59,6 +59,20 @@ const SHARED_DIRS: &[&str] = &[
 
 const APPEND_ONLY_FILES: &[&str] = &["history.jsonl", "session_index.jsonl"];
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotLayoutAudit {
+    pub slot: String,
+    pub home_exists: bool,
+    pub auth_exists: bool,
+    pub issues: Vec<SlotLayoutIssue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotLayoutIssue {
+    pub path: PathBuf,
+    pub message: String,
+}
+
 pub fn add_slot(paths: &ManagerPaths, args: AddArgs) -> Result<()> {
     validate_slot_name(&args.slot)?;
     ensure_slot_layout(paths, &args.slot)?;
@@ -221,6 +235,111 @@ fn repair_shared_sqlite(paths: &ManagerPaths, slot: &str) -> Result<()> {
         remove_sqlite_family(&slot_path)?;
         link_if_safe(&canonical_path, &slot_path)?;
     }
+    Ok(())
+}
+
+pub fn audit_slot_layout(paths: &ManagerPaths, slot: &str) -> Result<SlotLayoutAudit> {
+    validate_slot_name(slot)?;
+    let slot_home = paths.slot_home(slot);
+    let auth_path = slot_home.join("auth.json");
+    let mut issues = Vec::new();
+
+    let home_exists = slot_home.is_dir();
+    if !home_exists {
+        issues.push(SlotLayoutIssue {
+            path: slot_home,
+            message: "missing slot home".to_string(),
+        });
+        return Ok(SlotLayoutAudit {
+            slot: slot.to_string(),
+            home_exists,
+            auth_exists: false,
+            issues,
+        });
+    }
+
+    let auth_exists = auth_path.exists();
+    if !auth_exists {
+        issues.push(SlotLayoutIssue {
+            path: auth_path.clone(),
+            message: "missing slot auth.json".to_string(),
+        });
+    } else if is_symlink(&auth_path) {
+        issues.push(SlotLayoutIssue {
+            path: auth_path.clone(),
+            message: "auth.json should be slot-private, not a symlink".to_string(),
+        });
+    }
+
+    audit_shared_link(paths, &slot_home, "config.toml", &mut issues)?;
+    for name in SHARED_NAMES {
+        audit_shared_link(paths, &slot_home, name, &mut issues)?;
+    }
+    for name in SHARED_SQLITE {
+        audit_shared_link(paths, &slot_home, name, &mut issues)?;
+        for suffix in ["-wal", "-shm"] {
+            let sidecar = slot_home.join(format!("{name}{suffix}"));
+            if sidecar.exists() || is_symlink(&sidecar) {
+                issues.push(SlotLayoutIssue {
+                    path: sidecar,
+                    message: "sqlite sidecar should live beside the canonical database".to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(SlotLayoutAudit {
+        slot: slot.to_string(),
+        home_exists,
+        auth_exists,
+        issues,
+    })
+}
+
+fn audit_shared_link(
+    paths: &ManagerPaths,
+    slot_home: &Path,
+    name: &str,
+    issues: &mut Vec<SlotLayoutIssue>,
+) -> Result<()> {
+    let canonical_path = paths.base_codex_home.join(name);
+    let slot_path = slot_home.join(name);
+    let canonical_exists = canonical_path.exists() || is_symlink(&canonical_path);
+    let slot_exists = slot_path.exists() || is_symlink(&slot_path);
+
+    if !canonical_exists && !slot_exists {
+        return Ok(());
+    }
+
+    if !slot_exists {
+        issues.push(SlotLayoutIssue {
+            path: slot_path,
+            message: format!("missing shared link to {}", canonical_path.display()),
+        });
+        return Ok(());
+    }
+
+    if !is_symlink(&slot_path) {
+        issues.push(SlotLayoutIssue {
+            path: slot_path,
+            message: format!(
+                "private copy; expected symlink to {}",
+                canonical_path.display()
+            ),
+        });
+        return Ok(());
+    }
+
+    if !is_symlink_to(&slot_path, &canonical_path)? {
+        let target = fs::read_link(&slot_path)
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| "<unreadable>".to_string());
+        issues.push(SlotLayoutIssue {
+            path: slot_path,
+            message: format!("points to {target}; expected {}", canonical_path.display()),
+        });
+    }
+
     Ok(())
 }
 
@@ -528,6 +647,65 @@ mod tests {
             .unwrap();
         assert_eq!(count, 2);
         assert!(is_symlink_to(&slot_db, &canonical_db).unwrap());
+
+        let _ = fs::remove_dir_all(&paths.manager_dir);
+        let _ = fs::remove_dir_all(&paths.base_codex_home);
+    }
+
+    #[test]
+    fn audit_slot_layout_accepts_shared_links() {
+        let paths = temp_paths("audit-ok");
+        fs::create_dir_all(&paths.base_codex_home).unwrap();
+        fs::write(paths.base_codex_home.join("history.jsonl"), "base\n").unwrap();
+        fs::write(paths.base_codex_home.join("state_5.sqlite"), "").unwrap();
+        fs::create_dir_all(paths.slot_home("dia1")).unwrap();
+        fs::write(paths.slot_home("dia1").join("auth.json"), "{}\n").unwrap();
+        link_if_safe(
+            &paths.base_codex_home.join("history.jsonl"),
+            &paths.slot_home("dia1").join("history.jsonl"),
+        )
+        .unwrap();
+        link_if_safe(
+            &paths.base_codex_home.join("state_5.sqlite"),
+            &paths.slot_home("dia1").join("state_5.sqlite"),
+        )
+        .unwrap();
+
+        let audit = audit_slot_layout(&paths, "dia1").unwrap();
+
+        assert!(audit.issues.is_empty());
+
+        let _ = fs::remove_dir_all(&paths.manager_dir);
+        let _ = fs::remove_dir_all(&paths.base_codex_home);
+    }
+
+    #[test]
+    fn audit_slot_layout_reports_private_shared_files() {
+        let paths = temp_paths("audit-private");
+        fs::create_dir_all(&paths.base_codex_home).unwrap();
+        fs::write(paths.base_codex_home.join("history.jsonl"), "base\n").unwrap();
+        fs::write(paths.base_codex_home.join("state_5.sqlite"), "").unwrap();
+        fs::create_dir_all(paths.slot_home("dia1")).unwrap();
+        fs::write(paths.slot_home("dia1").join("auth.json"), "{}\n").unwrap();
+        fs::write(paths.slot_home("dia1").join("history.jsonl"), "slot\n").unwrap();
+        fs::write(paths.slot_home("dia1").join("state_5.sqlite-wal"), "").unwrap();
+
+        let audit = audit_slot_layout(&paths, "dia1").unwrap();
+        let messages = audit
+            .issues
+            .iter()
+            .map(|issue| issue.message.as_str())
+            .collect::<Vec<_>>();
+
+        assert!(messages
+            .iter()
+            .any(|message| message.starts_with("private copy; expected symlink")));
+        assert!(messages.contains(&"sqlite sidecar should live beside the canonical database"));
+        assert!(audit.issues.iter().any(|issue| issue
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            == Some("state_5.sqlite-wal")));
 
         let _ = fs::remove_dir_all(&paths.manager_dir);
         let _ = fs::remove_dir_all(&paths.base_codex_home);

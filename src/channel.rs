@@ -879,6 +879,7 @@ pub mod telegram {
         RefreshPortal,
         RefreshWork,
         Attach { thread_id: String },
+        Observe { thread_id: String },
         Takeover,
         Release,
         Close,
@@ -893,6 +894,14 @@ pub mod telegram {
                 "cx:rel" => Some(Self::Release),
                 "cx:c" => Some(Self::Close),
                 _ => {
+                    if let Some(thread_id) = data.strip_prefix("cx:o:") {
+                        if thread_id.is_empty() {
+                            return None;
+                        }
+                        return Some(Self::Observe {
+                            thread_id: thread_id.to_string(),
+                        });
+                    }
                     let thread_id = data.strip_prefix("cx:a:")?;
                     if thread_id.is_empty() {
                         return None;
@@ -1212,6 +1221,15 @@ pub mod telegram {
                     .or_else(|| state.active_alias_for_route(&route).map(str::to_string));
                 close_bound_route(paths, state, &route, alias.as_deref(), &options)
             }
+            TelegramTextCommand::Watch => {
+                let Some(binding) = state.active_binding_for_route(&route).cloned() else {
+                    return Ok(Some(reply(
+                        &route,
+                        no_session_bound_message(state, &route),
+                    )));
+                };
+                watch_bound_thread(paths, &route, &binding, &options)
+            }
             TelegramTextCommand::Message => {
                 if is_portal_route(&route, chat_is_forum) {
                     return Ok(Some(
@@ -1316,6 +1334,10 @@ pub mod telegram {
                 attach_app_thread(paths, state, route, chat_is_forum, &thread_id, options)
                     .unwrap_or_else(|err| reply(route, portal_unavailable_message(err))),
             )),
+            Some(TelegramCallbackCommand::Observe { thread_id }) => {
+                observe_portal_thread(paths, state, route, chat_is_forum, &thread_id, options)
+                    .or_else(|err| Ok(Some(reply(route, portal_unavailable_message(err)))))
+            }
             Some(TelegramCallbackCommand::Takeover) => {
                 takeover_handoff(paths, state, route, options, edit_message_id)
             }
@@ -1428,6 +1450,62 @@ pub mod telegram {
         Ok(work_panel_reply(&effective_route, &binding, headline, None))
     }
 
+    fn observe_portal_thread(
+        paths: &ManagerPaths,
+        state: &mut TelegramState,
+        route: &TelegramRoute,
+        chat_is_forum: bool,
+        thread_id: &str,
+        options: &HandleOptions<'_>,
+    ) -> Result<Option<TelegramReply>> {
+        let entries = list_portal_entries(paths, options.app_server_timeout, 30)?;
+        let Some(entry) = entries.iter().find(|e| e.thread_id == thread_id) else {
+            return Ok(Some(reply(
+                route,
+                "That Codex thread is no longer visible. Open /portal and choose again.",
+            )));
+        };
+        if !entry.active {
+            return Ok(Some(reply(
+                route,
+                "That thread is not active. Use 'Take over' instead to resume it.",
+            )));
+        }
+
+        let mut topic_created_by_adapter = false;
+        let effective_route = if should_create_work_topic(state, route, chat_is_forum) {
+            if let Some(notifier) = options.notifier {
+                let topic_id = create_forum_topic(
+                    notifier.client,
+                    notifier.token,
+                    route.chat_id,
+                    &work_topic_title(entry),
+                )?;
+                topic_created_by_adapter = true;
+                TelegramRoute {
+                    chat_id: route.chat_id,
+                    message_thread_id: Some(topic_id),
+                }
+            } else {
+                route.clone()
+            }
+        } else {
+            route.clone()
+        };
+
+        let binding =
+            state.bind_app_thread(paths, &effective_route, entry, topic_created_by_adapter)?;
+        session::record_channel_message(
+            paths,
+            RecordChannelMessageRequest {
+                session_id: binding.session_id.clone(),
+                channel_id: binding.channel_id.clone(),
+            },
+        )?;
+
+        watch_bound_thread(paths, &effective_route, &binding, options)
+    }
+
     fn takeover_handoff(
         paths: &ManagerPaths,
         state: &mut TelegramState,
@@ -1500,6 +1578,50 @@ pub mod telegram {
             format!("Telegram handoff paused.{suffix} Continue on desktop."),
             edit_message_id,
         )))
+    }
+
+    fn watch_bound_thread(
+        paths: &ManagerPaths,
+        route: &TelegramRoute,
+        binding: &TelegramBinding,
+        options: &HandleOptions<'_>,
+    ) -> Result<Option<TelegramReply>> {
+        let Some(_thread_id) = binding.app_thread_id.as_deref() else {
+            return Ok(Some(reply(
+                route,
+                "This session is not bound to a Codex thread yet. Send a message first.",
+            )));
+        };
+
+        let result = run_codex_observe(
+            paths,
+            route,
+            binding,
+            options.app_server_timeout,
+            options.notifier,
+        );
+
+        match result {
+            ObserveResult::NoActiveTurn => Ok(Some(work_panel_reply(
+                route,
+                binding,
+                "No active turn to observe. Send a prompt from TUI first, then try /watch again.",
+                None,
+            ))),
+            ObserveResult::TurnCompleted {
+                turn_id,
+                streamed,
+            } => {
+                if streamed {
+                    return Ok(None);
+                }
+                let headline = format!("Watched turn {turn_id} complete.");
+                Ok(Some(work_panel_reply(route, binding, headline, None)))
+            }
+            ObserveResult::Error(err) => {
+                Ok(Some(reply(route, format!("Observation failed.\n{err:#}"))))
+            }
+        }
     }
 
     fn refresh_work_panel(
@@ -1685,20 +1807,36 @@ pub mod telegram {
                 entry.cwd
             ));
         }
-        lines.push(String::from("Tap a thread to continue it from Telegram."));
+        lines.push(String::from(
+            "Active threads can be watched or taken over. Tap Watch to observe, then Take over when ready.",
+        ));
         lines.join("\n")
     }
 
     fn portal_keyboard(entries: &[AppThreadPortalEntry]) -> TelegramInlineKeyboardMarkup {
-        let mut rows = entries
-            .iter()
-            .map(|entry| {
-                vec![TelegramInlineKeyboardButton {
-                    text: portal_button_text(entry),
+        let mut rows = Vec::new();
+        for entry in entries {
+            if entry.active {
+                rows.push(vec![
+                    TelegramInlineKeyboardButton {
+                        text: format!(
+                            "Take over: {}",
+                            truncate_chars(&work_topic_title(entry), 36)
+                        ),
+                        callback_data: format!("cx:a:{}", entry.thread_id),
+                    },
+                    TelegramInlineKeyboardButton {
+                        text: String::from("Watch"),
+                        callback_data: format!("cx:o:{}", entry.thread_id),
+                    },
+                ]);
+            } else {
+                rows.push(vec![TelegramInlineKeyboardButton {
+                    text: format!("Open: {}", truncate_chars(&work_topic_title(entry), 48)),
                     callback_data: format!("cx:a:{}", entry.thread_id),
-                }]
-            })
-            .collect::<Vec<_>>();
+                }]);
+            }
+        }
         rows.push(vec![TelegramInlineKeyboardButton {
             text: String::from("Refresh"),
             callback_data: String::from("cx:p"),
@@ -1706,11 +1844,6 @@ pub mod telegram {
         TelegramInlineKeyboardMarkup {
             inline_keyboard: rows,
         }
-    }
-
-    fn portal_button_text(entry: &AppThreadPortalEntry) -> String {
-        let prefix = if entry.active { "Take over" } else { "Open" };
-        truncate_chars(&format!("{prefix}: {}", work_topic_title(entry)), 48)
     }
 
     fn work_topic_title(entry: &AppThreadPortalEntry) -> String {
@@ -1907,6 +2040,72 @@ pub mod telegram {
     struct CodexTurnOutput {
         assistant_text: String,
         streamed_to_telegram: bool,
+    }
+
+    enum ObserveResult {
+        NoActiveTurn,
+        TurnCompleted {
+            turn_id: String,
+            streamed: bool,
+        },
+        Error(anyhow::Error),
+    }
+
+    fn run_codex_observe(
+        paths: &ManagerPaths,
+        route: &TelegramRoute,
+        binding: &TelegramBinding,
+        timeout_secs: f32,
+        notifier: Option<&TelegramNotifier<'_>>,
+    ) -> ObserveResult {
+        let Some(thread_id) = binding.app_thread_id.as_deref() else {
+            return ObserveResult::NoActiveTurn;
+        };
+
+        let server = match serve::ready_app_server(paths) {
+            Ok(s) => s,
+            Err(err) => return ObserveResult::Error(err),
+        };
+        let mut client = match AppServerClient::connect(
+            &server.listen_url,
+            Duration::from_secs_f32(timeout_secs),
+        ) {
+            Ok(c) => c,
+            Err(err) => return ObserveResult::Error(err),
+        };
+        if let Err(err) = client.initialize("cx-telegram", env!("CARGO_PKG_VERSION")) {
+            return ObserveResult::Error(err);
+        }
+
+        let mut sink = notifier.map(|n| TelegramDeltaSink::new(n, route.clone()));
+        let outcome = match client.observe_thread_events(
+            thread_id,
+            binding.app_thread_cwd.as_deref(),
+            |delta| {
+                if let Some(sink) = sink.as_mut() {
+                    sink.push(delta)?;
+                }
+                Ok(())
+            },
+        ) {
+            Ok(o) => o,
+            Err(err) => return ObserveResult::Error(err),
+        };
+
+        if let Some(sink) = sink.as_mut() {
+            if let Err(err) = sink.finish() {
+                return ObserveResult::Error(err);
+            }
+        }
+        let streamed = sink.is_some_and(|s| s.sent_any());
+
+        match outcome.turn_id {
+            Some(turn_id) => ObserveResult::TurnCompleted {
+                turn_id,
+                streamed,
+            },
+            None => ObserveResult::NoActiveTurn,
+        }
     }
 
     struct TelegramNotifier<'a> {
@@ -2435,6 +2634,7 @@ pub mod telegram {
         Portal,
         Attach { thread_id: Option<String> },
         Takeover,
+        Watch,
         New { alias: Option<String> },
         Use { alias: Option<String> },
         Status,
@@ -2459,6 +2659,7 @@ pub mod telegram {
                     thread_id: parts.next().map(String::from),
                 },
                 "/takeover" | "/take" => Self::Takeover,
+                "/watch" | "/observe" => Self::Watch,
                 "/new" => Self::New {
                     alias: parts.next().map(String::from),
                 },
@@ -3936,6 +4137,12 @@ pub mod telegram {
                     thread_id: "thread-123".to_string()
                 })
             );
+            assert_eq!(
+                TelegramCallbackCommand::parse("cx:o:thread-456"),
+                Some(TelegramCallbackCommand::Observe {
+                    thread_id: "thread-456".to_string()
+                })
+            );
             assert_eq!(TelegramCallbackCommand::parse("noop"), None);
         }
 
@@ -3953,6 +4160,7 @@ pub mod telegram {
             let keyboard = portal_keyboard(&entries);
 
             assert_eq!(keyboard.inline_keyboard.len(), 2);
+            assert_eq!(keyboard.inline_keyboard[0].len(), 2);
             assert_eq!(
                 keyboard.inline_keyboard[0][0].callback_data,
                 "cx:a:019dfeec-78ca-7cb0-a497-cd3a79f1329a"
@@ -3960,6 +4168,11 @@ pub mod telegram {
             assert!(keyboard.inline_keyboard[0][0]
                 .text
                 .starts_with("Take over:"));
+            assert_eq!(keyboard.inline_keyboard[0][1].text, "Watch");
+            assert_eq!(
+                keyboard.inline_keyboard[0][1].callback_data,
+                "cx:o:019dfeec-78ca-7cb0-a497-cd3a79f1329a"
+            );
             assert_eq!(keyboard.inline_keyboard[1][0].text, "Refresh");
             assert_eq!(keyboard.inline_keyboard[1][0].callback_data, "cx:p");
         }

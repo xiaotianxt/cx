@@ -62,6 +62,11 @@ pub(crate) struct InterruptOutcome {
     pub interrupted_turn_id: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ObserveOutcome {
+    pub turn_id: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ApprovalRequest {
     pub id: Value,
@@ -233,6 +238,51 @@ impl AppServerClient {
             },
         )?;
         self.collect_turn_start(request_id, thread_id, &mut on_delta, &mut on_approval)
+    }
+
+    pub(crate) fn observe_thread_events<F>(
+        &mut self,
+        thread_id: &str,
+        cwd: Option<&str>,
+        mut on_delta: F,
+    ) -> Result<ObserveOutcome>
+    where
+        F: FnMut(&str) -> Result<()>,
+    {
+        self.thread_resume(thread_id, cwd)?;
+
+        let Some(turn_id) = self.active_turn_id(thread_id)? else {
+            return Ok(ObserveOutcome { turn_id: None });
+        };
+
+        loop {
+            let frame = self.websocket.read_text()?;
+            let message = serde_json::from_str::<ServerMessage>(&frame)
+                .context("decode observe event")?;
+            match message {
+                ServerMessage::Notification { method, params }
+                    if method == "item/agentMessage/delta" =>
+                {
+                    if let Some(delta) =
+                        notification_delta(&params, thread_id, Some(&turn_id))
+                    {
+                        on_delta(delta)?;
+                    }
+                }
+                ServerMessage::Notification { method, params }
+                    if method == "turn/completed" =>
+                {
+                    if let Some(completed_tid) = completed_turn_id(&params, thread_id) {
+                        if completed_tid == turn_id {
+                            return Ok(ObserveOutcome {
+                                turn_id: Some(turn_id),
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 
     fn active_turn_id(&mut self, thread_id: &str) -> Result<Option<String>> {

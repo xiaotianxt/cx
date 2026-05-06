@@ -98,6 +98,10 @@ impl ManagerPaths {
         self.service_dir().join("default.log")
     }
 
+    pub fn service_token_file(&self) -> PathBuf {
+        self.service_dir().join("tokens.json")
+    }
+
     pub fn service_launchd_plist_file(&self) -> Result<PathBuf> {
         Ok(home_dir()?.join("Library/LaunchAgents/dev.xiaotian.cx.service.plist"))
     }

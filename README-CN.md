@@ -309,7 +309,8 @@ adapter 最终都应该接入 cx，而不是直接拿 raw Codex app-server WebSo
 用一个 cx supervisor 后台运行 app-server 和 Telegram adapter：
 
 ```bash
-cx service start --telegram-token-op-ref 'op://Private/Telegram/codex_xiaotian_bot'
+secret-tool-read-telegram-token | cx service token set telegram
+cx service start
 cx service status
 cx service logs
 cx service stop
@@ -317,19 +318,21 @@ cx service stop
 
 `cx service start` 默认会启动 Telegram。它先启动 `cx serve start`，等待 app-server
 state 就绪，然后启动 `cx channel telegram run`。如果只想后台跑 app-server，用
-`--no-telegram`。token 不写入源码、state 或 log：可以用 `--telegram-bot-token-env`
-指定环境变量，也可以用 `--telegram-token-op-ref` 传 1Password 引用，supervisor 只会把
-读取到的 token 注入 Telegram 子进程。
+`--no-telegram`。token 先通过 `cx service token set telegram` provision 一次；cx 从
+stdin 读取 token，并用私有文件权限写到 `<profile-manager>/service/tokens.json`。运行命令和
+launchd plist 都不携带 token；supervisor 只把 token 注入 Telegram 子进程。临时运行时，已有的
+`TELEGRAM_BOT_TOKEN` 环境变量也可以直接使用。
 
 macOS 登录自启可以安装 launchd agent：
 
 ```bash
-cx service install --telegram-token-op-ref 'op://Private/Telegram/codex_xiaotian_bot' --start
+cx service install --start
 cx service uninstall
 ```
 
 service state 和 log 写在 `<profile-manager>/service/`。supervisor 会在子进程退出时重启；
-`cx service stop` 会停止 state 里记录的子进程和 supervisor。
+`cx service stop` 会停止 state 里记录的子进程和 supervisor。完整 private chat、group、
+forum topic 和 channel 测试流程见 [Telegram Service Test Plan](docs/telegram-service-test-plan.md)。
 
 ## Telegram Channel
 
@@ -341,7 +344,7 @@ export TELEGRAM_BOT_TOKEN=...
 cx serve start
 cx channel telegram run
 cx channel telegram run --acquire-lease
-cx service start --telegram-token-op-ref 'op://Private/Telegram/codex_xiaotian_bot'
+cx service start
 cx channel telegram bind
 cx channel telegram menu
 cx channel telegram status --json

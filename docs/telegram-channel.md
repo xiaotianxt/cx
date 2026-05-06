@@ -81,7 +81,8 @@ text back to Telegram. Long replies are split into Telegram-sized messages.
 To run both pieces under one background supervisor instead:
 
 ```bash
-cx service start --telegram-token-op-ref 'op://Private/Telegram/codex_xiaotian_bot'
+secret-tool-read-telegram-token | cx service token set telegram
+cx service start
 cx service status
 cx service logs
 cx service stop
@@ -89,10 +90,13 @@ cx service stop
 
 `cx service start` starts `cx serve start`, waits for app-server state, then
 starts `cx channel telegram run`. It defaults to Telegram; pass `--no-telegram`
-when only a background app-server is wanted. For login startup on macOS:
+when only a background app-server is wanted. `cx service token set telegram`
+reads the token from stdin and stores it with private file permissions; the
+start command and launchd plist do not carry the token. For login startup on
+macOS:
 
 ```bash
-cx service install --telegram-token-op-ref 'op://Private/Telegram/codex_xiaotian_bot' --start
+cx service install --start
 ```
 
 `run` and `bind` also synchronize the bot's Telegram command menu with:

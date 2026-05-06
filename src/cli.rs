@@ -8,6 +8,9 @@ use clap::ValueEnum;
 
 use crate::paths::ManagerPaths;
 
+mod service;
+pub use service::*;
+
 #[derive(Debug, Parser)]
 #[command(name = "cx")]
 #[command(about = "Fast local Codex launcher, stdin wrapper, and slot manager")]
@@ -396,15 +399,13 @@ mod tests {
     }
 
     #[test]
-    fn service_start_defaults_to_telegram_and_accepts_op_ref() {
+    fn service_start_defaults_to_telegram() {
         let cli = Cli::parse_from([
             "cx",
             "service",
             "start",
             "--target",
             "work",
-            "--telegram-token-op-ref",
-            "op://Private/Telegram/credential",
             "--allow-chat",
             "12345",
             "--acquire-lease",
@@ -418,10 +419,6 @@ mod tests {
         };
         assert_eq!(args.spec.target, Some(String::from("work")));
         assert!(!args.spec.no_telegram);
-        assert_eq!(
-            args.spec.telegram_token_op_ref,
-            Some(String::from("op://Private/Telegram/credential"))
-        );
         assert_eq!(args.spec.allow_chats, vec![12345]);
         assert!(args.spec.acquire_lease);
     }
@@ -447,6 +444,22 @@ mod tests {
         assert_eq!(args.wait_timeout, 0.5);
         assert!(args.force);
         assert!(args.json);
+    }
+
+    #[test]
+    fn service_token_set_reads_named_token_from_stdin() {
+        let cli = Cli::parse_from(["cx", "service", "token", "set", "telegram"]);
+
+        let Command::Service(args) = cli.command else {
+            panic!("expected service command");
+        };
+        let ServiceCommand::Token(args) = args.command else {
+            panic!("expected service token command");
+        };
+        let ServiceTokenCommand::Set(args) = args.command else {
+            panic!("expected service token set command");
+        };
+        assert_eq!(args.token, ServiceTokenName::Telegram);
     }
 
     #[test]
@@ -1121,160 +1134,6 @@ pub struct TelegramStatusArgs {
     /// Print JSON instead of human output.
     #[arg(long)]
     pub json: bool,
-}
-
-#[derive(Debug, Clone, Args)]
-pub struct ServiceArgs {
-    #[command(subcommand)]
-    pub command: ServiceCommand,
-}
-
-#[derive(Debug, Clone, Subcommand)]
-pub enum ServiceCommand {
-    /// Start the cx service supervisor in the background.
-    Start(ServiceStartArgs),
-    /// Run the cx service supervisor in the foreground.
-    #[command(hide = true)]
-    Run(ServiceRunArgs),
-    /// Stop the cx service supervisor and its children.
-    Stop(ServiceStopArgs),
-    /// Show cx service supervisor status.
-    Status(ServiceStatusArgs),
-    /// Print recent cx service logs.
-    Logs(ServiceLogsArgs),
-    /// Install a macOS launchd service.
-    Install(ServiceInstallArgs),
-    /// Remove the macOS launchd service.
-    Uninstall(ServiceUninstallArgs),
-}
-
-#[derive(Debug, Clone, Args)]
-pub struct ServiceStartArgs {
-    #[command(flatten)]
-    pub spec: ServiceSpecArgs,
-
-    /// Print JSON instead of human output.
-    #[arg(long)]
-    pub json: bool,
-}
-
-#[derive(Debug, Clone, Args)]
-pub struct ServiceRunArgs {
-    #[command(flatten)]
-    pub spec: ServiceSpecArgs,
-}
-
-#[derive(Debug, Clone, Args)]
-pub struct ServiceInstallArgs {
-    #[command(flatten)]
-    pub spec: ServiceSpecArgs,
-
-    /// Start the launchd service after installing it.
-    #[arg(long)]
-    pub start: bool,
-}
-
-#[derive(Debug, Clone, Args)]
-pub struct ServiceSpecArgs {
-    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
-    #[arg(long, value_hint = clap::ValueHint::DirPath)]
-    pub manager_dir: Option<PathBuf>,
-
-    /// Path to the real Codex binary.
-    #[arg(long, value_hint = clap::ValueHint::FilePath)]
-    pub codex_bin: Option<PathBuf>,
-
-    /// Force a specific slot instead of selecting from rotation or target.
-    #[arg(long)]
-    pub slot: Option<String>,
-
-    /// Target config from targets/<name>.toml.
-    #[arg(long)]
-    pub target: Option<String>,
-
-    /// WebSocket listen URL for Codex app-server. Only loopback ws:// URLs are accepted.
-    #[arg(long, default_value = "ws://127.0.0.1:0")]
-    pub listen: String,
-
-    /// Do not run the Telegram adapter.
-    #[arg(long)]
-    pub no_telegram: bool,
-
-    /// Environment variable containing the Telegram bot token.
-    #[arg(long, default_value = "TELEGRAM_BOT_TOKEN")]
-    pub telegram_bot_token_env: String,
-
-    /// 1Password secret reference for the Telegram bot token.
-    #[arg(long)]
-    pub telegram_token_op_ref: Option<String>,
-
-    /// Allowed Telegram chat id. Repeat for multiple chats.
-    #[arg(long = "allow-chat")]
-    pub allow_chats: Vec<i64>,
-
-    /// Acquire an active lease for incoming Telegram messages.
-    #[arg(long)]
-    pub acquire_lease: bool,
-
-    /// Steal an existing lease when acquiring for Telegram.
-    #[arg(long)]
-    pub steal: bool,
-
-    /// Log safe Telegram update summaries to the service log.
-    #[arg(long)]
-    pub log_updates: bool,
-
-    /// App-server WebSocket timeout in seconds for Telegram Codex turns.
-    #[arg(long, default_value_t = 600.0)]
-    pub app_server_timeout: f32,
-}
-
-#[derive(Debug, Clone, Args)]
-pub struct ServiceStopArgs {
-    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
-    #[arg(long, value_hint = clap::ValueHint::DirPath)]
-    pub manager_dir: Option<PathBuf>,
-
-    /// Seconds to wait for the service and child processes to exit.
-    #[arg(long, default_value_t = 10.0)]
-    pub wait_timeout: f32,
-
-    /// Send SIGKILL if graceful stop does not finish before --wait-timeout.
-    #[arg(long)]
-    pub force: bool,
-
-    /// Print JSON instead of human output.
-    #[arg(long)]
-    pub json: bool,
-}
-
-#[derive(Debug, Clone, Args)]
-pub struct ServiceStatusArgs {
-    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
-    #[arg(long, value_hint = clap::ValueHint::DirPath)]
-    pub manager_dir: Option<PathBuf>,
-
-    /// Print JSON instead of human output.
-    #[arg(long)]
-    pub json: bool,
-}
-
-#[derive(Debug, Clone, Args)]
-pub struct ServiceLogsArgs {
-    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
-    #[arg(long, value_hint = clap::ValueHint::DirPath)]
-    pub manager_dir: Option<PathBuf>,
-
-    /// Number of recent log lines to print.
-    #[arg(long, default_value_t = 80)]
-    pub lines: usize,
-}
-
-#[derive(Debug, Clone, Args)]
-pub struct ServiceUninstallArgs {
-    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
-    #[arg(long, value_hint = clap::ValueHint::DirPath)]
-    pub manager_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Args)]

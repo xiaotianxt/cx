@@ -338,7 +338,8 @@ leases, approval routing, and audit state.
 Run the app-server and Telegram adapter under one cx-owned supervisor:
 
 ```bash
-cx service start --telegram-token-op-ref 'op://Private/Telegram/codex_xiaotian_bot'
+secret-tool-read-telegram-token | cx service token set telegram
+cx service start
 cx service status
 cx service logs
 cx service stop
@@ -346,22 +347,25 @@ cx service stop
 
 `cx service start` defaults to Telegram. It starts `cx serve start`, waits for
 the app-server state, then starts `cx channel telegram run`. Use `--no-telegram`
-when only the background app-server is wanted. Token handling stays out of
-source control and logs: pass a normal token environment variable with
-`--telegram-bot-token-env`, or pass a 1Password reference with
-`--telegram-token-op-ref` and the supervisor will inject the token only into the
-Telegram child process.
+when only the background app-server is wanted. Token handling is provisioned
+once with `cx service token set telegram`, which reads the token from stdin and
+stores it under `<profile-manager>/service/tokens.json` with private file
+permissions. Runtime commands and launchd plists do not carry the token; the
+supervisor injects it only into the Telegram child process. For ad-hoc runs, an
+existing `TELEGRAM_BOT_TOKEN` environment variable is also accepted.
 
 For login startup on macOS, install a launchd agent:
 
 ```bash
-cx service install --telegram-token-op-ref 'op://Private/Telegram/codex_xiaotian_bot' --start
+cx service install --start
 cx service uninstall
 ```
 
 The service writes state and logs under `<profile-manager>/service/`. The
 supervisor restarts child processes if they exit; `cx service stop` stops the
-recorded children and then the supervisor.
+recorded children and then the supervisor. See
+[Telegram Service Test Plan](docs/telegram-service-test-plan.md) for the
+end-to-end private chat, group, forum topic, and channel test flow.
 
 ## Telegram Channel
 
@@ -373,7 +377,7 @@ export TELEGRAM_BOT_TOKEN=...
 cx serve start
 cx channel telegram run
 cx channel telegram run --acquire-lease
-cx service start --telegram-token-op-ref 'op://Private/Telegram/codex_xiaotian_bot'
+cx service start
 cx channel telegram bind
 cx channel telegram menu
 cx channel telegram status --json

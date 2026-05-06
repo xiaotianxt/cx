@@ -26,10 +26,14 @@ use crate::cli::ServiceSpecArgs;
 use crate::cli::ServiceStartArgs;
 use crate::cli::ServiceStatusArgs;
 use crate::cli::ServiceStopArgs;
+use crate::cli::ServiceTokenArgs;
+use crate::cli::ServiceTokenCommand;
+use crate::cli::ServiceTokenName;
 use crate::cli::ServiceUninstallArgs;
 use crate::paths::ManagerPaths;
 
 const SERVICE_STATE_SCHEMA_VERSION: u64 = 1;
+const SERVICE_TOKEN_SCHEMA_VERSION: u64 = 1;
 const LAUNCHD_LABEL: &str = "dev.xiaotian.cx.service";
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -51,6 +55,20 @@ struct ServiceChildState {
     restarts: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_exit: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ServiceTokenFile {
+    schema_version: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    telegram: Option<StoredToken>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredToken {
+    token: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -83,6 +101,14 @@ struct ServiceStopReport {
     forced: bool,
     state_file: String,
     service: Option<ServiceStateFile>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ServiceTokenStatusReport {
+    schema_version: u64,
+    configured: bool,
+    token_file: String,
 }
 
 struct ManagedChild {
@@ -293,6 +319,62 @@ pub fn logs(args: ServiceLogsArgs) -> Result<()> {
     Ok(())
 }
 
+pub fn token(args: ServiceTokenArgs) -> Result<()> {
+    match args.command {
+        ServiceTokenCommand::Set(args) => {
+            let paths = ManagerPaths::new(args.manager_dir)?;
+            let token = read_secret_from_stdin()?;
+            let mut token_file = ServiceTokenFile {
+                schema_version: SERVICE_TOKEN_SCHEMA_VERSION,
+                telegram: None,
+            };
+            match args.token {
+                ServiceTokenName::Telegram => {
+                    token_file.telegram = Some(StoredToken { token });
+                }
+            }
+            write_token_file(&paths, &token_file)?;
+            println!(
+                "configured service token: {}",
+                paths.service_token_file().display()
+            );
+            Ok(())
+        }
+        ServiceTokenCommand::Status(args) => {
+            let paths = ManagerPaths::new(args.manager_dir)?;
+            let token = read_token_file_if_exists(&paths.service_token_file())?;
+            let report = ServiceTokenStatusReport {
+                schema_version: SERVICE_TOKEN_SCHEMA_VERSION,
+                configured: token.as_ref().is_some_and(|token| token.telegram.is_some()),
+                token_file: paths.service_token_file().display().to_string(),
+            };
+            print_token_status(report, args.json)
+        }
+        ServiceTokenCommand::Delete(args) => {
+            let paths = ManagerPaths::new(args.manager_dir)?;
+            let Some(mut token_file) = read_token_file_if_exists(&paths.service_token_file())?
+            else {
+                println!(
+                    "service token not configured: {}",
+                    paths.service_token_file().display()
+                );
+                return Ok(());
+            };
+            match args.token {
+                ServiceTokenName::Telegram => {
+                    token_file.telegram = None;
+                }
+            }
+            write_token_file(&paths, &token_file)?;
+            println!(
+                "removed service token: {}",
+                paths.service_token_file().display()
+            );
+            Ok(())
+        }
+    }
+}
+
 pub fn install(args: ServiceInstallArgs) -> Result<()> {
     let paths = ManagerPaths::new(args.spec.manager_dir.clone())?;
     fs::create_dir_all(paths.service_dir())
@@ -337,14 +419,6 @@ fn validate_spec(spec: &ServiceSpecArgs) -> Result<()> {
     if spec.no_telegram {
         return Ok(());
     }
-    if spec.telegram_token_op_ref.is_none()
-        && std::env::var_os(&spec.telegram_bot_token_env).is_none()
-    {
-        anyhow::bail!(
-            "{} is not set; pass --telegram-token-op-ref or use --no-telegram",
-            spec.telegram_bot_token_env
-        );
-    }
     Ok(())
 }
 
@@ -380,7 +454,7 @@ fn start_telegram_child(spec: &ServiceSpecArgs, paths: &ManagerPaths) -> Result<
     if spec.log_updates {
         command.arg("--log-updates");
     }
-    if let Some(token) = telegram_token(spec)? {
+    if let Some(token) = telegram_token(spec, paths)? {
         command.env(&spec.telegram_bot_token_env, token);
     }
     spawn_managed("telegram", command, paths)
@@ -413,26 +487,21 @@ fn spawn_managed(
     })
 }
 
-fn telegram_token(spec: &ServiceSpecArgs) -> Result<Option<String>> {
-    if let Some(reference) = &spec.telegram_token_op_ref {
-        let output = Command::new("op")
-            .arg("read")
-            .arg(reference)
-            .output()
-            .context("read Telegram token from 1Password")?;
-        if !output.status.success() {
-            anyhow::bail!("op read failed for Telegram token reference");
-        }
-        let token = String::from_utf8(output.stdout)
-            .context("Telegram token from 1Password is not UTF-8")?
-            .trim()
-            .to_string();
-        if token.is_empty() {
-            anyhow::bail!("Telegram token from 1Password is empty");
-        }
-        return Ok(Some(token));
+fn telegram_token(spec: &ServiceSpecArgs, paths: &ManagerPaths) -> Result<Option<String>> {
+    if std::env::var_os(&spec.telegram_bot_token_env).is_some() {
+        return Ok(None);
     }
-    Ok(None)
+    let token_file = read_token_file_if_exists(&paths.service_token_file())?.with_context(|| {
+        format!(
+            "{} is not set and no service token is configured; pipe the token into `cx service token set telegram` or use --no-telegram",
+            spec.telegram_bot_token_env
+        )
+    })?;
+    let token = token_file
+        .telegram
+        .with_context(|| "Telegram service token is not configured")?
+        .token;
+    Ok(Some(token))
 }
 
 fn service_state(
@@ -539,6 +608,75 @@ fn read_state_if_exists(path: &Path) -> Result<Option<ServiceStateFile>> {
     }
 }
 
+fn write_token_file(paths: &ManagerPaths, token: &ServiceTokenFile) -> Result<()> {
+    fs::create_dir_all(paths.service_dir())
+        .with_context(|| format!("create {}", paths.service_dir().display()))?;
+    set_private_dir_permissions(&paths.service_dir())?;
+    let tmp_path = paths.service_dir().join("tokens.json.tmp");
+    let content = serde_json::to_vec_pretty(token).context("serialize service token")?;
+    {
+        let mut file = private_open_for_write(&tmp_path)?;
+        file.write_all(&content)
+            .with_context(|| format!("write {}", tmp_path.display()))?;
+    }
+    fs::rename(&tmp_path, paths.service_token_file())
+        .with_context(|| format!("rename {}", paths.service_token_file().display()))?;
+    Ok(())
+}
+
+fn read_token_file_if_exists(path: &Path) -> Result<Option<ServiceTokenFile>> {
+    match fs::read_to_string(path) {
+        Ok(content) => {
+            let token = serde_json::from_str::<ServiceTokenFile>(&content)
+                .with_context(|| format!("parse {}", path.display()))?;
+            if token.schema_version != SERVICE_TOKEN_SCHEMA_VERSION {
+                anyhow::bail!(
+                    "unsupported service token schema version: {}",
+                    token.schema_version
+                );
+            }
+            Ok(Some(token))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("read {}", path.display())),
+    }
+}
+
+fn read_secret_from_stdin() -> Result<String> {
+    let mut input = String::new();
+    std::io::stdin()
+        .read_to_string(&mut input)
+        .context("read token from stdin")?;
+    let token = input.trim().to_string();
+    if token.is_empty() {
+        anyhow::bail!("token stdin is empty");
+    }
+    Ok(token)
+}
+
+fn private_open_for_write(path: &Path) -> Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))
+}
+
+fn set_private_dir_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("set permissions on {}", path.display()))?;
+    }
+    Ok(())
+}
+
 fn print_start(report: ServiceStartReport, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -550,6 +688,23 @@ fn print_start(report: ServiceStartReport, json: bool) -> Result<()> {
     if let Some(service) = report.service {
         print_service_state(service);
     }
+    Ok(())
+}
+
+fn print_token_status(report: ServiceTokenStatusReport, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    println!(
+        "cx service token: {}",
+        if report.configured {
+            "configured"
+        } else {
+            "missing"
+        }
+    );
+    println!("token_file: {}", report.token_file);
     Ok(())
 }
 
@@ -650,11 +805,6 @@ fn append_spec_args(command: &mut Command, spec: &ServiceSpecArgs) {
         .arg(&spec.telegram_bot_token_env)
         .arg("--app-server-timeout")
         .arg(spec.app_server_timeout.to_string());
-    append_string_arg(
-        command,
-        "--telegram-token-op-ref",
-        spec.telegram_token_op_ref.as_ref(),
-    );
     for chat in &spec.allow_chats {
         command.arg("--allow-chat").arg(chat.to_string());
     }
@@ -683,11 +833,6 @@ fn append_spec_argv(argv: &mut Vec<String>, spec: &ServiceSpecArgs) {
     argv.push(spec.telegram_bot_token_env.clone());
     argv.push(String::from("--app-server-timeout"));
     argv.push(spec.app_server_timeout.to_string());
-    append_string_argv(
-        argv,
-        "--telegram-token-op-ref",
-        spec.telegram_token_op_ref.as_ref(),
-    );
     for chat in &spec.allow_chats {
         argv.push(String::from("--allow-chat"));
         argv.push(chat.to_string());
@@ -901,14 +1046,14 @@ mod tests {
                 String::from("/tmp/cx"),
                 String::from("service"),
                 String::from("run"),
-                String::from("--telegram-token-op-ref"),
-                String::from("op://Private/A&B/credential"),
+                String::from("--target"),
+                String::from("A&B"),
             ],
             Path::new("/tmp/cx.log"),
             Path::new("/tmp/cx.err"),
         );
 
-        assert!(plist.contains("op://Private/A&amp;B/credential"));
+        assert!(plist.contains("<string>A&amp;B</string>"));
         assert!(plist.contains("<string>dev.xiaotian.cx.service</string>"));
     }
 

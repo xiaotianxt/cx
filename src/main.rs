@@ -142,6 +142,7 @@ fn entry() -> Result<()> {
             ServiceCommand::Stop(args) => service::stop(args)?,
             ServiceCommand::Status(args) => service::status(args)?,
             ServiceCommand::Logs(args) => service::logs(args)?,
+            ServiceCommand::Token(args) => service::token(args)?,
             ServiceCommand::Install(args) => service::install(args)?,
             ServiceCommand::Uninstall(args) => service::uninstall(args)?,
         },

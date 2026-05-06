@@ -145,6 +145,12 @@ telegram:<chat_id>:topic:<message_thread_id>:session:<alias>
 Private chats normally use one default route. Telegram forum groups get one
 route per topic because Telegram includes `message_thread_id` on topic messages.
 That gives each topic an independent cx session and Codex app-server thread.
+Binding the chat-level group route also trusts topic routes inside that group,
+so one group bind is enough before creating per-topic sessions.
+The bot API can create topics only inside an existing forum supergroup where
+the bot is an administrator with topic-management permission; it cannot create
+the supergroup itself. Create the forum group in Telegram first, enable Topics,
+add the bot, then bind the group or a topic with `/bind <secret>`.
 
 Inside any route, use named sessions for parallel work:
 
@@ -175,6 +181,19 @@ cx channel telegram bind
 
 `bind` prints a fresh `/bind <secret>`, waits for the first matching Telegram
 chat, records it as trusted, then exits.
+
+## Interaction Feedback
+
+For every trusted incoming message, the adapter immediately tries to add a
+`eyes` reaction to the original Telegram message. Reaction failures are logged
+but do not fail the turn because Telegram can reject reactions depending on chat
+permissions or message type.
+
+While a normal text message is being processed by Codex, the adapter sends
+Telegram `typing` chat actions in the same private chat, group, channel, or
+forum topic. Assistant deltas from the Codex app-server are flushed back to the
+same route in small chunks as they arrive; the final answer is not sent again
+when streaming chunks were already delivered.
 
 Use a custom token environment variable:
 

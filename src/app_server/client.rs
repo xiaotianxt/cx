@@ -156,11 +156,15 @@ impl AppServerClient {
         })
     }
 
-    pub(crate) fn turn_start_collect(
+    pub(crate) fn turn_start_stream<F>(
         &mut self,
         thread_id: &str,
         prompt: String,
-    ) -> Result<StartedTurn> {
+        mut on_delta: F,
+    ) -> Result<StartedTurn>
+    where
+        F: FnMut(&str) -> Result<()>,
+    {
         let request_id = self.send_request(
             "turn/start",
             protocol::TurnStartParams {
@@ -171,7 +175,7 @@ impl AppServerClient {
                 }],
             },
         )?;
-        self.collect_turn_start(request_id, thread_id)
+        self.collect_turn_start(request_id, thread_id, &mut on_delta)
     }
 
     fn request<P>(&mut self, method: &'static str, params: P) -> Result<Value>
@@ -230,7 +234,15 @@ impl AppServerClient {
         }
     }
 
-    fn collect_turn_start(&mut self, request_id: u64, thread_id: &str) -> Result<StartedTurn> {
+    fn collect_turn_start<F>(
+        &mut self,
+        request_id: u64,
+        thread_id: &str,
+        on_delta: &mut F,
+    ) -> Result<StartedTurn>
+    where
+        F: FnMut(&str) -> Result<()>,
+    {
         let mut turn_id = None::<String>;
         let mut assistant_text = String::new();
         let mut completed = false;
@@ -267,6 +279,7 @@ impl AppServerClient {
                             notification_delta(&params, thread_id, turn_id.as_deref())
                         {
                             assistant_text.push_str(delta);
+                            on_delta(delta)?;
                         }
                     } else if method == "turn/completed" {
                         if let Some(completed_turn_id) = completed_turn_id(&params, thread_id) {

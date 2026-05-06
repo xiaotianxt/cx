@@ -63,11 +63,14 @@ Expected:
 ## Forum Group Topics
 
 1. Add the bot to a Telegram forum group.
-2. In topic A, send `/new topic-a`.
-3. In topic B, send `/new topic-b`.
-4. Send ordinary text in each topic.
-5. Send `/status` in each topic.
-6. Send `/sessions` from either topic.
+2. If the group is not trusted yet, run `cx channel telegram bind` and send the
+   printed `/bind <secret>` in the group. A chat-level group bind trusts routes
+   for that group's topics.
+3. In topic A, send `/new topic-a`.
+4. In topic B, send `/new topic-b`.
+5. Send ordinary text in each topic.
+6. Send `/status` in each topic.
+7. Send `/sessions` from either topic.
 
 Expected:
 
@@ -76,6 +79,16 @@ Expected:
 - Replies stay in the originating topic.
 - `/status` in each topic shows that topic's active session.
 - `/sessions` lists Telegram-bound sessions for the group chat.
+- Trusted messages receive an `eyes` reaction when Telegram permissions allow
+  bot reactions.
+- During Codex turns, Telegram shows the bot as typing in the originating topic.
+- Long assistant replies arrive as incremental chunks in the originating topic.
+
+Notes:
+
+- The bot cannot create the forum supergroup itself through Bot API. Create a
+  supergroup in Telegram, enable Topics, add the bot, and grant topic-management
+  permission if you want the bot to create or manage topics later.
 
 ## Multiple Named Sessions
 

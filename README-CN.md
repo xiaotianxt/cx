@@ -178,9 +178,11 @@ cx desktop --target research
 
 `cx desktop` 会直接启动 Desktop 可执行文件，并把 `CODEX_HOME` 设为选中的 slot home；
 这样 Desktop 内部 app-server 会读取这个 slot 的 `auth.json` 和账号状态。slot 的
-`env.conf` 会注入到 Desktop 进程；`overrides.conf` 不会传给 Electron。切换 slot 前请先退出
-已经运行的 Codex Desktop，确保新进程能带着预期环境启动。如果 Desktop 安装在其他位置，
-可以用 `--app-bin` 或 `CX_CODEX_DESKTOP_BIN` 指定。
+`env.conf` 会注入到 Desktop 进程；`overrides.conf` 不会传给 Electron。默认情况下，
+如果已经有 Codex Desktop 进程在运行，`cx desktop` 会拒绝继续启动，因为第二次启动可能复用
+旧 Electron 实例，导致新的 slot 环境没有生效。切换 slot 前请先退出 Codex Desktop；如果你
+明确要测试并行实例，可以传 `--allow-parallel`。如果 Desktop 安装在其他位置，可以用
+`--app-bin` 或 `CX_CODEX_DESKTOP_BIN` 指定。
 
 从当前 `~/.codex` 复制登录态：
 

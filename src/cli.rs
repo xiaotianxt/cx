@@ -311,6 +311,7 @@ mod tests {
             "--app-bin",
             "/Applications/Codex.app",
             "--wait",
+            "--allow-parallel",
             "--",
             "--enable-logging",
         ]);
@@ -322,6 +323,7 @@ mod tests {
         assert_eq!(args.target, Some(String::from("work")));
         assert_eq!(args.app_bin, Some(PathBuf::from("/Applications/Codex.app")));
         assert!(args.wait);
+        assert!(args.allow_parallel);
         assert_eq!(args.args, vec![String::from("--enable-logging")]);
     }
 
@@ -490,6 +492,10 @@ pub struct DesktopArgs {
     /// Wait for Codex Desktop to exit instead of returning after launch.
     #[arg(long)]
     pub wait: bool,
+
+    /// Launch even when another Codex Desktop process is already running.
+    #[arg(long)]
+    pub allow_parallel: bool,
 
     /// Extra args forwarded to the Codex Desktop executable.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]

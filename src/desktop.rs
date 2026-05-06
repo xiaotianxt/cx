@@ -46,6 +46,8 @@ impl DesktopLaunchSpec {
 }
 
 pub fn launch(args: DesktopArgs) -> Result<()> {
+    ensure_desktop_not_running(args.allow_parallel)?;
+
     let paths = ManagerPaths::new(args.manager_dir.clone())?;
     let runtime = run::select_runtime(
         &paths,
@@ -88,6 +90,81 @@ pub fn launch(args: DesktopArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn ensure_desktop_not_running(allow_parallel: bool) -> Result<()> {
+    ensure_no_running_desktop(allow_parallel, running_desktop_process()?)
+}
+
+fn ensure_no_running_desktop(allow_parallel: bool, running: Option<RunningDesktop>) -> Result<()> {
+    if allow_parallel {
+        return Ok(());
+    }
+
+    let Some(running) = running else {
+        return Ok(());
+    };
+
+    anyhow::bail!(
+        "Codex Desktop is already running ({}). Quit it before running `cx desktop`, or pass --allow-parallel to bypass this guard.",
+        running.display()
+    );
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunningDesktop {
+    pids: Vec<u32>,
+}
+
+impl RunningDesktop {
+    fn display(&self) -> String {
+        match self.pids.as_slice() {
+            [] => "pid unknown".to_string(),
+            [pid] => format!("pid {pid}"),
+            pids => format!(
+                "pids {}",
+                pids.iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn running_desktop_process() -> Result<Option<RunningDesktop>> {
+    let output = Command::new("/usr/bin/pgrep")
+        .args(["-x", "Codex"])
+        .output()
+        .context("check for running Codex Desktop")?;
+
+    if output.status.success() {
+        return Ok(Some(RunningDesktop {
+            pids: parse_pgrep_pids(&output.stdout),
+        }));
+    }
+    if output.status.code() == Some(1) {
+        return Ok(None);
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.is_empty() {
+        anyhow::bail!("failed to check for running Codex Desktop");
+    }
+    anyhow::bail!("failed to check for running Codex Desktop: {stderr}");
+}
+
+#[cfg(not(target_os = "macos"))]
+fn running_desktop_process() -> Result<Option<RunningDesktop>> {
+    Ok(None)
+}
+
+fn parse_pgrep_pids(stdout: &[u8]) -> Vec<u32> {
+    String::from_utf8_lossy(stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .collect()
 }
 
 fn resolve_desktop_bin(override_path: Option<&Path>) -> Result<PathBuf> {
@@ -167,6 +244,37 @@ mod tests {
             normalize_desktop_bin(PathBuf::from("/Applications/Codex.app")),
             PathBuf::from("/Applications/Codex.app/Contents/MacOS/Codex")
         );
+    }
+
+    #[test]
+    fn running_desktop_guard_blocks_by_default() {
+        let err = ensure_no_running_desktop(
+            false,
+            Some(RunningDesktop {
+                pids: vec![123, 456],
+            }),
+        )
+        .unwrap_err();
+
+        let message = format!("{err:#}");
+        assert!(message.contains("Codex Desktop is already running"));
+        assert!(message.contains("--allow-parallel"));
+    }
+
+    #[test]
+    fn running_desktop_guard_allows_explicit_parallel_launch() {
+        ensure_no_running_desktop(
+            true,
+            Some(RunningDesktop {
+                pids: vec![123, 456],
+            }),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn pgrep_pid_parser_ignores_non_pid_lines() {
+        assert_eq!(parse_pgrep_pids(b"123\nnot-a-pid\n456\n"), vec![123, 456]);
     }
 
     #[test]

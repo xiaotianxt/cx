@@ -5,6 +5,7 @@ mod cli;
 mod completion;
 mod control;
 mod cx;
+mod desktop;
 mod envfile;
 mod install;
 mod output;
@@ -105,6 +106,9 @@ fn entry() -> Result<()> {
             let paths = paths::ManagerPaths::new(args.manager_dir.clone())?;
             slot::ensure_slot_layout(&paths, &args.slot)?;
             run::exec_slot_login(&paths, args)?;
+        }
+        Command::Desktop(args) => {
+            desktop::launch(args)?;
         }
         Command::Serve(args) => match args.command {
             ServeCommand::Daemon(args) => control::daemon(args)?,

@@ -11,6 +11,7 @@ cx 是一个本地 Codex 入口：负责启动 Codex、处理 stdin pipe、管�
 - `cx status`：并发查看所有 slot 的真实用量。
 - `cx stats`：从本地 `state_5.sqlite` 汇总 Codex token 消耗。
 - `cx add` / `cx login` / `cx remove`：管理独立 slot。
+- `cx desktop`：通过选中的 slot 启动 Codex Desktop。
 - `cx --target <name>`：使用命名 target 的 slot 组和覆盖策略启动 Codex。
 - `cx serve start` / `cx serve stop`：通过选中的 slot 管理前台 loopback Codex
   app-server。
@@ -166,6 +167,20 @@ cx 自己拥有的 `price-cache.json` 和 `stats-calibration.json` 都带 `schem
 cx add bus6 --rotate
 cx login bus6
 ```
+
+用同一套 slot 隔离启动 Codex Desktop：
+
+```bash
+cx desktop
+cx desktop --slot bus6
+cx desktop --target research
+```
+
+`cx desktop` 会直接启动 Desktop 可执行文件，并把 `CODEX_HOME` 设为选中的 slot home；
+这样 Desktop 内部 app-server 会读取这个 slot 的 `auth.json` 和账号状态。slot 的
+`env.conf` 会注入到 Desktop 进程；`overrides.conf` 不会传给 Electron。切换 slot 前请先退出
+已经运行的 Codex Desktop，确保新进程能带着预期环境启动。如果 Desktop 安装在其他位置，
+可以用 `--app-bin` 或 `CX_CODEX_DESKTOP_BIN` 指定。
 
 从当前 `~/.codex` 复制登录态：
 

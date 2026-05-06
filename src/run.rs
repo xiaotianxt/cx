@@ -169,7 +169,7 @@ pub(crate) fn select_runtime(
         slot::load_rotation(paths)?
     };
     if candidates.is_empty() {
-        anyhow::bail!("no configured slots for serve");
+        anyhow::bail!("no configured slots");
     }
 
     let results = selector::query_slots(paths, &candidates, usage_timeout())?;

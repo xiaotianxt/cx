@@ -15,6 +15,7 @@ live usage.
 - `cx stats`: summarize local Codex token usage from `state_5.sqlite`.
 - `cx add` / `cx login` / `cx remove`: manage isolated Codex slots.
 - `cx select`: print the best slot name for scripts.
+- `cx desktop`: launch Codex Desktop through a selected slot.
 - `cx --target <name>`: launch through a named target-specific slot group and
   override set.
 - `cx serve start` / `cx serve stop`: manage a foreground loopback Codex
@@ -184,6 +185,22 @@ Create and authenticate a slot:
 cx add bus6 --rotate
 cx login bus6
 ```
+
+Launch Codex Desktop with the same slot isolation:
+
+```bash
+cx desktop
+cx desktop --slot bus6
+cx desktop --target research
+```
+
+`cx desktop` starts the Desktop executable directly with `CODEX_HOME` set to the
+selected slot home, so the Desktop app-server reads that slot's `auth.json` and
+account state. `env.conf` values are passed to the Desktop process; slot
+`overrides.conf` values are not forwarded to Electron. Quit an already-running
+Codex Desktop before switching slots so the new process starts with the intended
+environment. If Codex Desktop is installed somewhere else, use `--app-bin` or
+`CX_CODEX_DESKTOP_BIN`.
 
 Copy the current `~/.codex` auth state into a slot:
 

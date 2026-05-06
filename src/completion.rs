@@ -501,6 +501,7 @@ fn value_candidates_for_arg(
     }
     if let Some(long) = arg.get_long() {
         let completion = match long {
+            "slot" => Some(ValueCompletion::Dynamic(DynamicKind::Slots)),
             "target" => Some(ValueCompletion::Dynamic(DynamicKind::Targets)),
             _ => None,
         };

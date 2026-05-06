@@ -36,6 +36,8 @@ pub enum Command {
     Remove(RemoveArgs),
     /// Run `codex login` inside a slot.
     Login(LoginArgs),
+    /// Launch Codex Desktop through a selected slot.
+    Desktop(DesktopArgs),
     /// Start and manage a local Codex app-server.
     Serve(ServeArgs),
     /// Inspect and export Codex App Server protocol bindings.
@@ -298,6 +300,32 @@ mod tests {
     }
 
     #[test]
+    fn desktop_accepts_slot_target_app_bin_wait_and_app_args() {
+        let cli = Cli::parse_from([
+            "cx",
+            "desktop",
+            "--slot",
+            "bus1",
+            "--target",
+            "work",
+            "--app-bin",
+            "/Applications/Codex.app",
+            "--wait",
+            "--",
+            "--enable-logging",
+        ]);
+
+        let Command::Desktop(args) = cli.command else {
+            panic!("expected desktop command");
+        };
+        assert_eq!(args.slot, Some(String::from("bus1")));
+        assert_eq!(args.target, Some(String::from("work")));
+        assert_eq!(args.app_bin, Some(PathBuf::from("/Applications/Codex.app")));
+        assert!(args.wait);
+        assert_eq!(args.args, vec![String::from("--enable-logging")]);
+    }
+
+    #[test]
     fn serve_session_create_accepts_id_channel_and_json() {
         let cli = Cli::parse_from([
             "cx",
@@ -433,6 +461,37 @@ pub struct LoginArgs {
     pub slot: String,
 
     /// Extra args forwarded to `codex login`.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct DesktopArgs {
+    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
+    pub manager_dir: Option<PathBuf>,
+
+    /// Path to the Codex Desktop executable or .app bundle.
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
+    pub app_bin: Option<PathBuf>,
+
+    /// Force a specific slot instead of selecting from rotation or target.
+    #[arg(long)]
+    pub slot: Option<String>,
+
+    /// Target config from targets/<name>.toml.
+    #[arg(long)]
+    pub target: Option<String>,
+
+    /// Print slot selection details before launch.
+    #[arg(long)]
+    pub cx_debug: bool,
+
+    /// Wait for Codex Desktop to exit instead of returning after launch.
+    #[arg(long)]
+    pub wait: bool,
+
+    /// Extra args forwarded to the Codex Desktop executable.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub args: Vec<String>,
 }

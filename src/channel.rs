@@ -1991,12 +1991,10 @@ pub mod telegram {
                 elapsed_ms(list_start)
             );
         }
-        let mut entries = filter_portal_entries(
+        Ok(filter_portal_entries(
             page.threads.into_iter().map(AppThreadPortalEntry::from),
             limit,
-        );
-        mark_active_rollout_entries(paths, &mut entries);
-        Ok(entries)
+        ))
     }
 
     fn filter_portal_entries<I>(entries: I, limit: u64) -> Vec<AppThreadPortalEntry>
@@ -2008,15 +2006,6 @@ pub mod telegram {
             .filter(|entry| !is_local_watch_regression_entry(entry))
             .take(limit as usize)
             .collect()
-    }
-
-    fn mark_active_rollout_entries(paths: &ManagerPaths, entries: &mut [AppThreadPortalEntry]) {
-        for entry in entries {
-            if !entry.active && rollout_has_active_turn(paths, &entry.thread_id) {
-                entry.watchable = true;
-                entry.status = String::from("active-tui");
-            }
-        }
     }
 
     #[cfg(test)]
@@ -3192,16 +3181,6 @@ pub mod telegram {
             text.push_str(&compact_history_message(&item.message));
         }
         Ok(Some(text))
-    }
-
-    fn rollout_has_active_turn(paths: &ManagerPaths, thread_id: &str) -> bool {
-        let Some(path) = rollout_path_for_thread(paths, thread_id) else {
-            return false;
-        };
-        if !path.exists() {
-            return false;
-        }
-        latest_active_rollout_turn(&path).ok().flatten().is_some()
     }
 
     fn rollout_history_item(line: &str) -> Option<RolloutHistoryItem> {

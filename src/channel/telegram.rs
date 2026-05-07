@@ -2982,13 +2982,43 @@ fn rollout_exec_command_end(value: &Value) -> Option<CommandExecution> {
 
 fn rollout_command_activity(value: &Value) -> Option<CommandActivity> {
     let parsed = value.get("parsed_cmd")?.as_array()?;
-    let first = parsed.first()?;
-    let command_type = first.get("type").and_then(Value::as_str)?;
-    let verb = match command_type {
+    let mut verb = None::<&'static str>;
+    let mut targets = Vec::<String>::new();
+    for item in parsed {
+        let item_verb = item
+            .get("type")
+            .and_then(Value::as_str)
+            .map(command_activity_verb)
+            .unwrap_or("Run");
+        verb = match verb {
+            Some(existing) if existing == item_verb => Some(existing),
+            Some(_) => Some("Run"),
+            None => Some(item_verb),
+        };
+        if let Some(target) = parsed_command_target(item) {
+            if !targets.iter().any(|existing| existing == &target) {
+                targets.push(target);
+            }
+        }
+    }
+    let verb = verb?;
+    let target = if targets.is_empty() {
+        "<unknown>".to_string()
+    } else {
+        targets.join(", ")
+    };
+    Some(CommandActivity {
+        verb: verb.to_string(),
+        target,
+    })
+}
+
+fn command_activity_verb(command_type: &str) -> &'static str {
+    match command_type {
         "read" => "Read",
         "write" | "edit" | "patch" => "Write",
         "search" => "Search",
-        "list" => "List",
+        "list" | "list_files" => "List",
         "delete" | "remove" => "Delete",
         "move" | "rename" => "Move",
         "copy" => "Copy",
@@ -2997,24 +3027,26 @@ fn rollout_command_activity(value: &Value) -> Option<CommandActivity> {
         "build" => "Build",
         "lint" => "Lint",
         _ => "Run",
-    };
-    let target = first
-        .get("name")
+    }
+}
+
+fn parsed_command_target(item: &Value) -> Option<String> {
+    item.get("name")
         .and_then(Value::as_str)
         .filter(|name| !name.trim().is_empty())
+        .map(str::to_string)
         .or_else(|| {
-            first
-                .get("path")
+            item.get("path")
                 .and_then(Value::as_str)
                 .and_then(command_path_label)
+                .map(str::to_string)
         })
-        .or_else(|| first.get("cmd").and_then(Value::as_str))
-        .unwrap_or("<unknown>")
-        .to_string();
-    Some(CommandActivity {
-        verb: verb.to_string(),
-        target,
-    })
+        .or_else(|| {
+            item.get("cmd")
+                .and_then(Value::as_str)
+                .filter(|cmd| !cmd.trim().is_empty())
+                .map(str::to_string)
+        })
 }
 
 fn command_path_label(path: &str) -> Option<&str> {
@@ -6601,6 +6633,32 @@ mod tests {
                     status: CommandExecutionStatus::Completed,
                     exit_code: Some(0),
                     duration_ms: Some(1250),
+                    aggregated_output: None,
+                })
+            ))
+        );
+    }
+
+    #[test]
+    fn rollout_command_activity_summarizes_multiple_parsed_commands() {
+        let completed = rollout_observe_event(
+            r#"{"type":"event_msg","payload":{"type":"exec_command_end","call_id":"call-1","turn_id":"turn-1","command":["/bin/zsh","-lc","sed -n '1,80p' wiley.py && sed -n '1,60p' science.py && sed -n '1,60p' pnas.py"],"cwd":"/tmp","parsed_cmd":[{"type":"read","cmd":"sed -n '1,80p' wiley.py","name":"wiley.py","path":"/tmp/wiley.py"},{"type":"read","cmd":"sed -n '1,60p' science.py","name":"science.py","path":"/tmp/science.py"},{"type":"read","cmd":"sed -n '1,60p' pnas.py","name":"pnas.py","path":"/tmp/pnas.py"}],"exit_code":0,"duration":{"secs":0,"nanos":0},"status":"completed"}}"#,
+        );
+
+        assert_eq!(
+            completed,
+            Some(RolloutObserveEvent::Stream(
+                AppStreamEvent::CommandCompleted(CommandExecution {
+                    item_id: "call-1".to_string(),
+                    command: "sed -n '1,80p' wiley.py && sed -n '1,60p' science.py && sed -n '1,60p' pnas.py".to_string(),
+                    cwd: "/tmp".to_string(),
+                    activity: Some(CommandActivity {
+                        verb: "Read".to_string(),
+                        target: "wiley.py, science.py, pnas.py".to_string(),
+                    }),
+                    status: CommandExecutionStatus::Completed,
+                    exit_code: Some(0),
+                    duration_ms: Some(0),
                     aggregated_output: None,
                 })
             ))

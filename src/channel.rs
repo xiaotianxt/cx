@@ -53,6 +53,7 @@ pub mod telegram {
 
     const TELEGRAM_STATE_SCHEMA_VERSION: u64 = 1;
     const PORTAL_TOPIC_TITLE: &str = "cx portal";
+    const ROLLOUT_OWNER_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
     #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
     #[serde(rename_all = "camelCase")]
@@ -2565,7 +2566,10 @@ pub mod telegram {
         let Some((turn_id, offset)) = latest_active_rollout_turn(&path)? else {
             return Ok(None);
         };
-        if pid_holding_file(&path).is_none() {
+        let Some(pid) = pid_holding_file(&path) else {
+            return Ok(None);
+        };
+        if !rollout_holder_is_watchable(pid, thread_id) {
             return Ok(None);
         }
         Ok(Some(ActiveRolloutTurn {
@@ -3131,7 +3135,21 @@ pub mod telegram {
         if info.archived {
             return false;
         }
-        pid_holding_file(&info.path).is_some()
+        let Some(pid) = pid_holding_file(&info.path) else {
+            return false;
+        };
+        rollout_holder_is_watchable(pid, thread_id)
+    }
+
+    fn rollout_holder_is_watchable(pid: u32, thread_id: &str) -> bool {
+        let urls = pid_listening_urls(pid);
+        if urls.is_empty() {
+            return true;
+        }
+        urls.into_iter().any(|url| {
+            app_server_has_active_turn(&url, thread_id, ROLLOUT_OWNER_PROBE_TIMEOUT)
+                .unwrap_or(false)
+        })
     }
 
     fn pid_holding_file(path: &Path) -> Option<u32> {
@@ -5842,7 +5860,11 @@ pub mod telegram {
             )
             .unwrap();
             let _held = fs::File::open(&rollout).unwrap();
-            if pid_holding_file(&rollout).is_none() {
+            let Some(pid) = pid_holding_file(&rollout) else {
+                let _ = fs::remove_dir_all(paths.base_codex_home);
+                return;
+            };
+            if !pid_listening_urls(pid).is_empty() {
                 let _ = fs::remove_dir_all(paths.base_codex_home);
                 return;
             }
@@ -5889,6 +5911,48 @@ pub mod telegram {
         }
 
         #[test]
+        fn active_rollout_turn_requires_active_turn_proof_from_listener_holder() {
+            let paths = temp_paths("rollout-listener-holder");
+            fs::create_dir_all(&paths.base_codex_home).unwrap();
+            let rollout = paths.base_codex_home.join("listener-holder-rollout.jsonl");
+            fs::write(
+                &rollout,
+                r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            )
+            .unwrap();
+            let _held = fs::File::open(&rollout).unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let accept_thread = std::thread::spawn(move || {
+                let _ = listener.accept();
+            });
+            let Some(pid) = pid_holding_file(&rollout) else {
+                let _ = fs::remove_dir_all(paths.base_codex_home);
+                return;
+            };
+            if pid_listening_urls(pid).is_empty() {
+                let _ = fs::remove_dir_all(paths.base_codex_home);
+                return;
+            }
+            let conn = Connection::open(paths.base_codex_home.join("state_5.sqlite")).unwrap();
+            conn.execute(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, archived INTEGER NOT NULL DEFAULT 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO threads (id, rollout_path, archived) VALUES (?1, ?2, 0)",
+                params!["thread-listener-holder", rollout.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+
+            let active = active_rollout_turn(&paths, "thread-listener-holder").unwrap();
+
+            assert!(active.is_none());
+            let _ = accept_thread.join();
+            let _ = fs::remove_dir_all(paths.base_codex_home);
+        }
+
+        #[test]
         fn open_tui_portal_entries_keeps_archived_active_rollouts_visible() {
             let paths = temp_paths("rollout-archived-active");
             fs::create_dir_all(&paths.base_codex_home).unwrap();
@@ -5899,7 +5963,11 @@ pub mod telegram {
             )
             .unwrap();
             let _held = fs::File::open(&rollout).unwrap();
-            if pid_holding_file(&rollout).is_none() {
+            let Some(pid) = pid_holding_file(&rollout) else {
+                let _ = fs::remove_dir_all(paths.base_codex_home);
+                return;
+            };
+            if !pid_listening_urls(pid).is_empty() {
                 let _ = fs::remove_dir_all(paths.base_codex_home);
                 return;
             }

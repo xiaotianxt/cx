@@ -64,11 +64,6 @@ pub(crate) struct InterruptOutcome {
     pub interrupted_turn_id: Option<String>,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct ObserveOutcome {
-    pub turn_id: Option<String>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AppStreamEvent {
     TurnStarted,
@@ -112,6 +107,12 @@ pub(crate) struct ApprovalRequest {
     pub id: Value,
     pub method: String,
     pub params: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ParsedServerEvent {
+    Stream(AppStreamEvent),
+    TurnCompleted { turn_id: String },
 }
 
 impl ThreadListInfo {
@@ -272,87 +273,6 @@ impl AppServerClient {
             },
         )?;
         self.collect_turn_start(request_id, thread_id, &mut on_event, &mut on_approval)
-    }
-
-    pub(crate) fn observe_thread_events<F>(
-        &mut self,
-        thread_id: &str,
-        cwd: Option<&str>,
-        mut on_event: F,
-    ) -> Result<ObserveOutcome>
-    where
-        F: FnMut(AppStreamEvent) -> Result<()>,
-    {
-        self.thread_resume(thread_id, cwd)?;
-
-        let Some(turn_id) = self.active_turn_id(thread_id)? else {
-            return Ok(ObserveOutcome { turn_id: None });
-        };
-        on_event(AppStreamEvent::TurnStarted)?;
-
-        loop {
-            let frame = self.websocket.read_text()?;
-            let message =
-                serde_json::from_str::<ServerMessage>(&frame).context("decode observe event")?;
-            match message {
-                ServerMessage::Notification { method, params }
-                    if method == "item/reasoning/summaryPartAdded"
-                        && notification_params(&params, thread_id, Some(&turn_id)).is_some() =>
-                {
-                    on_event(AppStreamEvent::ReasoningStarted)?;
-                }
-                ServerMessage::Notification { method, params }
-                    if method == "item/reasoning/summaryTextDelta"
-                        || method == "item/reasoning/textDelta"
-                        || method == "item/plan/delta" =>
-                {
-                    if let Some(delta) = notification_text_delta(&params, thread_id, Some(&turn_id))
-                    {
-                        on_event(AppStreamEvent::ReasoningDelta(delta))?;
-                    }
-                }
-                ServerMessage::Notification { method, params }
-                    if method == "item/agentMessage/delta" =>
-                {
-                    if let Some(delta) = notification_delta(&params, thread_id, Some(&turn_id)) {
-                        on_event(AppStreamEvent::AgentDelta(delta.to_string()))?;
-                    }
-                }
-                ServerMessage::Notification { method, params } if method == "item/started" => {
-                    if let Some(command) =
-                        notification_command_execution(&params, thread_id, Some(&turn_id))
-                    {
-                        on_event(AppStreamEvent::CommandStarted(command))?;
-                    }
-                }
-                ServerMessage::Notification { method, params }
-                    if method == "item/commandExecution/outputDelta" =>
-                {
-                    if let Some((item_id, delta)) =
-                        notification_command_output_delta(&params, thread_id, Some(&turn_id))
-                    {
-                        on_event(AppStreamEvent::CommandOutputDelta { item_id, delta })?;
-                    }
-                }
-                ServerMessage::Notification { method, params } if method == "item/completed" => {
-                    if let Some(command) =
-                        notification_command_execution(&params, thread_id, Some(&turn_id))
-                    {
-                        on_event(AppStreamEvent::CommandCompleted(command))?;
-                    }
-                }
-                ServerMessage::Notification { method, params } if method == "turn/completed" => {
-                    if let Some(completed_tid) = completed_turn_id(&params, thread_id) {
-                        if completed_tid == turn_id {
-                            return Ok(ObserveOutcome {
-                                turn_id: Some(turn_id),
-                            });
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
     }
 
     pub(crate) fn active_turn_id(&mut self, thread_id: &str) -> Result<Option<String>> {
@@ -615,6 +535,68 @@ fn latest_in_progress_turn_id(response: &Value) -> Option<String> {
         .get("id")?
         .as_str()
         .map(str::to_string)
+}
+
+pub(crate) fn parse_server_event(
+    message: &Value,
+    thread_id: &str,
+    turn_id: Option<&str>,
+) -> Option<ParsedServerEvent> {
+    let message = serde_json::from_value::<ServerMessage>(message.clone()).ok()?;
+    match message {
+        ServerMessage::Notification { method, params }
+            if method == "turn/started" || method == "task/started" =>
+        {
+            started_turn_id(&params, thread_id)
+                .map(|_| ParsedServerEvent::Stream(AppStreamEvent::TurnStarted))
+        }
+        ServerMessage::Notification { method, params }
+            if method == "item/reasoning/summaryPartAdded"
+                && notification_params(&params, thread_id, turn_id).is_some() =>
+        {
+            Some(ParsedServerEvent::Stream(AppStreamEvent::ReasoningStarted))
+        }
+        ServerMessage::Notification { method, params }
+            if method == "item/reasoning/summaryTextDelta"
+                || method == "item/reasoning/textDelta"
+                || method == "item/plan/delta" =>
+        {
+            notification_text_delta(&params, thread_id, turn_id)
+                .map(AppStreamEvent::ReasoningDelta)
+                .map(ParsedServerEvent::Stream)
+        }
+        ServerMessage::Notification { method, params } if method == "item/agentMessage/delta" => {
+            notification_delta(&params, thread_id, turn_id)
+                .map(str::to_string)
+                .map(AppStreamEvent::AgentDelta)
+                .map(ParsedServerEvent::Stream)
+        }
+        ServerMessage::Notification { method, params } if method == "item/started" => {
+            notification_command_execution(&params, thread_id, turn_id)
+                .map(AppStreamEvent::CommandStarted)
+                .map(ParsedServerEvent::Stream)
+        }
+        ServerMessage::Notification { method, params }
+            if method == "item/commandExecution/outputDelta" =>
+        {
+            notification_command_output_delta(&params, thread_id, turn_id)
+                .map(|(item_id, delta)| AppStreamEvent::CommandOutputDelta { item_id, delta })
+                .map(ParsedServerEvent::Stream)
+        }
+        ServerMessage::Notification { method, params } if method == "item/completed" => {
+            notification_command_execution(&params, thread_id, turn_id)
+                .map(AppStreamEvent::CommandCompleted)
+                .map(ParsedServerEvent::Stream)
+        }
+        ServerMessage::Notification { method, params } if method == "turn/completed" => {
+            completed_turn_id(&params, thread_id)
+                .filter(|completed| turn_id.is_none_or(|expected| *completed == expected))
+                .map(|completed| ParsedServerEvent::TurnCompleted {
+                    turn_id: completed.to_string(),
+                })
+        }
+        _ => None,
+    }
 }
 
 fn notification_delta<'a>(

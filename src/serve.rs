@@ -18,6 +18,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::app_server::AppServerClient;
+use crate::app_server::AppServerProxy;
 use crate::app_server::AppThreadSummary;
 use crate::app_server::InitializeInfo;
 use crate::app_server::LoopbackWsUrl;
@@ -197,12 +198,18 @@ pub fn start(args: ServeStartArgs) -> Result<()> {
     let runtime = run::select_runtime(&paths, args.slot.as_deref(), args.target.as_deref(), false)?;
     let real_codex = run::resolve_codex_bin(args.codex_bin.as_deref())?;
     let listen = ListenUrl::parse(&args.listen)?.resolve()?;
-    let listen_url = listen.websocket_url();
+    let proxy_listen_url = listen.websocket_url();
+    let upstream = ListenUrl {
+        host: listen.host.clone(),
+        port: 0,
+    }
+    .resolve()?;
+    let upstream_listen_url = upstream.websocket_url();
 
     let mut codex_args = vec![
         OsString::from("app-server"),
         OsString::from("--listen"),
-        OsString::from(listen_url.clone()),
+        OsString::from(upstream_listen_url.clone()),
     ];
     codex_args.extend(args.args.into_iter().map(OsString::from));
 
@@ -218,7 +225,8 @@ pub fn start(args: ServeStartArgs) -> Result<()> {
     if let Some(target) = spec.target_name() {
         eprintln!("cx serve target: {target}");
     }
-    eprintln!("cx serve listen: {listen_url}");
+    eprintln!("cx serve listen: {proxy_listen_url}");
+    eprintln!("cx serve upstream: {upstream_listen_url}");
 
     let slot = spec.slot().to_string();
     let target = spec.target_name().map(str::to_string);
@@ -229,18 +237,32 @@ pub fn start(args: ServeStartArgs) -> Result<()> {
         .stderr(Stdio::inherit());
     let mut child = command.spawn().context("spawn codex app-server")?;
 
-    if let Err(err) = wait_for_ready(&listen.readyz_url(), args.ready_timeout, &mut child) {
+    if let Err(err) = wait_for_ready(&upstream.readyz_url(), args.ready_timeout, &mut child) {
         let _ = child.kill();
         let _ = child.wait();
         return Err(err);
     }
+
+    let proxy = AppServerProxy::new(
+        proxy_listen_url.clone(),
+        upstream_listen_url,
+        paths.serve_dir().join("events").join("default.jsonl"),
+    );
+    let _proxy_handle = match proxy.spawn() {
+        Ok(handle) => handle,
+        Err(err) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(err);
+        }
+    };
 
     let state = ServeStateFile {
         schema_version: SERVE_STATE_SCHEMA_VERSION,
         pid: child.id(),
         slot,
         target,
-        listen_url,
+        listen_url: proxy_listen_url,
         readyz_url: listen.readyz_url(),
         started_at_unix: unix_now()?,
     };

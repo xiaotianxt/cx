@@ -52,11 +52,11 @@ impl LoopbackWsUrl {
         })
     }
 
-    fn host(&self) -> &str {
+    pub(crate) fn host(&self) -> &str {
         &self.host
     }
 
-    fn port(&self) -> u16 {
+    pub(crate) fn port(&self) -> u16 {
         self.port
     }
 }

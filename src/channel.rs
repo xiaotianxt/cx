@@ -2484,7 +2484,16 @@ pub mod telegram {
     }
 
     fn rollout_task_event(line: &str) -> Option<RolloutTaskEvent> {
-        let value = rollout_event_payload(line)?;
+        let top_level = serde_json::from_str::<Value>(line).ok()?;
+        if top_level.get("type").and_then(Value::as_str) == Some("turn_context") {
+            return top_level
+                .get("payload")
+                .and_then(|payload| payload.get("turn_id"))
+                .and_then(Value::as_str)
+                .map(|turn_id| RolloutTaskEvent::Started(turn_id.to_string()));
+        }
+
+        let value = rollout_event_payload_value(&top_level)?;
         let kind = value.get("type")?.as_str()?;
         match kind {
             "task_started" | "turn_started" => value
@@ -2542,10 +2551,14 @@ pub mod telegram {
 
     fn rollout_event_payload(line: &str) -> Option<Value> {
         let value = serde_json::from_str::<Value>(line).ok()?;
+        rollout_event_payload_value(&value).cloned()
+    }
+
+    fn rollout_event_payload_value(value: &Value) -> Option<&Value> {
         if value.get("type").and_then(Value::as_str) != Some("event_msg") {
             return None;
         }
-        value.get("payload").cloned()
+        value.get("payload")
     }
 
     fn rollout_history_text(
@@ -2652,7 +2665,7 @@ pub mod telegram {
         let db_path = paths.base_codex_home.join("state_5.sqlite");
         let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
         let mut stmt = conn
-            .prepare("SELECT rollout_path FROM threads WHERE id = ?1 AND archived = 0")
+            .prepare("SELECT rollout_path FROM threads WHERE id = ?1 ORDER BY archived ASC LIMIT 1")
             .ok()?;
         let path: String = stmt.query_row(params![thread_id], |row| row.get(0)).ok()?;
         Some(PathBuf::from(path))
@@ -4895,6 +4908,39 @@ pub mod telegram {
                 ),
             );
             assert!(active_turns.is_empty());
+        }
+
+        #[test]
+        fn rollout_task_events_accept_turn_context_start() {
+            assert_eq!(
+                rollout_task_event(
+                    r#"{"type":"turn_context","payload":{"turn_id":"turn-context-1","cwd":"/tmp"}}"#,
+                ),
+                Some(RolloutTaskEvent::Started("turn-context-1".to_string()))
+            );
+        }
+
+        #[test]
+        fn rollout_path_for_thread_keeps_archived_active_rollouts_visible() {
+            let paths = temp_paths("rollout-archived-path");
+            fs::create_dir_all(&paths.base_codex_home).unwrap();
+            let rollout = paths.base_codex_home.join("archived-rollout.jsonl");
+            let conn = Connection::open(paths.base_codex_home.join("state_5.sqlite")).unwrap();
+            conn.execute(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, archived INTEGER NOT NULL DEFAULT 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO threads (id, rollout_path, archived) VALUES (?1, ?2, 1)",
+                params!["thread-archived-active", rollout.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+
+            assert_eq!(
+                rollout_path_for_thread(&paths, "thread-archived-active"),
+                Some(rollout)
+            );
         }
 
         #[test]

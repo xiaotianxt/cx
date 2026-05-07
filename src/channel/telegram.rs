@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs;
 use std::fs::OpenOptions;
@@ -71,7 +72,6 @@ use self::transcript::TelegramTranscriptTarget;
 const TELEGRAM_STATE_SCHEMA_VERSION: u64 = 1;
 const PORTAL_TOPIC_TITLE: &str = "cx portal";
 const PORTAL_APP_SERVER_TIMEOUT: Duration = Duration::from_millis(750);
-#[cfg(test)]
 const ROLLOUT_OWNER_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 const WATCH_DRAIN_MAX_LINES: usize = 1000;
 
@@ -2092,6 +2092,57 @@ fn list_portal_entries(
     trace_timings: bool,
     route_log: &str,
 ) -> Result<Vec<AppThreadPortalEntry>> {
+    let candidate_limit = limit.saturating_mul(8).max(50);
+    let mut candidates = Vec::new();
+    let mut app_server_error = None::<anyhow::Error>;
+
+    match app_server_portal_candidates(paths, candidate_limit, trace_timings, route_log) {
+        Ok(mut app_candidates) => candidates.append(&mut app_candidates),
+        Err(err) => {
+            if trace_timings {
+                eprintln!(
+                    "telegram timing route={} phase=portal_app_server_error error={err:#}",
+                    route_log
+                );
+            }
+            app_server_error = Some(err);
+        }
+    }
+
+    let local_start = Instant::now();
+    let mut local_candidates = local_state_portal_candidates(paths, candidate_limit)?;
+    if trace_timings {
+        eprintln!(
+            "telegram timing route={} phase=portal_local_state threads={} elapsed_ms={}",
+            route_log,
+            local_candidates.len(),
+            elapsed_ms(local_start)
+        );
+    }
+    candidates.append(&mut local_candidates);
+
+    let entries = filter_portal_candidates(candidates, limit);
+    if entries.is_empty() {
+        if let Some(err) = app_server_error {
+            return Err(err);
+        }
+    }
+    Ok(entries)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PortalEntryCandidate {
+    entry: AppThreadPortalEntry,
+    updated_at_unix: i64,
+    priority: u8,
+}
+
+fn app_server_portal_candidates(
+    paths: &ManagerPaths,
+    limit: u64,
+    trace_timings: bool,
+    route_log: &str,
+) -> Result<Vec<PortalEntryCandidate>> {
     let state_start = Instant::now();
     let server = serve::registered_app_server(paths)?;
     if trace_timings {
@@ -2122,21 +2173,152 @@ fn list_portal_entries(
             elapsed_ms(list_start)
         );
     }
-    Ok(filter_portal_entries(
-        page.threads.into_iter().map(AppThreadPortalEntry::from),
-        limit,
-    ))
+    Ok(page
+        .threads
+        .into_iter()
+        .map(|summary| PortalEntryCandidate {
+            updated_at_unix: summary.updated_at_unix,
+            entry: AppThreadPortalEntry::from(summary),
+            priority: 3,
+        })
+        .collect())
 }
 
+fn local_state_portal_candidates(
+    paths: &ManagerPaths,
+    limit: u64,
+) -> Result<Vec<PortalEntryCandidate>> {
+    let mut candidates = Vec::new();
+    for db_path in codex_state_db_paths(paths) {
+        if !db_path.exists() {
+            continue;
+        }
+        candidates.extend(local_state_portal_candidates_from_db(&db_path, limit)?);
+    }
+    Ok(candidates)
+}
+
+fn local_state_portal_candidates_from_db(
+    db_path: &Path,
+    limit: u64,
+) -> Result<Vec<PortalEntryCandidate>> {
+    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("open {}", db_path.display()))?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, title, first_user_message, cwd, archived, rollout_path, updated_at \
+                 FROM threads \
+                 WHERE rollout_path <> '' \
+                 ORDER BY updated_at DESC \
+                 LIMIT ?1",
+        )
+        .with_context(|| format!("prepare portal state query for {}", db_path.display()))?;
+    let rows = stmt.query_map(params![limit as i64], |row| {
+        let thread_id: String = row.get(0)?;
+        let title: Option<String> = row.get(1)?;
+        let preview: Option<String> = row.get(2)?;
+        let cwd: Option<String> = row.get(3)?;
+        let archived = row.get::<_, i64>(4)? != 0;
+        let rollout_path: String = row.get(5)?;
+        let updated_at_unix: i64 = row.get(6)?;
+        Ok((
+            thread_id,
+            title.unwrap_or_default(),
+            preview.unwrap_or_default(),
+            cwd.unwrap_or_default(),
+            archived,
+            PathBuf::from(rollout_path),
+            updated_at_unix,
+        ))
+    })?;
+
+    let mut candidates = Vec::new();
+    for row in rows {
+        let (thread_id, title, preview, cwd, archived, rollout_path, updated_at_unix) = row?;
+        let active = active_rollout_turn_for_path(&rollout_path, &thread_id)
+            .ok()
+            .flatten()
+            .is_some();
+        if archived && !active {
+            continue;
+        }
+        let status = if active {
+            "active-tui"
+        } else if rollout_file_is_open_path(&rollout_path, &thread_id) {
+            "open-tui"
+        } else {
+            "notLoaded"
+        };
+        candidates.push(PortalEntryCandidate {
+            entry: AppThreadPortalEntry {
+                thread_id,
+                title: (!title.trim().is_empty()).then_some(title),
+                preview,
+                cwd,
+                active: false,
+                watchable: true,
+                status: status.to_string(),
+            },
+            updated_at_unix,
+            priority: if active { 2 } else { 1 },
+        });
+    }
+    Ok(candidates)
+}
+
+fn filter_portal_candidates(
+    candidates: Vec<PortalEntryCandidate>,
+    limit: u64,
+) -> Vec<AppThreadPortalEntry> {
+    let mut by_thread = BTreeMap::<String, PortalEntryCandidate>::new();
+    for candidate in candidates {
+        if is_local_watch_regression_entry(&candidate.entry) {
+            continue;
+        }
+        by_thread
+            .entry(candidate.entry.thread_id.clone())
+            .and_modify(|existing| {
+                if candidate.priority > existing.priority
+                    || candidate.priority == existing.priority
+                        && candidate.updated_at_unix > existing.updated_at_unix
+                {
+                    *existing = candidate.clone();
+                }
+            })
+            .or_insert(candidate);
+    }
+    let mut candidates = by_thread.into_values().collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        right
+            .updated_at_unix
+            .cmp(&left.updated_at_unix)
+            .then_with(|| right.priority.cmp(&left.priority))
+            .then_with(|| left.entry.thread_id.cmp(&right.entry.thread_id))
+    });
+    candidates
+        .into_iter()
+        .take(limit as usize)
+        .map(|candidate| candidate.entry)
+        .collect()
+}
+
+#[cfg(test)]
 fn filter_portal_entries<I>(entries: I, limit: u64) -> Vec<AppThreadPortalEntry>
 where
     I: IntoIterator<Item = AppThreadPortalEntry>,
 {
-    entries
-        .into_iter()
-        .filter(|entry| !is_local_watch_regression_entry(entry))
-        .take(limit as usize)
-        .collect()
+    filter_portal_candidates(
+        entries
+            .into_iter()
+            .enumerate()
+            .map(|(index, entry)| PortalEntryCandidate {
+                entry,
+                updated_at_unix: i64::MAX.saturating_sub(index as i64),
+                priority: 1,
+            })
+            .collect(),
+        limit,
+    )
 }
 
 #[cfg(test)]
@@ -2144,53 +2326,10 @@ fn open_tui_portal_entries(
     paths: &ManagerPaths,
     max_candidates: u64,
 ) -> Result<Vec<AppThreadPortalEntry>> {
-    let db_path = paths.base_codex_home.join("state_5.sqlite");
-    let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .with_context(|| format!("open {}", db_path.display()))?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, title, first_user_message, cwd, archived \
-                 FROM threads \
-                 WHERE rollout_path <> '' \
-                 ORDER BY updated_at DESC \
-                 LIMIT ?1",
-        )
-        .with_context(|| format!("prepare open tui query for {}", db_path.display()))?;
-    let rows = stmt.query_map(params![max_candidates as i64], |row| {
-        let thread_id: String = row.get(0)?;
-        let title: String = row.get(1)?;
-        let preview: String = row.get(2)?;
-        let cwd: String = row.get(3)?;
-        let archived = row.get::<_, i64>(4)? != 0;
-        Ok((
-            AppThreadPortalEntry {
-                thread_id,
-                title: (!title.trim().is_empty()).then_some(title),
-                preview,
-                cwd,
-                active: false,
-                watchable: true,
-                status: String::from("open-tui"),
-            },
-            archived,
-        ))
-    })?;
-
-    let mut entries = Vec::new();
-    for row in rows {
-        let (mut entry, archived) = row?;
-        if active_rollout_turn(paths, &entry.thread_id)
-            .ok()
-            .flatten()
-            .is_some()
-        {
-            entry.status = String::from("active-tui");
-        } else if archived || !rollout_file_is_open(paths, &entry.thread_id) {
-            continue;
-        }
-        entries.push(entry);
-    }
-    Ok(entries)
+    Ok(filter_portal_candidates(
+        local_state_portal_candidates(paths, max_candidates)?,
+        max_candidates,
+    ))
 }
 
 fn is_local_watch_regression_entry(entry: &AppThreadPortalEntry) -> bool {
@@ -2558,7 +2697,6 @@ enum ObserveTerminal {
     Aborted,
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ActiveRolloutTurn {
     path: PathBuf,
@@ -2624,20 +2762,24 @@ fn active_rollout_turn(paths: &ManagerPaths, thread_id: &str) -> Result<Option<A
     let Some(path) = rollout_path_for_thread(paths, thread_id) else {
         return Ok(None);
     };
+    active_rollout_turn_for_path(&path, thread_id)
+}
+
+fn active_rollout_turn_for_path(path: &Path, thread_id: &str) -> Result<Option<ActiveRolloutTurn>> {
     if !path.exists() {
         return Ok(None);
     }
-    let Some((turn_id, offset)) = latest_active_rollout_turn(&path)? else {
+    let Some((turn_id, offset)) = latest_active_rollout_turn(path)? else {
         return Ok(None);
     };
-    let Some(pid) = pid_holding_file(&path) else {
+    let Some(pid) = pid_holding_file(path) else {
         return Ok(None);
     };
     if !rollout_holder_is_watchable(pid, thread_id) {
         return Ok(None);
     }
     Ok(Some(ActiveRolloutTurn {
-        path,
+        path: path.to_path_buf(),
         turn_id,
         offset,
     }))
@@ -3713,6 +3855,41 @@ fn compact_history_message(message: &str) -> String {
     truncate_chars(&normalized, 1800)
 }
 
+fn codex_state_db_paths(paths: &ManagerPaths) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    push_unique_existing_path(
+        &mut candidates,
+        paths.base_codex_home.join("state_5.sqlite"),
+    );
+    if let Ok(entries) = fs::read_dir(&paths.slots_dir) {
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let slot_home = entry.path().join("home");
+            push_unique_existing_path(&mut candidates, slot_home.join("state_5.sqlite"));
+            push_unique_existing_path(&mut candidates, slot_home.join(".codex/state_5.sqlite"));
+        }
+    }
+    candidates
+}
+
+fn push_unique_existing_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !path.exists() {
+        return;
+    }
+    let key = path.canonicalize().unwrap_or_else(|_| path.clone());
+    if paths
+        .iter()
+        .all(|existing| existing.canonicalize().unwrap_or_else(|_| existing.clone()) != key)
+    {
+        paths.push(path);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RolloutThreadInfo {
     path: PathBuf,
@@ -3720,8 +3897,16 @@ struct RolloutThreadInfo {
 }
 
 fn rollout_thread_info(paths: &ManagerPaths, thread_id: &str) -> Option<RolloutThreadInfo> {
-    let db_path = paths.base_codex_home.join("state_5.sqlite");
-    let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    for db_path in codex_state_db_paths(paths) {
+        if let Some(info) = rollout_thread_info_from_db(&db_path, thread_id) {
+            return Some(info);
+        }
+    }
+    None
+}
+
+fn rollout_thread_info_from_db(db_path: &Path, thread_id: &str) -> Option<RolloutThreadInfo> {
+    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
     let mut stmt = conn
         .prepare(
             "SELECT rollout_path, archived \
@@ -3746,21 +3931,13 @@ fn rollout_path_for_thread(paths: &ManagerPaths, thread_id: &str) -> Option<Path
     rollout_thread_info(paths, thread_id).map(|info| info.path)
 }
 
-#[cfg(test)]
-fn rollout_file_is_open(paths: &ManagerPaths, thread_id: &str) -> bool {
-    let Some(info) = rollout_thread_info(paths, thread_id) else {
-        return false;
-    };
-    if info.archived {
-        return false;
-    }
-    let Some(pid) = pid_holding_file(&info.path) else {
+fn rollout_file_is_open_path(path: &Path, thread_id: &str) -> bool {
+    let Some(pid) = pid_holding_file(path) else {
         return false;
     };
     rollout_holder_is_watchable(pid, thread_id)
 }
 
-#[cfg(test)]
 fn rollout_holder_is_watchable(pid: u32, thread_id: &str) -> bool {
     let urls = pid_listening_urls(pid);
     if urls.is_empty() {
@@ -3771,14 +3948,12 @@ fn rollout_holder_is_watchable(pid: u32, thread_id: &str) -> bool {
     })
 }
 
-#[cfg(test)]
 fn app_server_has_active_turn(url: &str, thread_id: &str, timeout: Duration) -> Result<bool> {
     let mut client = AppServerClient::connect(url, timeout)?;
     client.initialize("cx-telegram", env!("CARGO_PKG_VERSION"))?;
     Ok(client.active_turn_id(thread_id)?.is_some())
 }
 
-#[cfg(test)]
 fn pid_holding_file(path: &Path) -> Option<u32> {
     let output = std::process::Command::new("lsof")
         .args(["-nP", "-Fp", "--"])
@@ -3794,7 +3969,6 @@ fn pid_holding_file(path: &Path) -> Option<u32> {
         .find_map(|line| line.strip_prefix('p')?.parse::<u32>().ok())
 }
 
-#[cfg(test)]
 fn pid_listening_urls(pid: u32) -> Vec<String> {
     let output = std::process::Command::new("lsof")
         .args([
@@ -3817,7 +3991,6 @@ fn pid_listening_urls(pid: u32) -> Vec<String> {
     loopback_listen_urls(&text)
 }
 
-#[cfg(test)]
 fn loopback_listen_urls(text: &str) -> Vec<String> {
     let mut urls = Vec::new();
     for line in text.lines() {
@@ -3832,7 +4005,6 @@ fn loopback_listen_urls(text: &str) -> Vec<String> {
     urls
 }
 
-#[cfg(test)]
 fn loopback_port(addr: &str) -> Option<u16> {
     addr.strip_prefix("127.0.0.1:")
         .or_else(|| addr.strip_prefix("localhost:"))
@@ -3915,6 +4087,10 @@ impl TelegramNotifier<'_> {
             text,
             None,
         )
+    }
+
+    fn delete_one(&self, route: &TelegramRoute, message_id: i64) -> Result<()> {
+        delete_message(self.client, self.token, route.chat_id, message_id)
     }
 }
 
@@ -4198,6 +4374,7 @@ struct TelegramWatchSink<'a> {
     activity: TelegramActivityPanel,
     sent_any: bool,
     best_effort_delivery: bool,
+    status_needs_tail: bool,
 }
 
 impl<'a> TelegramWatchSink<'a> {
@@ -4207,19 +4384,92 @@ impl<'a> TelegramWatchSink<'a> {
         activity: Option<TelegramActivityState>,
         status: Option<TelegramStatusState>,
     ) -> Self {
+        let status = TelegramStatusPanel::from_state(status);
+        let status_needs_tail = status.is_active() && status.message_id().is_some();
         Self {
-            status: TelegramStatusPanel::from_state(status),
+            status,
             thinking: TelegramThinkingPanel::new(),
             agent: TelegramDeltaSink::new(notifier, route),
             activity: TelegramActivityPanel::from_state(activity),
             sent_any: false,
             best_effort_delivery: true,
+            status_needs_tail,
         }
+    }
+
+    fn mark_status_not_tail(&mut self) {
+        if self.status.is_active() || self.status.message_id().is_some() {
+            self.status_needs_tail = true;
+        }
+    }
+
+    fn ensure_status_tail(&mut self, force: bool) -> Result<()> {
+        if !self.status_needs_tail {
+            return Ok(());
+        }
+        if let Some(message_id) = self.status.message_id() {
+            match self
+                .agent
+                .notifier
+                .delete_one(&self.agent.route, message_id)
+            {
+                Ok(()) => {}
+                Err(err) if is_telegram_missing_thread_error(&err) => return Err(err),
+                Err(err) if self.best_effort_delivery => {
+                    if let Some(delay) = telegram_retry_after_delay(&err) {
+                        self.status.defer_delivery_for(delay);
+                        log_watch_delivery_failure(&self.agent.route, "status delete", err);
+                        return Ok(());
+                    }
+                    log_watch_delivery_failure(&self.agent.route, "status delete", err);
+                }
+                Err(err) => return Err(err),
+            }
+            self.status.clear_message_id();
+        }
+        if flush_status_panel(
+            &mut self.status,
+            self.agent.notifier,
+            &self.agent.route,
+            self.best_effort_delivery,
+            force,
+        )? {
+            self.sent_any = true;
+            self.status_needs_tail = false;
+        }
+        Ok(())
+    }
+
+    fn seal_activity_cell(&mut self) -> Result<()> {
+        if !self.activity.has_content() {
+            return Ok(());
+        }
+        let had_message = self.activity.message_id.is_some();
+        let was_dirty = self.activity.is_dirty();
+        let sent = flush_activity_panel(
+            &mut self.activity,
+            self.agent.notifier,
+            &self.agent.route,
+            self.best_effort_delivery,
+            true,
+        )?;
+        if sent {
+            self.sent_any = true;
+            if !had_message {
+                self.mark_status_not_tail();
+            }
+        }
+        if was_dirty && !sent {
+            return Ok(());
+        }
+        self.activity = TelegramActivityPanel::new();
+        Ok(())
     }
 
     fn push_event(&mut self, event: AppStreamEvent) -> Result<()> {
         match event {
             AppStreamEvent::UserMessage(message) => {
+                self.seal_activity_cell()?;
                 match self
                     .agent
                     .notifier
@@ -4227,6 +4477,7 @@ impl<'a> TelegramWatchSink<'a> {
                 {
                     Ok(Some(_)) => {
                         self.sent_any = true;
+                        self.mark_status_not_tail();
                     }
                     Ok(None) => {}
                     Err(err) if is_telegram_missing_thread_error(&err) => return Err(err),
@@ -4235,11 +4486,14 @@ impl<'a> TelegramWatchSink<'a> {
                     }
                     Err(err) => return Err(err),
                 }
+                self.ensure_status_tail(false)?;
                 Ok(())
             }
             AppStreamEvent::TurnStarted => {
+                self.seal_activity_cell()?;
                 self.ensure_status_started(false)?;
                 self.thinking.start();
+                let had_thinking = self.thinking.message_id().is_some();
                 if flush_thinking_panel(
                     &mut self.thinking,
                     self.agent.notifier,
@@ -4248,13 +4502,19 @@ impl<'a> TelegramWatchSink<'a> {
                     false,
                 )? {
                     self.sent_any = true;
+                    if !had_thinking {
+                        self.mark_status_not_tail();
+                    }
                 }
+                self.ensure_status_tail(false)?;
                 Ok(())
             }
             AppStreamEvent::Info(message) => {
+                self.seal_activity_cell()?;
                 self.ensure_status_started(false)?;
                 if self.thinking.is_active() {
                     self.thinking.finish();
+                    let had_thinking = self.thinking.message_id().is_some();
                     if flush_thinking_panel(
                         &mut self.thinking,
                         self.agent.notifier,
@@ -4263,6 +4523,9 @@ impl<'a> TelegramWatchSink<'a> {
                         true,
                     )? {
                         self.sent_any = true;
+                        if !had_thinking {
+                            self.mark_status_not_tail();
+                        }
                     }
                 }
                 match self
@@ -4272,6 +4535,7 @@ impl<'a> TelegramWatchSink<'a> {
                 {
                     Ok(Some(_)) => {
                         self.sent_any = true;
+                        self.mark_status_not_tail();
                     }
                     Ok(None) => {}
                     Err(err) if is_telegram_missing_thread_error(&err) => return Err(err),
@@ -4280,11 +4544,14 @@ impl<'a> TelegramWatchSink<'a> {
                     }
                     Err(err) => return Err(err),
                 }
+                self.ensure_status_tail(false)?;
                 Ok(())
             }
             AppStreamEvent::ReasoningStarted => {
+                self.seal_activity_cell()?;
                 self.ensure_status_started(false)?;
                 self.thinking.start();
+                let had_thinking = self.thinking.message_id().is_some();
                 if flush_thinking_panel(
                     &mut self.thinking,
                     self.agent.notifier,
@@ -4293,12 +4560,18 @@ impl<'a> TelegramWatchSink<'a> {
                     false,
                 )? {
                     self.sent_any = true;
+                    if !had_thinking {
+                        self.mark_status_not_tail();
+                    }
                 }
+                self.ensure_status_tail(false)?;
                 Ok(())
             }
             AppStreamEvent::ReasoningDelta(delta) => {
+                self.seal_activity_cell()?;
                 self.ensure_status_started(false)?;
                 self.thinking.push(&delta);
+                let had_thinking = self.thinking.message_id().is_some();
                 if flush_thinking_panel(
                     &mut self.thinking,
                     self.agent.notifier,
@@ -4307,13 +4580,19 @@ impl<'a> TelegramWatchSink<'a> {
                     false,
                 )? {
                     self.sent_any = true;
+                    if !had_thinking {
+                        self.mark_status_not_tail();
+                    }
                 }
+                self.ensure_status_tail(false)?;
                 Ok(())
             }
             AppStreamEvent::AgentDelta(delta) => {
+                self.seal_activity_cell()?;
                 self.ensure_status_started(false)?;
                 if self.thinking.is_active() {
                     self.thinking.finish();
+                    let had_thinking = self.thinking.message_id().is_some();
                     if flush_thinking_panel(
                         &mut self.thinking,
                         self.agent.notifier,
@@ -4322,8 +4601,12 @@ impl<'a> TelegramWatchSink<'a> {
                         true,
                     )? {
                         self.sent_any = true;
+                        if !had_thinking {
+                            self.mark_status_not_tail();
+                        }
                     }
                 }
+                let had_agent = self.agent.message_id.is_some();
                 if let Err(err) = self.agent.push(&delta) {
                     if is_telegram_missing_thread_error(&err) {
                         return Err(err);
@@ -4334,10 +4617,15 @@ impl<'a> TelegramWatchSink<'a> {
                     self.agent.last_sent_chars = self.agent.text.chars().count();
                     log_watch_delivery_failure(&self.agent.route, "agent message", err);
                 }
+                if !had_agent && self.agent.message_id.is_some() {
+                    self.mark_status_not_tail();
+                }
+                self.ensure_status_tail(false)?;
                 Ok(())
             }
             AppStreamEvent::CommandStarted(command) => {
                 self.ensure_status_started(false)?;
+                let had_activity = self.activity.message_id.is_some();
                 self.activity.apply_execution(command);
                 if flush_activity_panel(
                     &mut self.activity,
@@ -4347,11 +4635,16 @@ impl<'a> TelegramWatchSink<'a> {
                     false,
                 )? {
                     self.sent_any = true;
+                    if !had_activity {
+                        self.mark_status_not_tail();
+                    }
                 }
+                self.ensure_status_tail(false)?;
                 Ok(())
             }
             AppStreamEvent::CommandOutputDelta { item_id, delta } => {
                 self.ensure_status_started(false)?;
+                let had_activity = self.activity.message_id.is_some();
                 self.activity.apply_output_delta(&item_id, &delta);
                 if flush_activity_panel(
                     &mut self.activity,
@@ -4361,11 +4654,16 @@ impl<'a> TelegramWatchSink<'a> {
                     false,
                 )? {
                     self.sent_any = true;
+                    if !had_activity {
+                        self.mark_status_not_tail();
+                    }
                 }
+                self.ensure_status_tail(false)?;
                 Ok(())
             }
             AppStreamEvent::CommandCompleted(command) => {
                 self.ensure_status_started(false)?;
+                let had_activity = self.activity.message_id.is_some();
                 self.activity.apply_execution(command);
                 if flush_activity_panel(
                     &mut self.activity,
@@ -4375,7 +4673,11 @@ impl<'a> TelegramWatchSink<'a> {
                     false,
                 )? {
                     self.sent_any = true;
+                    if !had_activity {
+                        self.mark_status_not_tail();
+                    }
                 }
+                self.ensure_status_tail(false)?;
                 Ok(())
             }
         }
@@ -4398,6 +4700,7 @@ impl<'a> TelegramWatchSink<'a> {
     fn turn_completed(&mut self) -> Result<()> {
         self.status.finish();
         self.thinking.finish();
+        let had_thinking = self.thinking.message_id().is_some();
         if flush_thinking_panel(
             &mut self.thinking,
             self.agent.notifier,
@@ -4406,19 +4709,28 @@ impl<'a> TelegramWatchSink<'a> {
             true,
         )? {
             self.sent_any = true;
+            if !had_thinking {
+                self.mark_status_not_tail();
+            }
         }
         self.activity.finish_turn();
-        if flush_status_panel(
-            &mut self.status,
+        let had_activity = self.activity.message_id.is_some();
+        if flush_activity_panel(
+            &mut self.activity,
             self.agent.notifier,
             &self.agent.route,
             self.best_effort_delivery,
             true,
         )? {
             self.sent_any = true;
+            if !had_activity {
+                self.mark_status_not_tail();
+            }
         }
-        if flush_activity_panel(
-            &mut self.activity,
+        if self.status_needs_tail {
+            self.ensure_status_tail(true)?;
+        } else if flush_status_panel(
+            &mut self.status,
             self.agent.notifier,
             &self.agent.route,
             self.best_effort_delivery,
@@ -4430,15 +4742,7 @@ impl<'a> TelegramWatchSink<'a> {
     }
 
     fn flush_pending(&mut self) -> Result<()> {
-        if flush_status_panel(
-            &mut self.status,
-            self.agent.notifier,
-            &self.agent.route,
-            self.best_effort_delivery,
-            false,
-        )? {
-            self.sent_any = true;
-        }
+        let had_thinking = self.thinking.message_id().is_some();
         if flush_thinking_panel(
             &mut self.thinking,
             self.agent.notifier,
@@ -4447,7 +4751,11 @@ impl<'a> TelegramWatchSink<'a> {
             false,
         )? {
             self.sent_any = true;
+            if !had_thinking {
+                self.mark_status_not_tail();
+            }
         }
+        let had_agent = self.agent.message_id.is_some();
         if let Err(err) = self.agent.finish() {
             if is_telegram_missing_thread_error(&err) {
                 return Err(err);
@@ -4457,12 +4765,30 @@ impl<'a> TelegramWatchSink<'a> {
             }
             log_watch_delivery_failure(&self.agent.route, "agent message", err);
         }
+        if !had_agent && self.agent.message_id.is_some() {
+            self.mark_status_not_tail();
+        }
+        let had_activity = self.activity.message_id.is_some();
         if flush_activity_panel(
             &mut self.activity,
             self.agent.notifier,
             &self.agent.route,
             self.best_effort_delivery,
             true,
+        )? {
+            self.sent_any = true;
+            if !had_activity {
+                self.mark_status_not_tail();
+            }
+        }
+        if self.status_needs_tail {
+            self.ensure_status_tail(false)?;
+        } else if flush_status_panel(
+            &mut self.status,
+            self.agent.notifier,
+            &self.agent.route,
+            self.best_effort_delivery,
+            false,
         )? {
             self.sent_any = true;
         }
@@ -5094,6 +5420,50 @@ fn edit_message_text(
 }
 
 #[derive(Debug, Serialize)]
+struct TelegramDeleteMessage<'a> {
+    chat_id: &'a str,
+    message_id: &'a str,
+}
+
+fn delete_message(client: &Client, token: &str, chat_id: i64, message_id: i64) -> Result<()> {
+    let url = telegram_method_url(token, "deleteMessage");
+    let chat_id = chat_id.to_string();
+    let message_id = message_id.to_string();
+    let payload = TelegramDeleteMessage {
+        chat_id: chat_id.as_str(),
+        message_id: message_id.as_str(),
+    };
+    let response = client.post(url).form(&payload).send().map_err(|err| {
+        anyhow::anyhow!(
+            "Telegram deleteMessage request failed: {}",
+            err.without_url()
+        )
+    })?;
+    let response = response.json::<TelegramResponse<bool>>().map_err(|err| {
+        anyhow::anyhow!(
+            "decode Telegram deleteMessage response failed: {}",
+            err.without_url()
+        )
+    })?;
+    if !response.ok {
+        if response
+            .description
+            .as_deref()
+            .is_some_and(is_telegram_delete_noop_error)
+        {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "Telegram deleteMessage failed: {}",
+            response
+                .description
+                .unwrap_or_else(|| "unknown error".to_string())
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
 struct TelegramForumTopicParams<'a> {
     chat_id: &'a str,
     name: &'a str,
@@ -5271,6 +5641,10 @@ fn unhide_general_forum_topic(client: &Client, token: &str, chat_id: i64) -> Res
 
 fn is_telegram_noop_error(description: &str) -> bool {
     description.contains("message is not modified") || description.contains("TOPIC_NOT_MODIFIED")
+}
+
+fn is_telegram_delete_noop_error(description: &str) -> bool {
+    description.contains("message to delete not found")
 }
 
 fn is_telegram_missing_thread_error(err: &anyhow::Error) -> bool {
@@ -6665,6 +7039,60 @@ mod tests {
     }
 
     #[test]
+    fn list_portal_entries_reads_threads_from_all_slot_state_dbs() {
+        let paths = temp_paths("portal-all-slots");
+        let deepseek_home = paths.slot_home("deepseek");
+        fs::create_dir_all(&deepseek_home).unwrap();
+        let rollout = deepseek_home.join("sessions/rollout-deepseek.jsonl");
+        fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+        fs::write(&rollout, "").unwrap();
+        let conn = Connection::open(deepseek_home.join("state_5.sqlite")).unwrap();
+        conn.execute(
+            "CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    rollout_path TEXT NOT NULL,
+                    title TEXT,
+                    first_user_message TEXT,
+                    cwd TEXT,
+                    updated_at INTEGER NOT NULL,
+                    archived INTEGER NOT NULL DEFAULT 0
+                )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO threads (
+                    id,
+                    rollout_path,
+                    title,
+                    first_user_message,
+                    cwd,
+                    updated_at,
+                    archived
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0)",
+            params![
+                "thread-deepseek",
+                rollout.to_string_lossy().as_ref(),
+                "DeepSeek slot thread",
+                "DeepSeek slot thread",
+                "/Users/yupeit",
+                42_i64
+            ],
+        )
+        .unwrap();
+
+        let entries = list_portal_entries(&paths, 8, false, "test").unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].thread_id, "thread-deepseek");
+        assert_eq!(entries[0].status, "notLoaded");
+        assert!(entries[0].watchable);
+
+        let _ = fs::remove_dir_all(paths.manager_dir);
+        let _ = fs::remove_dir_all(paths.base_codex_home);
+    }
+
+    #[test]
     fn loopback_listen_urls_accepts_only_loopback_addresses() {
         let urls = loopback_listen_urls(
                 "p1\nn127.0.0.1:1234\nnlocalhost:4567\nn[::1]:2345\nn0.0.0.0:9999\nn127.0.0.1:not-a-port\nn127.0.0.1:1234\n",
@@ -7074,6 +7502,57 @@ mod tests {
         assert_eq!(
             activity_watch_text(&restored),
             "• **Explored**\n  └ Read `telegram.rs`"
+        );
+    }
+
+    #[test]
+    fn watch_sink_seals_activity_cell_before_next_history_cell() {
+        let target = CapturingTranscriptTarget::default();
+        let mut panel = TelegramActivityPanel::new();
+        panel.apply_execution(CommandExecution {
+            item_id: "read-1".to_string(),
+            command: "sed -n '1,80p' telegram.rs".to_string(),
+            cwd: "/tmp/project".to_string(),
+            activity: Some(CommandActivity {
+                verb: "Read".to_string(),
+                target: "telegram.rs".to_string(),
+            }),
+            status: CommandExecutionStatus::Completed,
+            exit_code: Some(0),
+            duration_ms: Some(0),
+            aggregated_output: None,
+        });
+        assert!(panel.flush(&target, true).unwrap());
+
+        let client = Client::new();
+        let notifier = TelegramNotifier {
+            client: &client,
+            token: "test-token",
+        };
+        let route = TelegramRoute {
+            chat_id: 1,
+            message_thread_id: None,
+        };
+        let mut sink = TelegramWatchSink::new_best_effort(&notifier, route, panel.to_state(), None);
+
+        sink.seal_activity_cell().unwrap();
+        sink.activity.apply_execution(CommandExecution {
+            item_id: "read-2".to_string(),
+            command: "sed -n '1,80p' client.rs".to_string(),
+            cwd: "/tmp/project".to_string(),
+            activity: Some(CommandActivity {
+                verb: "Read".to_string(),
+                target: "client.rs".to_string(),
+            }),
+            status: CommandExecutionStatus::Completed,
+            exit_code: Some(0),
+            duration_ms: Some(0),
+            aggregated_output: None,
+        });
+
+        assert_eq!(
+            activity_watch_text(&sink.activity),
+            "• **Explored**\n  └ Read `client.rs`"
         );
     }
 
@@ -7752,6 +8231,9 @@ mod tests {
         assert!(is_telegram_noop_error("Bad Request: TOPIC_NOT_MODIFIED"));
         assert!(!is_telegram_noop_error(
             "Bad Request: message to edit not found"
+        ));
+        assert!(is_telegram_delete_noop_error(
+            "Bad Request: message to delete not found"
         ));
     }
 

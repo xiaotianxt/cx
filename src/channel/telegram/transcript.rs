@@ -158,6 +158,22 @@ impl TelegramStatusPanel {
         self.sent_any
     }
 
+    pub(super) fn is_active(&self) -> bool {
+        self.active
+    }
+
+    pub(super) fn message_id(&self) -> Option<i64> {
+        self.message_id
+    }
+
+    pub(super) fn clear_message_id(&mut self) {
+        self.message_id = None;
+        self.last_sent_text = None;
+        self.retry_after_ms = None;
+        self.last_flush = Instant::now() - Self::MIN_EDIT_INTERVAL;
+        self.dirty = true;
+    }
+
     fn record_delivery_attempt(&mut self) {
         self.last_flush = Instant::now();
         self.last_flush_at_ms = Some(unix_millis());
@@ -319,6 +335,10 @@ impl TelegramThinkingPanel {
 
     pub(super) fn sent_any(&self) -> bool {
         self.sent_any
+    }
+
+    pub(super) fn message_id(&self) -> Option<i64> {
+        self.message_id
     }
 }
 
@@ -496,6 +516,14 @@ impl TelegramActivityPanel {
 
     pub(super) fn sent_any(&self) -> bool {
         self.sent_any
+    }
+
+    pub(super) fn has_content(&self) -> bool {
+        !self.order.is_empty() || self.message_id.is_some()
+    }
+
+    pub(super) fn is_dirty(&self) -> bool {
+        self.dirty
     }
 
     fn record_delivery_attempt(&mut self) {

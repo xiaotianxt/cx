@@ -69,6 +69,7 @@ pub(crate) struct InterruptOutcome {
 pub(crate) enum AppStreamEvent {
     UserMessage(String),
     TurnStarted,
+    Info(String),
     ReasoningStarted,
     ReasoningDelta(String),
     AgentDelta(String),
@@ -399,6 +400,10 @@ impl AppServerClient {
                                 on_event(AppStreamEvent::TurnStarted)?;
                             }
                         }
+                    } else if method == "thread/compacted" {
+                        if notification_params(&params, thread_id, turn_id.as_deref()).is_some() {
+                            on_event(AppStreamEvent::Info("Context compacted".to_string()))?;
+                        }
                     } else if method == "item/reasoning/summaryPartAdded" {
                         if notification_params(&params, thread_id, turn_id.as_deref()).is_some() {
                             on_event(AppStreamEvent::ReasoningStarted)?;
@@ -558,6 +563,14 @@ pub(crate) fn parse_server_event(
                 && notification_params(&params, thread_id, turn_id).is_some() =>
         {
             Some(ParsedServerEvent::Stream(AppStreamEvent::ReasoningStarted))
+        }
+        ServerMessage::Notification { method, params }
+            if method == "thread/compacted"
+                && notification_params(&params, thread_id, turn_id).is_some() =>
+        {
+            Some(ParsedServerEvent::Stream(AppStreamEvent::Info(
+                "Context compacted".to_string(),
+            )))
         }
         ServerMessage::Notification { method, params }
             if method == "item/reasoning/summaryTextDelta"

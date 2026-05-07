@@ -57,6 +57,7 @@ mod transcript;
 
 #[cfg(test)]
 use self::transcript::activity_watch_text;
+use self::transcript::info_watch_text;
 #[cfg(test)]
 use self::transcript::thinking_watch_text;
 use self::transcript::user_watch_text;
@@ -956,10 +957,19 @@ fn drain_watched_binding(
     let file_len = fs::metadata(&path)
         .with_context(|| format!("stat rollout {}", path.display()))?
         .len();
-    let start_offset = binding
-        .watch_rollout_offset
-        .filter(|offset| *offset <= file_len)
-        .unwrap_or(file_len);
+    let missing_activity_state = binding.watch_activity.is_none();
+    let active_turn_offset = latest_active_rollout_turn(&path)
+        .ok()
+        .flatten()
+        .map(|(_, offset)| offset);
+    let start_offset = match (binding.watch_rollout_offset, active_turn_offset) {
+        (Some(offset), Some(active_offset)) if missing_activity_state && active_offset < offset => {
+            active_offset
+        }
+        (Some(offset), _) if offset <= file_len => offset,
+        (_, Some(active_offset)) => active_offset,
+        _ => file_len,
+    };
     let drain = rollout_events_since(&path, start_offset, WATCH_DRAIN_MAX_LINES)?;
 
     let activity_state = state
@@ -1017,7 +1027,7 @@ fn send_watch_events(
             }
         }
     }
-    sink.finish()?;
+    sink.flush_pending()?;
     Ok(WatchSendResult {
         sent_any: sink.sent_any(),
         activity: sink.activity_state(),
@@ -1965,10 +1975,15 @@ fn initialize_watch_cursor(paths: &ManagerPaths, binding: &mut TelegramBinding) 
     let Some(path) = rollout_path_for_thread(paths, thread_id) else {
         return;
     };
-    let Ok(metadata) = fs::metadata(path) else {
+    let Ok(metadata) = fs::metadata(&path) else {
         return;
     };
-    binding.watch_rollout_offset = Some(metadata.len());
+    let offset = latest_active_rollout_turn(&path)
+        .ok()
+        .flatten()
+        .map(|(_, offset)| offset)
+        .unwrap_or_else(|| metadata.len());
+    binding.watch_rollout_offset = Some(offset);
 }
 
 fn proxy_event_log_path(paths: &ManagerPaths) -> PathBuf {
@@ -2515,7 +2530,7 @@ fn run_codex_turn(
     if let Some(sink) = sink.as_mut() {
         sink.turn_completed()?;
         let finish_start = Instant::now();
-        sink.finish()?;
+        sink.flush_pending()?;
         if trace_timings {
             eprintln!(
                     "telegram timing route={} thread_id={} phase=telegram_sink_finish sent_any={} elapsed_ms={}",
@@ -2558,7 +2573,6 @@ struct ObservedRolloutTerminal {
     terminal: ObserveTerminal,
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RolloutTaskEvent {
     Started(String),
@@ -2629,7 +2643,6 @@ fn active_rollout_turn(paths: &ManagerPaths, thread_id: &str) -> Result<Option<A
     }))
 }
 
-#[cfg(test)]
 fn latest_active_rollout_turn(path: &Path) -> Result<Option<(String, u64)>> {
     let file = fs::File::open(path).with_context(|| format!("open rollout {}", path.display()))?;
     let mut reader = BufReader::new(file);
@@ -2653,7 +2666,6 @@ fn latest_active_rollout_turn(path: &Path) -> Result<Option<(String, u64)>> {
         .map(|(turn_id, offset)| (turn_id.clone(), *offset)))
 }
 
-#[cfg(test)]
 fn apply_rollout_task_event(
     active_turns: &mut Vec<(String, u64)>,
     event: Option<RolloutTaskEvent>,
@@ -2898,7 +2910,6 @@ where
     Ok(())
 }
 
-#[cfg(test)]
 fn rollout_task_event(line: &str) -> Option<RolloutTaskEvent> {
     let top_level = serde_json::from_str::<Value>(line).ok()?;
     if top_level.get("type").and_then(Value::as_str) == Some("turn_context") {
@@ -2936,6 +2947,11 @@ fn rollout_task_event(line: &str) -> Option<RolloutTaskEvent> {
 
 fn rollout_observe_event(line: &str) -> Option<RolloutObserveEvent> {
     let top_level = serde_json::from_str::<Value>(line).ok()?;
+    if top_level.get("type").and_then(Value::as_str) == Some("compacted") {
+        return Some(RolloutObserveEvent::Stream(AppStreamEvent::Info(
+            "Context compacted".to_string(),
+        )));
+    }
     if top_level.get("type").and_then(Value::as_str) == Some("response_item") {
         return rollout_response_item_observe_event(top_level.get("payload")?);
     }
@@ -2949,6 +2965,9 @@ fn rollout_observe_event(line: &str) -> Option<RolloutObserveEvent> {
         "task_started" | "turn_started" => {
             Some(RolloutObserveEvent::Stream(AppStreamEvent::TurnStarted))
         }
+        "context_compacted" => Some(RolloutObserveEvent::Stream(AppStreamEvent::Info(
+            "Context compacted".to_string(),
+        ))),
         "agent_message" => value.get("message").and_then(Value::as_str).map(|message| {
             let event = match value.get("phase").and_then(Value::as_str) {
                 Some("commentary") => AppStreamEvent::ReasoningDelta(message.to_string()),
@@ -4232,6 +4251,37 @@ impl<'a> TelegramWatchSink<'a> {
                 }
                 Ok(())
             }
+            AppStreamEvent::Info(message) => {
+                self.ensure_status_started(false)?;
+                if self.thinking.is_active() {
+                    self.thinking.finish();
+                    if flush_thinking_panel(
+                        &mut self.thinking,
+                        self.agent.notifier,
+                        &self.agent.route,
+                        self.best_effort_delivery,
+                        true,
+                    )? {
+                        self.sent_any = true;
+                    }
+                }
+                match self
+                    .agent
+                    .notifier
+                    .send_chunks(&self.agent.route, &info_watch_text(&message))
+                {
+                    Ok(Some(_)) => {
+                        self.sent_any = true;
+                    }
+                    Ok(None) => {}
+                    Err(err) if is_telegram_missing_thread_error(&err) => return Err(err),
+                    Err(err) if self.best_effort_delivery => {
+                        log_watch_delivery_failure(&self.agent.route, "info", err);
+                    }
+                    Err(err) => return Err(err),
+                }
+                Ok(())
+            }
             AppStreamEvent::ReasoningStarted => {
                 self.ensure_status_started(false)?;
                 self.thinking.start();
@@ -4347,6 +4397,16 @@ impl<'a> TelegramWatchSink<'a> {
 
     fn turn_completed(&mut self) -> Result<()> {
         self.status.finish();
+        self.thinking.finish();
+        if flush_thinking_panel(
+            &mut self.thinking,
+            self.agent.notifier,
+            &self.agent.route,
+            self.best_effort_delivery,
+            true,
+        )? {
+            self.sent_any = true;
+        }
         self.activity.finish_turn();
         if flush_status_panel(
             &mut self.status,
@@ -4369,7 +4429,7 @@ impl<'a> TelegramWatchSink<'a> {
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<()> {
+    fn flush_pending(&mut self) -> Result<()> {
         if flush_status_panel(
             &mut self.status,
             self.agent.notifier,
@@ -4379,13 +4439,12 @@ impl<'a> TelegramWatchSink<'a> {
         )? {
             self.sent_any = true;
         }
-        self.thinking.finish();
         if flush_thinking_panel(
             &mut self.thinking,
             self.agent.notifier,
             &self.agent.route,
             self.best_effort_delivery,
-            true,
+            false,
         )? {
             self.sent_any = true;
         }
@@ -5689,10 +5748,31 @@ fn set_private_file_permissions(path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::time::SystemTime;
     use std::time::UNIX_EPOCH;
 
     use super::*;
+
+    #[derive(Default)]
+    struct CapturingTranscriptTarget {
+        sent: RefCell<Vec<String>>,
+        edited: RefCell<Vec<(i64, String)>>,
+    }
+
+    impl TelegramTranscriptTarget for CapturingTranscriptTarget {
+        fn send_one(&self, text: &str) -> Result<i64> {
+            self.sent.borrow_mut().push(text.to_string());
+            Ok(self.sent.borrow().len() as i64)
+        }
+
+        fn edit_one(&self, message_id: i64, text: &str) -> Result<()> {
+            self.edited
+                .borrow_mut()
+                .push((message_id, text.to_string()));
+            Ok(())
+        }
+    }
 
     fn temp_paths(name: &str) -> ManagerPaths {
         let unique = SystemTime::now()
@@ -7026,10 +7106,7 @@ mod tests {
         let mut panel = TelegramThinkingPanel::new();
         panel.start();
 
-        assert_eq!(
-            thinking_watch_text(&panel),
-            "Codex is working\nWorking on this turn."
-        );
+        assert_eq!(thinking_watch_text(&panel), "Codex is working\n");
 
         panel.push("Checking current state.");
         panel.finish();
@@ -7037,6 +7114,34 @@ mod tests {
         assert_eq!(
             thinking_watch_text(&panel),
             "Codex\nChecking current state."
+        );
+    }
+
+    #[test]
+    fn thinking_panel_does_not_send_empty_working_placeholder() {
+        let target = CapturingTranscriptTarget::default();
+        let mut panel = TelegramThinkingPanel::new();
+        panel.start();
+        panel.finish();
+
+        assert!(!panel.flush(&target, true).unwrap());
+        assert!(target.sent.borrow().is_empty());
+        assert!(target.edited.borrow().is_empty());
+    }
+
+    #[test]
+    fn rollout_observe_event_reads_context_compaction_as_info_cell() {
+        assert_eq!(
+            rollout_observe_event(r#"{"type":"compacted","payload":{"message":""}}"#),
+            Some(RolloutObserveEvent::Stream(AppStreamEvent::Info(
+                "Context compacted".to_string()
+            )))
+        );
+        assert_eq!(
+            rollout_observe_event(r#"{"type":"event_msg","payload":{"type":"context_compacted"}}"#,),
+            Some(RolloutObserveEvent::Stream(AppStreamEvent::Info(
+                "Context compacted".to_string()
+            )))
         );
     }
 

@@ -201,7 +201,6 @@ impl TelegramThinkingPanel {
             return;
         }
         self.active = true;
-        self.dirty = true;
     }
 
     pub(super) fn push(&mut self, delta: &str) {
@@ -219,11 +218,11 @@ impl TelegramThinkingPanel {
         }
         self.active = false;
         self.done = true;
-        self.dirty = true;
+        self.dirty |= !self.text.trim().is_empty();
     }
 
     pub(super) fn is_active(&self) -> bool {
-        self.active && !self.done
+        self.active && !self.done && !self.text.trim().is_empty()
     }
 
     pub(super) fn flush<T: TelegramTranscriptTarget>(
@@ -232,6 +231,10 @@ impl TelegramThinkingPanel {
         force: bool,
     ) -> Result<bool> {
         if !self.dirty {
+            return Ok(false);
+        }
+        if self.text.trim().is_empty() {
+            self.dirty = false;
             return Ok(false);
         }
         let current_chars = self.text.chars().count();
@@ -278,12 +281,12 @@ pub(super) fn thinking_watch_text(panel: &TelegramThinkingPanel) -> String {
     } else {
         "Codex is working"
     };
-    let body = if panel.text.trim().is_empty() {
-        "Working on this turn."
-    } else {
-        panel.text.trim()
-    };
+    let body = panel.text.trim();
     truncate_chars(&format!("{title}\n{body}"), 1800)
+}
+
+pub(super) fn info_watch_text(message: &str) -> String {
+    truncate_chars(&format!("• {}", message.trim()), 1800)
 }
 
 pub(super) fn user_watch_text(message: &str) -> String {

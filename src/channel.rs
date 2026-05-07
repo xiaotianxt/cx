@@ -1239,6 +1239,9 @@ pub mod telegram {
         if let Some(callback_data) = options.callback_data {
             return handle_callback(paths, state, &route, chat_is_forum, callback_data, &options);
         }
+        if text.trim().is_empty() {
+            return Ok(None);
+        }
 
         match command {
             TelegramTextCommand::Portal => Ok(Some(
@@ -1460,12 +1463,6 @@ pub mod telegram {
                         )
                         .unwrap_or_else(|err| portal_unavailable_reply(&route, err, None)),
                     ));
-                }
-                if text.trim().is_empty() {
-                    return Ok(Some(reply(
-                        &route,
-                        "Send a message for Codex to answer, or open the cx portal.",
-                    )));
                 }
                 let binding = state
                     .active_binding_for_route(&route)
@@ -7186,6 +7183,38 @@ pub mod telegram {
             );
             assert!(state.bindings.is_empty());
 
+            let _ = fs::remove_dir_all(paths.serve_dir());
+        }
+
+        #[test]
+        fn non_text_service_message_is_ignored() {
+            let paths = temp_paths("non-text-service-message");
+            let mut state = TelegramState::empty();
+            let route = TelegramRoute {
+                chat_id: -10042,
+                message_thread_id: Some(99),
+            };
+            state.bind_route(&paths, &route, None).unwrap();
+
+            let reply = handle_message(
+                &paths,
+                &mut state,
+                TelegramMessage {
+                    chat: TelegramChat {
+                        id: -10042,
+                        is_forum: true,
+                    },
+                    message_id: 1,
+                    date: None,
+                    message_thread_id: Some(99),
+                    text: None,
+                    forum_topic_edited: None,
+                },
+                handle_options(),
+            )
+            .unwrap();
+
+            assert!(reply.is_none());
             let _ = fs::remove_dir_all(paths.serve_dir());
         }
 

@@ -17,6 +17,9 @@ pub mod telegram {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
     use reqwest::blocking::Client;
+    use rusqlite::params;
+    use rusqlite::Connection;
+    use rusqlite::OpenFlags;
     use serde::Deserialize;
     use serde::Serialize;
     use serde_json::json;
@@ -1223,10 +1226,7 @@ pub mod telegram {
             }
             TelegramTextCommand::Watch => {
                 let Some(binding) = state.active_binding_for_route(&route).cloned() else {
-                    return Ok(Some(reply(
-                        &route,
-                        no_session_bound_message(state, &route),
-                    )));
+                    return Ok(Some(reply(&route, no_session_bound_message(state, &route))));
                 };
                 watch_bound_thread(paths, &route, &binding, &options)
             }
@@ -1602,10 +1602,16 @@ pub mod telegram {
         );
 
         match result {
+            ObserveResult::NoObservableAppServer => Ok(Some(work_panel_reply(
+                route,
+                binding,
+                "No app-server with an active turn is available for this thread. Use Take over to continue from Telegram.",
+                None,
+            ))),
             ObserveResult::NoActiveTurn => Ok(Some(work_panel_reply(
                 route,
                 binding,
-                "No active turn to observe. Send a prompt from TUI first, then try /watch again.",
+                "No active turn to observe.",
                 None,
             ))),
             ObserveResult::TurnCompleted {
@@ -2043,11 +2049,9 @@ pub mod telegram {
     }
 
     enum ObserveResult {
+        NoObservableAppServer,
         NoActiveTurn,
-        TurnCompleted {
-            turn_id: String,
-            streamed: bool,
-        },
+        TurnCompleted { turn_id: String, streamed: bool },
         Error(anyhow::Error),
     }
 
@@ -2062,17 +2066,16 @@ pub mod telegram {
             return ObserveResult::NoActiveTurn;
         };
 
-        let server = match serve::ready_app_server(paths) {
-            Ok(s) => s,
+        let app_url = match resolve_observe_app_url(paths, thread_id, timeout_secs) {
+            Ok(Some(url)) => url,
+            Ok(None) => return ObserveResult::NoObservableAppServer,
             Err(err) => return ObserveResult::Error(err),
         };
-        let mut client = match AppServerClient::connect(
-            &server.listen_url,
-            Duration::from_secs_f32(timeout_secs),
-        ) {
-            Ok(c) => c,
-            Err(err) => return ObserveResult::Error(err),
-        };
+        let mut client =
+            match AppServerClient::connect(&app_url, Duration::from_secs_f32(timeout_secs)) {
+                Ok(c) => c,
+                Err(err) => return ObserveResult::Error(err),
+            };
         if let Err(err) = client.initialize("cx-telegram", env!("CARGO_PKG_VERSION")) {
             return ObserveResult::Error(err);
         }
@@ -2100,12 +2103,167 @@ pub mod telegram {
         let streamed = sink.is_some_and(|s| s.sent_any());
 
         match outcome.turn_id {
-            Some(turn_id) => ObserveResult::TurnCompleted {
-                turn_id,
-                streamed,
-            },
+            Some(turn_id) => ObserveResult::TurnCompleted { turn_id, streamed },
             None => ObserveResult::NoActiveTurn,
         }
+    }
+
+    fn resolve_observe_app_url(
+        paths: &ManagerPaths,
+        thread_id: &str,
+        timeout_secs: f32,
+    ) -> Result<Option<String>> {
+        let deadline = observe_probe_deadline(timeout_secs);
+        let service_url = serve::ready_app_server(paths)?.listen_url;
+        if let Some(timeout) = observe_probe_timeout(deadline) {
+            if app_server_has_active_turn(&service_url, thread_id, timeout)? {
+                return Ok(Some(service_url));
+            }
+        }
+
+        if let Some(url) = scan_app_servers_for_thread(paths, thread_id, &service_url, deadline) {
+            return Ok(Some(url));
+        }
+
+        Ok(None)
+    }
+
+    fn observe_probe_deadline(timeout_secs: f32) -> Instant {
+        Instant::now() + Duration::from_secs_f32(timeout_secs)
+    }
+
+    fn observe_probe_timeout(deadline: Instant) -> Option<Duration> {
+        let remaining = deadline.checked_duration_since(Instant::now())?;
+        if remaining.is_zero() {
+            return None;
+        }
+        Some(remaining.min(Duration::from_secs(2)))
+    }
+
+    fn app_server_has_active_turn(url: &str, thread_id: &str, timeout: Duration) -> Result<bool> {
+        let mut client = AppServerClient::connect(url, timeout)?;
+        client.initialize("cx-telegram", env!("CARGO_PKG_VERSION"))?;
+        Ok(client.active_turn_id(thread_id)?.is_some())
+    }
+
+    fn scan_app_servers_for_thread(
+        paths: &ManagerPaths,
+        thread_id: &str,
+        service_url: &str,
+        deadline: Instant,
+    ) -> Option<String> {
+        let listeners = rollout_owner_app_server_urls(paths, thread_id);
+        for url in listeners {
+            if url == service_url {
+                continue;
+            }
+            let timeout = observe_probe_timeout(deadline)?;
+            if let Ok(true) = app_server_has_active_turn(&url, thread_id, timeout) {
+                return Some(url);
+            }
+        }
+        None
+    }
+
+    fn rollout_owner_app_server_urls(paths: &ManagerPaths, thread_id: &str) -> Vec<String> {
+        let rollout = match rollout_path_for_thread(paths, thread_id) {
+            Some(p) => p,
+            None => return codex_app_server_urls(),
+        };
+        let pid = match pid_holding_file(&rollout) {
+            Some(p) => p,
+            None => return codex_app_server_urls(),
+        };
+        let urls = pid_listening_urls(pid);
+        if urls.is_empty() {
+            return codex_app_server_urls();
+        }
+        urls
+    }
+
+    fn codex_app_server_urls() -> Vec<String> {
+        let output = std::process::Command::new("lsof")
+            .args(["-nP", "-iTCP", "-sTCP:LISTEN", "-c", "codex"])
+            .arg("-Fn")
+            .stdin(std::process::Stdio::null())
+            .output();
+        let Ok(output) = output else {
+            return Vec::new();
+        };
+        if !output.status.success() {
+            return Vec::new();
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut urls = loopback_listen_urls(&text);
+        urls.reverse();
+        urls
+    }
+
+    fn rollout_path_for_thread(paths: &ManagerPaths, thread_id: &str) -> Option<String> {
+        let db_path = paths.base_codex_home.join("state_5.sqlite");
+        let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+        let mut stmt = conn
+            .prepare("SELECT rollout_path FROM threads WHERE id = ?1 AND archived = 0")
+            .ok()?;
+        let path: String = stmt.query_row(params![thread_id], |row| row.get(0)).ok()?;
+        Some(path)
+    }
+
+    fn pid_holding_file(path: &str) -> Option<u32> {
+        let output = std::process::Command::new("lsof")
+            .args(["-nP", "-Fp", "--", path])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        text.lines()
+            .find_map(|line| line.strip_prefix('p')?.parse::<u32>().ok())
+    }
+
+    fn pid_listening_urls(pid: u32) -> Vec<String> {
+        let output = std::process::Command::new("lsof")
+            .args([
+                "-nP",
+                "-iTCP",
+                "-sTCP:LISTEN",
+                "-Fn",
+                "-p",
+                &pid.to_string(),
+            ])
+            .stdin(std::process::Stdio::null())
+            .output();
+        let Ok(output) = output else {
+            return Vec::new();
+        };
+        if !output.status.success() {
+            return Vec::new();
+        }
+        let text = String::from_utf8_lossy(&output.stdout);
+        loopback_listen_urls(&text)
+    }
+
+    fn loopback_listen_urls(text: &str) -> Vec<String> {
+        let mut urls = Vec::new();
+        for line in text.lines() {
+            let addr = line.strip_prefix('n').unwrap_or(line);
+            let Some(port) = loopback_port(addr) else {
+                continue;
+            };
+            urls.push(format!("ws://127.0.0.1:{port}"));
+        }
+        urls.sort();
+        urls.dedup();
+        urls
+    }
+
+    fn loopback_port(addr: &str) -> Option<u16> {
+        addr.strip_prefix("127.0.0.1:")
+            .or_else(|| addr.strip_prefix("localhost:"))
+            .or_else(|| addr.strip_prefix("[::1]:"))
+            .and_then(|port| port.parse::<u16>().ok())
     }
 
     struct TelegramNotifier<'a> {
@@ -4175,6 +4333,43 @@ pub mod telegram {
             );
             assert_eq!(keyboard.inline_keyboard[1][0].text, "Refresh");
             assert_eq!(keyboard.inline_keyboard[1][0].callback_data, "cx:p");
+        }
+
+        #[test]
+        fn portal_keyboard_does_not_offer_watch_for_inactive_threads() {
+            let entries = vec![AppThreadPortalEntry {
+                thread_id: "thread-idle".to_string(),
+                title: Some("Idle thread".to_string()),
+                preview: String::new(),
+                cwd: "/Users/yupeit/dev/cx".to_string(),
+                active: false,
+                status: "idle".to_string(),
+            }];
+
+            let keyboard = portal_keyboard(&entries);
+
+            assert_eq!(keyboard.inline_keyboard[0].len(), 1);
+            assert_eq!(
+                keyboard.inline_keyboard[0][0].callback_data,
+                "cx:a:thread-idle"
+            );
+            assert!(keyboard.inline_keyboard[0][0].text.starts_with("Open:"));
+        }
+
+        #[test]
+        fn loopback_listen_urls_accepts_only_loopback_addresses() {
+            let urls = loopback_listen_urls(
+                "p1\nn127.0.0.1:1234\nnlocalhost:4567\nn[::1]:2345\nn0.0.0.0:9999\nn127.0.0.1:not-a-port\nn127.0.0.1:1234\n",
+            );
+
+            assert_eq!(
+                urls,
+                vec![
+                    "ws://127.0.0.1:1234",
+                    "ws://127.0.0.1:2345",
+                    "ws://127.0.0.1:4567",
+                ]
+            );
         }
 
         #[test]

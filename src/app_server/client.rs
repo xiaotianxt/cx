@@ -257,21 +257,17 @@ impl AppServerClient {
 
         loop {
             let frame = self.websocket.read_text()?;
-            let message = serde_json::from_str::<ServerMessage>(&frame)
-                .context("decode observe event")?;
+            let message =
+                serde_json::from_str::<ServerMessage>(&frame).context("decode observe event")?;
             match message {
                 ServerMessage::Notification { method, params }
                     if method == "item/agentMessage/delta" =>
                 {
-                    if let Some(delta) =
-                        notification_delta(&params, thread_id, Some(&turn_id))
-                    {
+                    if let Some(delta) = notification_delta(&params, thread_id, Some(&turn_id)) {
                         on_delta(delta)?;
                     }
                 }
-                ServerMessage::Notification { method, params }
-                    if method == "turn/completed" =>
-                {
+                ServerMessage::Notification { method, params } if method == "turn/completed" => {
                     if let Some(completed_tid) = completed_turn_id(&params, thread_id) {
                         if completed_tid == turn_id {
                             return Ok(ObserveOutcome {
@@ -285,7 +281,7 @@ impl AppServerClient {
         }
     }
 
-    fn active_turn_id(&mut self, thread_id: &str) -> Result<Option<String>> {
+    pub(crate) fn active_turn_id(&mut self, thread_id: &str) -> Result<Option<String>> {
         let response = self.request(
             "thread/read",
             protocol::ThreadReadParams {

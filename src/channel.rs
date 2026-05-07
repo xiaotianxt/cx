@@ -1671,6 +1671,15 @@ pub mod telegram {
 
         let binding =
             state.bind_app_thread(paths, &effective_route, &entry, topic_created_by_adapter)?;
+        let telegram_should_watch_desktop =
+            should_watch_desktop_after_attach(entry.active, options.acquire_lease);
+        if let Some(stored) = state.binding_for_route_mut(&effective_route, None) {
+            stored.telegram_paused = telegram_should_watch_desktop;
+        }
+        let binding = state
+            .binding_for_route(&effective_route, None)
+            .cloned()
+            .unwrap_or(binding);
         session::record_channel_message(
             paths,
             RecordChannelMessageRequest {
@@ -1691,12 +1700,20 @@ pub mod telegram {
                 "Telegram handoff active.\nNo interruptible desktop turn was running.\nthread: {}\ncwd: {}",
                 entry.thread_id, entry.cwd
             ),
+            None if binding.telegram_paused => format!(
+                "Telegram handoff paused. Watching for desktop activity.\nthread: {}\ncwd: {}",
+                entry.thread_id, entry.cwd
+            ),
             None => format!(
                 "Telegram handoff active.\nthread: {}\ncwd: {}",
                 entry.thread_id, entry.cwd
             ),
         };
         Ok(work_panel_reply(&effective_route, &binding, headline, None))
+    }
+
+    fn should_watch_desktop_after_attach(entry_active: bool, acquire_lease: bool) -> bool {
+        !entry_active && !acquire_lease
     }
 
     fn observe_portal_thread(
@@ -6254,6 +6271,13 @@ pub mod telegram {
                 keyboard.inline_keyboard[0][1].callback_data,
                 "cx:o:thread-tui-active"
             );
+        }
+
+        #[test]
+        fn attach_inactive_thread_defaults_to_desktop_watch() {
+            assert!(should_watch_desktop_after_attach(false, false));
+            assert!(!should_watch_desktop_after_attach(true, false));
+            assert!(!should_watch_desktop_after_attach(false, true));
         }
 
         #[test]

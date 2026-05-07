@@ -1076,7 +1076,7 @@ pub mod telegram {
                 preview: summary.preview,
                 cwd: summary.cwd,
                 active: summary.active,
-                watchable: summary.active,
+                watchable: true,
                 status: summary.status,
             }
         }
@@ -1086,7 +1086,6 @@ pub mod telegram {
     enum TelegramCallbackCommand {
         RefreshPortal,
         RefreshWork,
-        Attach { thread_id: String },
         Observe { thread_id: String },
         Takeover,
         Release,
@@ -1114,7 +1113,7 @@ pub mod telegram {
                     if thread_id.is_empty() {
                         return None;
                     }
-                    Some(Self::Attach {
+                    Some(Self::Observe {
                         thread_id: thread_id.to_string(),
                     })
                 }
@@ -1258,10 +1257,8 @@ pub mod telegram {
                 let Some(thread_id) = thread_id.as_deref() else {
                     return Ok(Some(reply(&route, "Usage: /attach <thread-id>")));
                 };
-                Ok(Some(
-                    attach_app_thread(paths, state, &route, chat_is_forum, thread_id, &options)
-                        .unwrap_or_else(|err| reply(&route, portal_unavailable_message(err))),
-                ))
+                attach_app_thread(paths, state, &route, chat_is_forum, thread_id, &options)
+                    .or_else(|err| Ok(Some(reply(&route, portal_unavailable_message(err)))))
             }
             TelegramTextCommand::Takeover => takeover_handoff(paths, state, &route, &options, None),
             TelegramTextCommand::Status => {
@@ -1560,10 +1557,6 @@ pub mod telegram {
             Some(TelegramCallbackCommand::RefreshWork) => {
                 Ok(Some(refresh_work_panel(state, route, edit_message_id)))
             }
-            Some(TelegramCallbackCommand::Attach { thread_id }) => Ok(Some(
-                attach_app_thread(paths, state, route, chat_is_forum, &thread_id, options)
-                    .unwrap_or_else(|err| reply(route, portal_unavailable_message(err))),
-            )),
             Some(TelegramCallbackCommand::Observe { thread_id }) => {
                 observe_portal_thread(paths, state, route, chat_is_forum, &thread_id, options)
                     .or_else(|err| Ok(Some(reply(route, portal_unavailable_message(err)))))
@@ -1622,98 +1615,8 @@ pub mod telegram {
         chat_is_forum: bool,
         thread_id: &str,
         options: &HandleOptions<'_>,
-    ) -> Result<TelegramReply> {
-        let entries = list_portal_entries(paths, 30, options.trace_timings, &route.display())?;
-        let Some(entry) = entries
-            .into_iter()
-            .find(|entry| entry.thread_id == thread_id)
-        else {
-            return Ok(reply(
-                route,
-                "That Codex thread is no longer visible. Open /portal and choose again.",
-            ));
-        };
-        let mut interrupted_turn_id = None;
-        if entry.active {
-            let mut client = connect_app_server(paths, options.app_server_timeout)?;
-            let interrupted = client.interrupt_active_turn(&entry.thread_id)?;
-            interrupted_turn_id = interrupted.interrupted_turn_id;
-        }
-
-        let mut topic_created_by_adapter = false;
-        let effective_route = if should_create_work_topic(state, route, chat_is_forum) {
-            if let Some(notifier) = options.notifier {
-                let topic_id = match create_forum_topic(
-                    notifier.client,
-                    notifier.token,
-                    route.chat_id,
-                    &work_topic_title(&entry),
-                ) {
-                    Ok(topic_id) => topic_id,
-                    Err(err) => {
-                        return Ok(reply(
-                            route,
-                            format!("Failed to create Telegram topic: {err:#}"),
-                        ));
-                    }
-                };
-                topic_created_by_adapter = true;
-                TelegramRoute {
-                    chat_id: route.chat_id,
-                    message_thread_id: Some(topic_id),
-                }
-            } else {
-                route.clone()
-            }
-        } else {
-            route.clone()
-        };
-
-        let binding =
-            state.bind_app_thread(paths, &effective_route, &entry, topic_created_by_adapter)?;
-        let telegram_should_watch_desktop =
-            should_watch_desktop_after_attach(entry.active, options.acquire_lease);
-        if let Some(stored) = state.binding_for_route_mut(&effective_route, None) {
-            stored.telegram_paused = telegram_should_watch_desktop;
-        }
-        let binding = state
-            .binding_for_route(&effective_route, None)
-            .cloned()
-            .unwrap_or(binding);
-        session::record_channel_message(
-            paths,
-            RecordChannelMessageRequest {
-                session_id: binding.session_id.clone(),
-                channel_id: binding.channel_id.clone(),
-            },
-        )?;
-        if options.acquire_lease {
-            acquire_binding_lease(paths, &binding, options.steal)?;
-        }
-
-        let headline = match interrupted_turn_id {
-            Some(turn_id) => format!(
-                "Telegram handoff active.\nInterrupted desktop turn {turn_id}.\nthread: {}\ncwd: {}",
-                entry.thread_id, entry.cwd
-            ),
-            None if entry.active => format!(
-                "Telegram handoff active.\nNo interruptible desktop turn was running.\nthread: {}\ncwd: {}",
-                entry.thread_id, entry.cwd
-            ),
-            None if binding.telegram_paused => format!(
-                "Telegram handoff paused. Watching for desktop activity.\nthread: {}\ncwd: {}",
-                entry.thread_id, entry.cwd
-            ),
-            None => format!(
-                "Telegram handoff active.\nthread: {}\ncwd: {}",
-                entry.thread_id, entry.cwd
-            ),
-        };
-        Ok(work_panel_reply(&effective_route, &binding, headline, None))
-    }
-
-    fn should_watch_desktop_after_attach(entry_active: bool, acquire_lease: bool) -> bool {
-        !entry_active && !acquire_lease
+    ) -> Result<Option<TelegramReply>> {
+        observe_portal_thread(paths, state, route, chat_is_forum, thread_id, options)
     }
 
     fn observe_portal_thread(
@@ -1728,13 +1631,13 @@ pub mod telegram {
         let Some(entry) = entries.iter().find(|e| e.thread_id == thread_id) else {
             return Ok(Some(reply(
                 route,
-                "That Codex thread is no longer visible. Open /portal and choose again.",
+                "That Codex thread is no longer visible. Run /portal and choose again.",
             )));
         };
         if !entry.watchable {
             return Ok(Some(reply(
                 route,
-                "That thread is not watchable. Use Open instead to resume it.",
+                "That thread cannot be observed right now. Refresh /portal and try again.",
             )));
         }
 
@@ -2024,22 +1927,6 @@ pub mod telegram {
                 || state.active_binding_for_route(route).is_none())
     }
 
-    fn acquire_binding_lease(
-        paths: &ManagerPaths,
-        binding: &TelegramBinding,
-        steal: bool,
-    ) -> Result<()> {
-        session::acquire_lease(
-            paths,
-            AcquireLeaseRequest {
-                session_id: binding.session_id.clone(),
-                channel_id: binding.channel_id.clone(),
-                steal,
-            },
-        )?;
-        Ok(())
-    }
-
     fn interrupt_binding_thread(
         paths: &ManagerPaths,
         binding: &TelegramBinding,
@@ -2104,10 +1991,12 @@ pub mod telegram {
                 elapsed_ms(list_start)
             );
         }
-        Ok(filter_portal_entries(
+        let mut entries = filter_portal_entries(
             page.threads.into_iter().map(AppThreadPortalEntry::from),
             limit,
-        ))
+        );
+        mark_active_rollout_entries(paths, &mut entries);
+        Ok(entries)
     }
 
     fn filter_portal_entries<I>(entries: I, limit: u64) -> Vec<AppThreadPortalEntry>
@@ -2119,6 +2008,15 @@ pub mod telegram {
             .filter(|entry| !is_local_watch_regression_entry(entry))
             .take(limit as usize)
             .collect()
+    }
+
+    fn mark_active_rollout_entries(paths: &ManagerPaths, entries: &mut [AppThreadPortalEntry]) {
+        for entry in entries {
+            if !entry.active && rollout_has_active_turn(paths, &entry.thread_id) {
+                entry.watchable = true;
+                entry.status = String::from("active-tui");
+            }
+        }
     }
 
     #[cfg(test)]
@@ -2202,7 +2100,7 @@ pub mod telegram {
             ));
         }
         lines.push(String::from(
-            "Watchable threads can be observed. App-server active threads can also be taken over.",
+            "Threads are observed by default. Use Take over inside a topic to interrupt desktop Codex.",
         ));
         lines.join("\n")
     }
@@ -2210,27 +2108,10 @@ pub mod telegram {
     fn portal_keyboard(entries: &[AppThreadPortalEntry]) -> TelegramInlineKeyboardMarkup {
         let mut rows = Vec::new();
         for entry in entries {
-            if entry.watchable {
-                let open_label = if entry.active { "Take over" } else { "Open" };
-                rows.push(vec![
-                    TelegramInlineKeyboardButton {
-                        text: format!(
-                            "{open_label}: {}",
-                            truncate_chars(&work_topic_title(entry), 36)
-                        ),
-                        callback_data: format!("cx:a:{}", entry.thread_id),
-                    },
-                    TelegramInlineKeyboardButton {
-                        text: String::from("Watch"),
-                        callback_data: format!("cx:o:{}", entry.thread_id),
-                    },
-                ]);
-            } else {
-                rows.push(vec![TelegramInlineKeyboardButton {
-                    text: format!("Open: {}", truncate_chars(&work_topic_title(entry), 48)),
-                    callback_data: format!("cx:a:{}", entry.thread_id),
-                }]);
-            }
+            rows.push(vec![TelegramInlineKeyboardButton {
+                text: format!("Watch: {}", truncate_chars(&work_topic_title(entry), 48)),
+                callback_data: format!("cx:o:{}", entry.thread_id),
+            }]);
         }
         rows.push(vec![TelegramInlineKeyboardButton {
             text: String::from("Refresh"),
@@ -3311,6 +3192,16 @@ pub mod telegram {
             text.push_str(&compact_history_message(&item.message));
         }
         Ok(Some(text))
+    }
+
+    fn rollout_has_active_turn(paths: &ManagerPaths, thread_id: &str) -> bool {
+        let Some(path) = rollout_path_for_thread(paths, thread_id) else {
+            return false;
+        };
+        if !path.exists() {
+            return false;
+        }
+        latest_active_rollout_turn(&path).ok().flatten().is_some()
     }
 
     fn rollout_history_item(line: &str) -> Option<RolloutHistoryItem> {
@@ -6156,7 +6047,7 @@ pub mod telegram {
         }
 
         #[test]
-        fn portal_callback_data_parses_attach() {
+        fn portal_callback_data_parses_watch() {
             assert_eq!(
                 TelegramCallbackCommand::parse("cx:p"),
                 Some(TelegramCallbackCommand::RefreshPortal)
@@ -6179,7 +6070,7 @@ pub mod telegram {
             );
             assert_eq!(
                 TelegramCallbackCommand::parse("cx:a:thread-123"),
-                Some(TelegramCallbackCommand::Attach {
+                Some(TelegramCallbackCommand::Observe {
                     thread_id: "thread-123".to_string()
                 })
             );
@@ -6193,7 +6084,26 @@ pub mod telegram {
         }
 
         #[test]
-        fn portal_keyboard_uses_attach_callbacks() {
+        fn app_server_threads_are_watchable_even_when_not_loaded() {
+            let entry = AppThreadPortalEntry::from(AppThreadSummary {
+                upstream_thread_id: "thread-not-loaded".to_string(),
+                title: None,
+                preview: "Idle desktop thread".to_string(),
+                cwd: "/Users/yupeit/dev/cx".to_string(),
+                source: "cli".to_string(),
+                active: false,
+                status: "notLoaded".to_string(),
+                created_at_unix: 1,
+                updated_at_unix: 2,
+            });
+
+            assert!(entry.watchable);
+            assert!(!entry.active);
+            assert_eq!(entry.status, "notLoaded");
+        }
+
+        #[test]
+        fn portal_keyboard_uses_watch_callbacks() {
             let entries = vec![AppThreadPortalEntry {
                 thread_id: "019dfeec-78ca-7cb0-a497-cd3a79f1329a".to_string(),
                 title: Some("Fix Telegram handoff".to_string()),
@@ -6207,25 +6117,18 @@ pub mod telegram {
             let keyboard = portal_keyboard(&entries);
 
             assert_eq!(keyboard.inline_keyboard.len(), 2);
-            assert_eq!(keyboard.inline_keyboard[0].len(), 2);
+            assert_eq!(keyboard.inline_keyboard[0].len(), 1);
             assert_eq!(
                 keyboard.inline_keyboard[0][0].callback_data,
-                "cx:a:019dfeec-78ca-7cb0-a497-cd3a79f1329a"
-            );
-            assert!(keyboard.inline_keyboard[0][0]
-                .text
-                .starts_with("Take over:"));
-            assert_eq!(keyboard.inline_keyboard[0][1].text, "Watch");
-            assert_eq!(
-                keyboard.inline_keyboard[0][1].callback_data,
                 "cx:o:019dfeec-78ca-7cb0-a497-cd3a79f1329a"
             );
+            assert!(keyboard.inline_keyboard[0][0].text.starts_with("Watch:"));
             assert_eq!(keyboard.inline_keyboard[1][0].text, "Refresh");
             assert_eq!(keyboard.inline_keyboard[1][0].callback_data, "cx:p");
         }
 
         #[test]
-        fn portal_keyboard_does_not_offer_watch_for_inactive_threads() {
+        fn portal_keyboard_offers_watch_for_inactive_threads() {
             let entries = vec![AppThreadPortalEntry {
                 thread_id: "thread-idle".to_string(),
                 title: Some("Idle thread".to_string()),
@@ -6241,9 +6144,9 @@ pub mod telegram {
             assert_eq!(keyboard.inline_keyboard[0].len(), 1);
             assert_eq!(
                 keyboard.inline_keyboard[0][0].callback_data,
-                "cx:a:thread-idle"
+                "cx:o:thread-idle"
             );
-            assert!(keyboard.inline_keyboard[0][0].text.starts_with("Open:"));
+            assert!(keyboard.inline_keyboard[0][0].text.starts_with("Watch:"));
         }
 
         #[test]
@@ -6260,24 +6163,12 @@ pub mod telegram {
 
             let keyboard = portal_keyboard(&entries);
 
-            assert_eq!(keyboard.inline_keyboard[0].len(), 2);
-            assert!(keyboard.inline_keyboard[0][0].text.starts_with("Open:"));
+            assert_eq!(keyboard.inline_keyboard[0].len(), 1);
+            assert!(keyboard.inline_keyboard[0][0].text.starts_with("Watch:"));
             assert_eq!(
                 keyboard.inline_keyboard[0][0].callback_data,
-                "cx:a:thread-tui-active"
-            );
-            assert_eq!(keyboard.inline_keyboard[0][1].text, "Watch");
-            assert_eq!(
-                keyboard.inline_keyboard[0][1].callback_data,
                 "cx:o:thread-tui-active"
             );
-        }
-
-        #[test]
-        fn attach_inactive_thread_defaults_to_desktop_watch() {
-            assert!(should_watch_desktop_after_attach(false, false));
-            assert!(!should_watch_desktop_after_attach(true, false));
-            assert!(!should_watch_desktop_after_attach(false, true));
         }
 
         #[test]

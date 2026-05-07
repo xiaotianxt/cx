@@ -66,6 +66,7 @@ pub(crate) struct InterruptOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AppStreamEvent {
+    UserMessage(String),
     TurnStarted,
     ReasoningStarted,
     ReasoningDelta(String),

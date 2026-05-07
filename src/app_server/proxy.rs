@@ -128,15 +128,39 @@ fn handle_connection(
         .write_all(&response)
         .context("forward websocket handshake to client")?;
 
-    let mut client_reader = client.try_clone().context("clone client reader")?;
-    let mut upstream_writer = upstream.try_clone().context("clone upstream writer")?;
+    let client_log = Arc::clone(event_log);
+    let client_reader = client.try_clone().context("clone client reader")?;
+    let upstream_writer = upstream.try_clone().context("clone upstream writer")?;
     let client_to_upstream = thread::spawn(move || {
-        let _ = std::io::copy(&mut client_reader, &mut upstream_writer);
+        if let Err(err) = proxy_client_to_upstream(client_reader, upstream_writer, &client_log) {
+            eprintln!("app-server proxy client stream failed: {err:#}");
+        }
     });
 
     let result = proxy_upstream_to_client(upstream, client, event_log);
     let _ = client_to_upstream.join();
     result
+}
+
+fn proxy_client_to_upstream(
+    mut client: TcpStream,
+    mut upstream: TcpStream,
+    event_log: &Arc<Mutex<fs::File>>,
+) -> Result<()> {
+    loop {
+        let Some(frame) = read_frame(&mut client).context("read client websocket frame")? else {
+            return Ok(());
+        };
+        if frame.opcode() == 0x1 && frame.fin() {
+            if let Ok(text) = String::from_utf8(frame.payload.clone()) {
+                record_ws_text(event_log, "client_to_server", &text);
+            }
+        }
+        write_frame_raw(&mut upstream, &frame).context("write upstream websocket frame")?;
+        if frame.opcode() == 0x8 {
+            return Ok(());
+        }
+    }
 }
 
 fn proxy_upstream_to_client(
@@ -151,10 +175,10 @@ fn proxy_upstream_to_client(
         };
         if frame.opcode() == 0x1 && frame.fin() {
             if let Ok(text) = String::from_utf8(frame.payload.clone()) {
-                record_server_text(event_log, &text);
+                record_ws_text(event_log, "server_to_client", &text);
             }
         }
-        write_frame(&mut client, &frame).context("write client websocket frame")?;
+        write_frame_raw(&mut client, &frame).context("write client websocket frame")?;
         if frame.opcode() == 0x8 {
             return Ok(());
         }
@@ -213,6 +237,7 @@ fn read_frame(stream: &mut TcpStream) -> Result<Option<Frame>> {
         Err(err) if err.kind() == ErrorKind::UnexpectedEof => return Ok(None),
         Err(err) => return Err(err).context("read frame header"),
     }
+    let mut raw = Vec::from(header);
     let masked = header[1] & 0x80 != 0;
     let mut len = u64::from(header[1] & 0x7f);
     if len == 126 {
@@ -220,12 +245,14 @@ fn read_frame(stream: &mut TcpStream) -> Result<Option<Frame>> {
         stream
             .read_exact(&mut extended)
             .context("read frame length")?;
+        raw.extend_from_slice(&extended);
         len = u64::from(u16::from_be_bytes(extended));
     } else if len == 127 {
         let mut extended = [0_u8; 8];
         stream
             .read_exact(&mut extended)
             .context("read frame length")?;
+        raw.extend_from_slice(&extended);
         len = u64::from_be_bytes(extended);
     }
     if len > MAX_FRAME_PAYLOAD {
@@ -235,11 +262,13 @@ fn read_frame(stream: &mut TcpStream) -> Result<Option<Frame>> {
     let mut mask = [0_u8; 4];
     if masked {
         stream.read_exact(&mut mask).context("read frame mask")?;
+        raw.extend_from_slice(&mask);
     }
     let mut payload = vec![0_u8; len as usize];
     stream
         .read_exact(&mut payload)
         .context("read frame payload")?;
+    raw.extend_from_slice(&payload);
     if masked {
         for (index, byte) in payload.iter_mut().enumerate() {
             *byte ^= mask[index % mask.len()];
@@ -248,31 +277,21 @@ fn read_frame(stream: &mut TcpStream) -> Result<Option<Frame>> {
     Ok(Some(Frame {
         first_byte: header[0],
         payload,
+        raw,
     }))
 }
 
-fn write_frame(stream: &mut TcpStream, frame: &Frame) -> Result<()> {
-    let mut out = Vec::with_capacity(frame.payload.len() + 10);
-    out.push(frame.first_byte);
-    match frame.payload.len() {
-        len if len < 126 => out.push(len as u8),
-        len if len <= u16::MAX as usize => {
-            out.push(126);
-            out.extend_from_slice(&(len as u16).to_be_bytes());
-        }
-        len => {
-            out.push(127);
-            out.extend_from_slice(&(len as u64).to_be_bytes());
-        }
-    }
-    out.extend_from_slice(&frame.payload);
-    stream.write_all(&out).context("write websocket frame")
+fn write_frame_raw(stream: &mut TcpStream, frame: &Frame) -> Result<()> {
+    stream
+        .write_all(&frame.raw)
+        .context("write websocket frame")
 }
 
 #[derive(Debug)]
 struct Frame {
     first_byte: u8,
     payload: Vec<u8>,
+    raw: Vec<u8>,
 }
 
 impl Frame {
@@ -285,7 +304,7 @@ impl Frame {
     }
 }
 
-fn record_server_text(event_log: &Arc<Mutex<fs::File>>, text: &str) {
+fn record_ws_text(event_log: &Arc<Mutex<fs::File>>, direction: &'static str, text: &str) {
     let Ok(value) = serde_json::from_str::<Value>(text) else {
         return;
     };
@@ -296,7 +315,7 @@ fn record_server_text(event_log: &Arc<Mutex<fs::File>>, text: &str) {
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_millis())
             .unwrap_or_default(),
-        direction: "server_to_client",
+        direction,
         method,
         thread_id: params.and_then(extract_thread_id),
         turn_id: params.and_then(extract_turn_id),

@@ -2775,6 +2775,13 @@ fn proxy_events_since(
 fn proxy_log_observe_event(line: &str, thread_id: &str) -> Option<RolloutObserveEvent> {
     let value = serde_json::from_str::<Value>(line).ok()?;
     let message = value.get("message")?;
+    if value.get("direction").and_then(Value::as_str) == Some("client_to_server") {
+        if let Some(message) = app_server_user_message(message, thread_id) {
+            return Some(RolloutObserveEvent::Stream(AppStreamEvent::UserMessage(
+                message,
+            )));
+        }
+    }
     match parse_server_event(message, thread_id, None)? {
         ParsedServerEvent::Stream(event) => Some(RolloutObserveEvent::Stream(event)),
         ParsedServerEvent::TurnCompleted { turn_id } => Some(RolloutObserveEvent::Terminal {
@@ -2783,6 +2790,30 @@ fn proxy_log_observe_event(line: &str, thread_id: &str) -> Option<RolloutObserve
             last_agent_message: None,
         }),
     }
+}
+
+fn app_server_user_message(message: &Value, thread_id: &str) -> Option<String> {
+    if message.get("method").and_then(Value::as_str) != Some("turn/start") {
+        return None;
+    }
+    let params = message.get("params")?;
+    if params
+        .get("threadId")
+        .or_else(|| params.get("thread_id"))
+        .and_then(Value::as_str)?
+        != thread_id
+    {
+        return None;
+    }
+    let input = params.get("input")?.as_array()?;
+    let parts = input
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .filter(|text| !text.trim().is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    (!parts.is_empty()).then(|| parts.join("\n"))
 }
 
 fn send_rollout_agent_message<F>(
@@ -2849,6 +2880,9 @@ fn rollout_observe_event(line: &str) -> Option<RolloutObserveEvent> {
     let value = rollout_event_payload_value(&top_level)?;
     let kind = value.get("type")?.as_str()?;
     match kind {
+        "user_message" => value.get("message").and_then(Value::as_str).map(|message| {
+            RolloutObserveEvent::Stream(AppStreamEvent::UserMessage(message.to_string()))
+        }),
         "task_started" | "turn_started" => {
             Some(RolloutObserveEvent::Stream(AppStreamEvent::TurnStarted))
         }
@@ -3715,6 +3749,24 @@ impl<'a> TelegramWatchSink<'a> {
 
     fn push_event(&mut self, event: AppStreamEvent) -> Result<()> {
         match event {
+            AppStreamEvent::UserMessage(message) => {
+                match self
+                    .agent
+                    .notifier
+                    .send_chunks(&self.agent.route, &user_watch_text(&message))
+                {
+                    Ok(Some(_)) => {
+                        self.sent_any = true;
+                    }
+                    Ok(None) => {}
+                    Err(err) if is_telegram_missing_thread_error(&err) => return Err(err),
+                    Err(err) if self.best_effort_delivery => {
+                        log_watch_delivery_failure(&self.agent.route, "user message", err);
+                    }
+                    Err(err) => return Err(err),
+                }
+                Ok(())
+            }
             AppStreamEvent::TurnStarted => {
                 self.thinking.start();
                 if flush_thinking_panel(
@@ -4003,9 +4055,9 @@ impl TelegramThinkingPanel {
 
 fn thinking_watch_text(panel: &TelegramThinkingPanel) -> String {
     let title = if panel.done {
-        "Thinking done"
+        "Working complete"
     } else {
-        "Thinking"
+        "Working"
     };
     let body = if panel.text.trim().is_empty() {
         "Working on this turn."
@@ -4013,6 +4065,10 @@ fn thinking_watch_text(panel: &TelegramThinkingPanel) -> String {
         panel.text.trim()
     };
     truncate_chars(&format!("{title}\n{body}"), 1800)
+}
+
+fn user_watch_text(message: &str) -> String {
+    truncate_chars(&format!("User\n{}", message.trim()), 1800)
 }
 
 struct TelegramActivityPanel {
@@ -6525,7 +6581,7 @@ mod tests {
 
         assert_eq!(
             thinking_watch_text(&panel),
-            "Thinking\nWorking on this turn."
+            "Working\nWorking on this turn."
         );
 
         panel.push("Checking current state.");
@@ -6533,12 +6589,20 @@ mod tests {
 
         assert_eq!(
             thinking_watch_text(&panel),
-            "Thinking done\nChecking current state."
+            "Working complete\nChecking current state."
         );
     }
 
     #[test]
     fn rollout_observe_event_reads_agent_and_terminal_messages() {
+        assert_eq!(
+            rollout_observe_event(
+                r#"{"type":"event_msg","payload":{"type":"user_message","message":"please inspect this"}}"#,
+            ),
+            Some(RolloutObserveEvent::Stream(AppStreamEvent::UserMessage(
+                "please inspect this".to_string()
+            )))
+        );
         assert_eq!(
             rollout_observe_event(
                 r#"{"type":"event_msg","payload":{"type":"agent_message","message":"hello","phase":"commentary"}}"#,
@@ -6662,6 +6726,21 @@ mod tests {
                     aggregated_output: None,
                 })
             ))
+        );
+    }
+
+    #[test]
+    fn proxy_log_observe_event_reads_client_user_message() {
+        let event = proxy_log_observe_event(
+            r#"{"timestampUnixMs":1,"direction":"client_to_server","method":"turn/start","threadId":"thread-1","turnId":null,"message":{"id":7,"method":"turn/start","params":{"threadId":"thread-1","input":[{"type":"text","text":"please inspect this","text_elements":[]}],"summary":"auto"}}}"#,
+            "thread-1",
+        );
+
+        assert_eq!(
+            event,
+            Some(RolloutObserveEvent::Stream(AppStreamEvent::UserMessage(
+                "please inspect this".to_string()
+            )))
         );
     }
 

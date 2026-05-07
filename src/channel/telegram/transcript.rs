@@ -24,6 +24,8 @@ pub(super) struct TelegramStatusPanel {
     turn_started_at_ms: Option<u128>,
     turn_finished_at_ms: Option<u128>,
     last_flush: Instant,
+    last_flush_at_ms: Option<u128>,
+    retry_after_ms: Option<u128>,
     last_sent_text: Option<String>,
     sent_any: bool,
     dirty: bool,
@@ -39,6 +41,8 @@ impl TelegramStatusPanel {
             turn_started_at_ms: None,
             turn_finished_at_ms: None,
             last_flush: Instant::now() - Self::MIN_EDIT_INTERVAL,
+            last_flush_at_ms: None,
+            retry_after_ms: None,
             last_sent_text: None,
             sent_any: false,
             dirty: false,
@@ -54,7 +58,9 @@ impl TelegramStatusPanel {
             message_id: state.message_id,
             turn_started_at_ms: state.turn_started_at_ms,
             turn_finished_at_ms: state.turn_finished_at_ms,
-            last_flush: Instant::now() - Self::MIN_EDIT_INTERVAL,
+            last_flush: instant_from_unix_millis(state.last_flush_at_ms, Self::MIN_EDIT_INTERVAL),
+            last_flush_at_ms: state.last_flush_at_ms,
+            retry_after_ms: state.retry_after_ms,
             last_sent_text: state.last_sent_text,
             sent_any: false,
             dirty: state.active,
@@ -70,6 +76,8 @@ impl TelegramStatusPanel {
             message_id: self.message_id,
             turn_started_at_ms: self.turn_started_at_ms,
             turn_finished_at_ms: self.turn_finished_at_ms,
+            last_flush_at_ms: self.last_flush_at_ms,
+            retry_after_ms: self.retry_after_ms,
             last_sent_text: self.last_sent_text.clone(),
             active: self.active,
         })
@@ -104,6 +112,9 @@ impl TelegramStatusPanel {
         if !(self.dirty || self.active && self.last_flush.elapsed() >= Self::MIN_EDIT_INTERVAL) {
             return Ok(false);
         }
+        if retry_after_is_active(self.retry_after_ms) {
+            return Ok(false);
+        }
         if !force
             && self.message_id.is_some()
             && self.last_flush.elapsed() < Self::MIN_EDIT_INTERVAL
@@ -122,18 +133,34 @@ impl TelegramStatusPanel {
             }
         }
         self.dirty = false;
-        self.last_flush = Instant::now();
+        self.record_delivery_attempt();
+        self.retry_after_ms = None;
         self.last_sent_text = Some(text);
         self.sent_any = true;
         Ok(true)
     }
 
     pub(super) fn mark_delivery_attempted(&mut self) {
-        self.last_flush = Instant::now();
+        self.record_delivery_attempt();
+    }
+
+    pub(super) fn defer_delivery_for(&mut self, delay: Duration) {
+        self.record_delivery_attempt();
+        let retry_after = unix_millis().saturating_add(delay.as_millis());
+        self.retry_after_ms = Some(
+            self.retry_after_ms
+                .map(|existing| existing.max(retry_after))
+                .unwrap_or(retry_after),
+        );
     }
 
     pub(super) fn sent_any(&self) -> bool {
         self.sent_any
+    }
+
+    fn record_delivery_attempt(&mut self) {
+        self.last_flush = Instant::now();
+        self.last_flush_at_ms = Some(unix_millis());
     }
 }
 
@@ -146,6 +173,10 @@ pub(super) struct TelegramStatusState {
     turn_started_at_ms: Option<u128>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     turn_finished_at_ms: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_flush_at_ms: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retry_after_ms: Option<u128>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_sent_text: Option<String>,
     #[serde(default)]
@@ -170,6 +201,7 @@ pub(super) struct TelegramThinkingPanel {
     text: String,
     message_id: Option<i64>,
     last_flush: Instant,
+    retry_after_ms: Option<u128>,
     last_sent_text: Option<String>,
     last_sent_chars: usize,
     sent_any: bool,
@@ -187,6 +219,7 @@ impl TelegramThinkingPanel {
             text: String::new(),
             message_id: None,
             last_flush: Instant::now() - Self::MIN_EDIT_INTERVAL,
+            retry_after_ms: None,
             last_sent_text: None,
             last_sent_chars: 0,
             sent_any: false,
@@ -237,6 +270,9 @@ impl TelegramThinkingPanel {
             self.dirty = false;
             return Ok(false);
         }
+        if retry_after_is_active(self.retry_after_ms) {
+            return Ok(false);
+        }
         let current_chars = self.text.chars().count();
         if !force
             && self.message_id.is_some()
@@ -260,6 +296,7 @@ impl TelegramThinkingPanel {
         }
         self.dirty = false;
         self.last_flush = Instant::now();
+        self.retry_after_ms = None;
         self.last_sent_chars = current_chars;
         self.last_sent_text = Some(text);
         self.sent_any = true;
@@ -268,6 +305,16 @@ impl TelegramThinkingPanel {
 
     pub(super) fn mark_delivery_attempted(&mut self) {
         self.last_flush = Instant::now();
+    }
+
+    pub(super) fn defer_delivery_for(&mut self, delay: Duration) {
+        self.mark_delivery_attempted();
+        let retry_after = unix_millis().saturating_add(delay.as_millis());
+        self.retry_after_ms = Some(
+            self.retry_after_ms
+                .map(|existing| existing.max(retry_after))
+                .unwrap_or(retry_after),
+        );
     }
 
     pub(super) fn sent_any(&self) -> bool {
@@ -298,6 +345,8 @@ pub(super) struct TelegramActivityPanel {
     items: BTreeMap<String, TelegramActivityItem>,
     pub(super) message_id: Option<i64>,
     last_flush: Instant,
+    last_flush_at_ms: Option<u128>,
+    retry_after_ms: Option<u128>,
     pub(super) last_sent_text: Option<String>,
     sent_any: bool,
     dirty: bool,
@@ -313,6 +362,8 @@ impl TelegramActivityPanel {
             items: BTreeMap::new(),
             message_id: None,
             last_flush: Instant::now() - Self::MIN_EDIT_INTERVAL,
+            last_flush_at_ms: None,
+            retry_after_ms: None,
             last_sent_text: None,
             sent_any: false,
             dirty: false,
@@ -327,7 +378,9 @@ impl TelegramActivityPanel {
             order: state.order,
             items: state.items,
             message_id: state.message_id,
-            last_flush: Instant::now() - Self::MIN_EDIT_INTERVAL,
+            last_flush: instant_from_unix_millis(state.last_flush_at_ms, Self::MIN_EDIT_INTERVAL),
+            last_flush_at_ms: state.last_flush_at_ms,
+            retry_after_ms: state.retry_after_ms,
             last_sent_text: state.last_sent_text,
             sent_any: false,
             dirty: false,
@@ -342,6 +395,8 @@ impl TelegramActivityPanel {
             order: self.order.clone(),
             items: self.items.clone(),
             message_id: self.message_id,
+            last_flush_at_ms: self.last_flush_at_ms,
+            retry_after_ms: self.retry_after_ms,
             last_sent_text: self.last_sent_text.clone(),
         })
     }
@@ -395,6 +450,9 @@ impl TelegramActivityPanel {
         if !self.dirty {
             return Ok(false);
         }
+        if retry_after_is_active(self.retry_after_ms) {
+            return Ok(false);
+        }
         if !force
             && self.message_id.is_some()
             && self.last_flush.elapsed() < Self::MIN_EDIT_INTERVAL
@@ -415,18 +473,34 @@ impl TelegramActivityPanel {
             }
         }
         self.dirty = false;
-        self.last_flush = Instant::now();
+        self.record_delivery_attempt();
+        self.retry_after_ms = None;
         self.last_sent_text = Some(text);
         self.sent_any = true;
         Ok(true)
     }
 
     pub(super) fn mark_delivery_attempted(&mut self) {
-        self.last_flush = Instant::now();
+        self.record_delivery_attempt();
+    }
+
+    pub(super) fn defer_delivery_for(&mut self, delay: Duration) {
+        self.record_delivery_attempt();
+        let retry_after = unix_millis().saturating_add(delay.as_millis());
+        self.retry_after_ms = Some(
+            self.retry_after_ms
+                .map(|existing| existing.max(retry_after))
+                .unwrap_or(retry_after),
+        );
     }
 
     pub(super) fn sent_any(&self) -> bool {
         self.sent_any
+    }
+
+    fn record_delivery_attempt(&mut self) {
+        self.last_flush = Instant::now();
+        self.last_flush_at_ms = Some(unix_millis());
     }
 }
 
@@ -453,7 +527,25 @@ pub(super) struct TelegramActivityState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     message_id: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_flush_at_ms: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retry_after_ms: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     last_sent_text: Option<String>,
+}
+
+fn instant_from_unix_millis(timestamp_ms: Option<u128>, default_age: Duration) -> Instant {
+    let now = Instant::now();
+    let Some(timestamp_ms) = timestamp_ms else {
+        return now - default_age;
+    };
+    let age_ms = unix_millis().saturating_sub(timestamp_ms);
+    let age = Duration::from_millis(age_ms.min(u128::from(u64::MAX)) as u64);
+    now.checked_sub(age).unwrap_or(now - default_age)
+}
+
+fn retry_after_is_active(retry_after_ms: Option<u128>) -> bool {
+    retry_after_ms.is_some_and(|retry_after_ms| unix_millis() < retry_after_ms)
 }
 
 impl From<CommandExecution> for TelegramActivityItem {

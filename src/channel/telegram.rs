@@ -4498,7 +4498,11 @@ fn flush_thinking_panel(
         Ok(sent) => Ok(sent),
         Err(err) if best_effort_delivery && is_telegram_missing_thread_error(&err) => Err(err),
         Err(err) if best_effort_delivery => {
-            panel.mark_delivery_attempted();
+            if let Some(delay) = telegram_retry_after_delay(&err) {
+                panel.defer_delivery_for(delay);
+            } else {
+                panel.mark_delivery_attempted();
+            }
             log_watch_delivery_failure(route, "thinking", err);
             Ok(false)
         }
@@ -4518,7 +4522,11 @@ fn flush_activity_panel(
         Ok(sent) => Ok(sent),
         Err(err) if best_effort_delivery && is_telegram_missing_thread_error(&err) => Err(err),
         Err(err) if best_effort_delivery => {
-            panel.mark_delivery_attempted();
+            if let Some(delay) = telegram_retry_after_delay(&err) {
+                panel.defer_delivery_for(delay);
+            } else {
+                panel.mark_delivery_attempted();
+            }
             log_watch_delivery_failure(route, "activity", err);
             Ok(false)
         }
@@ -4538,7 +4546,11 @@ fn flush_status_panel(
         Ok(sent) => Ok(sent),
         Err(err) if best_effort_delivery && is_telegram_missing_thread_error(&err) => Err(err),
         Err(err) if best_effort_delivery => {
-            panel.mark_delivery_attempted();
+            if let Some(delay) = telegram_retry_after_delay(&err) {
+                panel.defer_delivery_for(delay);
+            } else {
+                panel.mark_delivery_attempted();
+            }
             log_watch_delivery_failure(route, "status", err);
             Ok(false)
         }
@@ -4551,6 +4563,19 @@ fn log_watch_delivery_failure(route: &TelegramRoute, kind: &str, err: anyhow::Er
         "telegram watch {kind} delivery failed for {}: {err:#}",
         route.display()
     );
+}
+
+fn telegram_retry_after_delay(err: &anyhow::Error) -> Option<Duration> {
+    let text = format!("{err:#}");
+    let marker = "retry after ";
+    let start = text.find(marker)? + marker.len();
+    let seconds = text[start..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>()
+        .parse::<u64>()
+        .ok()?;
+    Some(Duration::from_secs(seconds.saturating_add(1)))
 }
 
 struct TelegramTranscriptDelivery<'a, 'b> {
@@ -7049,6 +7074,31 @@ mod tests {
         assert_eq!(
             activity_watch_text(&restored),
             "• **Explored**\n  └ Read `telegram.rs`"
+        );
+    }
+
+    #[test]
+    fn status_panel_state_throttles_active_edit_across_drains() {
+        let target = CapturingTranscriptTarget::default();
+        let mut panel = TelegramStatusPanel::from_state(None);
+        panel.start();
+
+        assert!(panel.flush(&target, false).unwrap());
+        let mut restored = TelegramStatusPanel::from_state(panel.to_state());
+
+        assert!(!restored.flush(&target, false).unwrap());
+        assert_eq!(target.sent.borrow().len(), 1);
+        assert!(target.edited.borrow().is_empty());
+    }
+
+    #[test]
+    fn retry_after_delay_reads_telegram_rate_limit() {
+        let err =
+            anyhow::anyhow!("Telegram editMessageText failed: Too Many Requests: retry after 27");
+
+        assert_eq!(
+            telegram_retry_after_delay(&err),
+            Some(Duration::from_secs(28))
         );
     }
 

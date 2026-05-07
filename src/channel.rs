@@ -63,6 +63,8 @@ pub mod telegram {
         schema_version: u64,
         #[serde(skip_serializing_if = "Option::is_none")]
         last_update_id: Option<i64>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        trusted_routes: Vec<TelegramRoute>,
         bindings: Vec<TelegramBinding>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         active_routes: Vec<TelegramActiveRoute>,
@@ -104,9 +106,11 @@ pub mod telegram {
         alias: Option<String>,
     }
 
-    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+    #[serde(rename_all = "camelCase")]
     struct TelegramRoute {
         chat_id: i64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         message_thread_id: Option<i64>,
     }
 
@@ -286,8 +290,15 @@ pub mod telegram {
             Self {
                 schema_version: TELEGRAM_STATE_SCHEMA_VERSION,
                 last_update_id: None,
+                trusted_routes: Vec::new(),
                 bindings: Vec::new(),
                 active_routes: Vec::new(),
+            }
+        }
+
+        fn trust_route(&mut self, route: &TelegramRoute) {
+            if !self.trusted_routes.contains(route) {
+                self.trusted_routes.push(route.clone());
             }
         }
 
@@ -638,6 +649,13 @@ pub mod telegram {
                 );
             }
         }
+        if state.trusted_routes.is_empty() {
+            println!("trusted_routes: 0");
+        } else {
+            for route in state.trusted_routes {
+                println!("trusted\t{}", route.display());
+            }
+        }
         Ok(())
     }
 
@@ -705,7 +723,8 @@ pub mod telegram {
                 continue;
             }
             if matches!(access, MessageAccess::AuthorizedByBind) {
-                let route = TelegramRoute::from_message(&message);
+                let route = trusted_route_for_message(&message);
+                state.trust_route(&route);
                 trusted.insert(route.clone());
                 bound_route = Some(route);
             }
@@ -983,17 +1002,30 @@ pub mod telegram {
 
     fn trusted_chats(state: &TelegramState, allow_chats: Vec<i64>) -> BTreeSet<TelegramRoute> {
         state
-            .bindings
+            .trusted_routes
             .iter()
-            .map(|binding| TelegramRoute {
+            .cloned()
+            .chain(state.bindings.iter().map(|binding| TelegramRoute {
                 chat_id: binding.chat_id,
                 message_thread_id: binding.message_thread_id,
-            })
+            }))
             .chain(allow_chats.into_iter().map(|chat_id| TelegramRoute {
                 chat_id,
                 message_thread_id: None,
             }))
             .collect()
+    }
+
+    fn trusted_route_for_message(message: &TelegramMessage) -> TelegramRoute {
+        let route = TelegramRoute::from_message(message);
+        if message.chat.is_forum {
+            TelegramRoute {
+                chat_id: route.chat_id,
+                message_thread_id: None,
+            }
+        } else {
+            route
+        }
     }
 
     fn generate_bind_secret() -> Result<String> {
@@ -1200,7 +1232,7 @@ pub mod telegram {
             }
             return Ok(None);
         }
-        let text = message.text.unwrap_or_default();
+        let text = message.text.clone().unwrap_or_default();
         let command = TelegramTextCommand::parse(&text);
 
         if let Some(callback_data) = options.callback_data {
@@ -1266,7 +1298,14 @@ pub mod telegram {
             TelegramTextCommand::Bind { .. } if !options.authorized_by_bind => {
                 Ok(Some(reply(&route, "Invalid or disabled bind secret.")))
             }
-            TelegramTextCommand::Start | TelegramTextCommand::Bind { .. } => {
+            TelegramTextCommand::Bind { .. } => Ok(Some(reply(
+                &route,
+                format!(
+                    "Trusted Telegram route {}.",
+                    trusted_route_for_message(&message).display()
+                ),
+            ))),
+            TelegramTextCommand::Start => {
                 let binding = state.bind_route(paths, &route, None)?;
                 session::record_channel_message(
                     paths,
@@ -5532,6 +5571,63 @@ pub mod telegram {
             let access = message_access(&message, &state, &trusted, Some("secret-123"), true);
 
             assert_eq!(access, MessageAccess::DeniedBind);
+        }
+
+        #[test]
+        fn bind_command_uses_chat_scope_for_forum_messages() {
+            let message = TelegramMessage {
+                chat: TelegramChat {
+                    id: -10042,
+                    is_forum: true,
+                },
+                message_id: 1,
+                date: None,
+                message_thread_id: Some(99),
+                text: Some("/bind secret-123".to_string()),
+                forum_topic_edited: None,
+            };
+
+            assert_eq!(
+                trusted_route_for_message(&message),
+                TelegramRoute {
+                    chat_id: -10042,
+                    message_thread_id: None
+                }
+            );
+        }
+
+        #[test]
+        fn bind_command_does_not_create_session_binding() {
+            let paths = temp_paths("bind-trust-only");
+            let mut state = TelegramState::empty();
+            let mut options = handle_options();
+            options.authorized_by_bind = true;
+            let message = text_message(42, None, "/bind secret-123");
+
+            let reply = handle_message(&paths, &mut state, message, options)
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(reply.text, "Trusted Telegram route 42.");
+            assert!(state.bindings.is_empty());
+            assert!(session::list_sessions(&paths).unwrap().is_empty());
+
+            let _ = fs::remove_dir_all(paths.serve_dir());
+        }
+
+        #[test]
+        fn trusted_route_trusts_forum_topic_routes() {
+            let mut state = TelegramState::empty();
+            state.trust_route(&TelegramRoute {
+                chat_id: -10042,
+                message_thread_id: None,
+            });
+            let trusted = trusted_chats(&state, Vec::new());
+            let message = text_message(-10042, Some(99), "/portal");
+
+            let access = message_access(&message, &state, &trusted, None, true);
+
+            assert_eq!(access, MessageAccess::Allowed);
         }
 
         #[test]

@@ -1509,6 +1509,12 @@ pub mod telegram {
                 channel_id: binding.channel_id.clone(),
             },
         )?;
+        write_state(paths, state)?;
+
+        if let Some(notifier) = options.notifier {
+            send_watch_intro(paths, state, notifier, &effective_route, &binding, entry)?;
+            write_state(paths, state)?;
+        }
 
         watch_bound_thread(paths, &effective_route, &binding, options)
     }
@@ -1884,6 +1890,35 @@ pub mod telegram {
             })
             .unwrap_or("Codex thread");
         truncate_chars(title.lines().next().unwrap_or("Codex thread"), 64)
+    }
+
+    fn send_watch_intro(
+        paths: &ManagerPaths,
+        state: &mut TelegramState,
+        notifier: &TelegramNotifier<'_>,
+        route: &TelegramRoute,
+        binding: &TelegramBinding,
+        entry: &AppThreadPortalEntry,
+    ) -> Result<()> {
+        let panel_text = watch_started_text(entry);
+        let panel_message_id = notifier.send_with_keyboard(
+            route,
+            &panel_text,
+            &work_panel_keyboard(binding, route),
+        )?;
+        state.remember_panel_message(route, panel_message_id);
+
+        if let Some(history) = rollout_history_text(paths, &entry.thread_id, 6)? {
+            notifier.send_one(route, &history)?;
+        }
+        Ok(())
+    }
+
+    fn watch_started_text(entry: &AppThreadPortalEntry) -> String {
+        format!(
+            "Watching Codex thread.\nthread: {}\ncwd: {}\nstatus: {}\nNew output will stream in this topic.",
+            entry.thread_id, entry.cwd, entry.status
+        )
     }
 
     fn takeover_message(interrupted_turn_id: Option<&str>) -> String {
@@ -2277,6 +2312,27 @@ pub mod telegram {
         },
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RolloutHistoryItem {
+        role: RolloutHistoryRole,
+        message: String,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum RolloutHistoryRole {
+        User,
+        Codex,
+    }
+
+    impl RolloutHistoryRole {
+        fn label(self) -> &'static str {
+            match self {
+                Self::User => "User",
+                Self::Codex => "Codex",
+            }
+        }
+    }
+
     fn active_rollout_turn(
         paths: &ManagerPaths,
         thread_id: &str,
@@ -2490,6 +2546,72 @@ pub mod telegram {
             return None;
         }
         value.get("payload").cloned()
+    }
+
+    fn rollout_history_text(
+        paths: &ManagerPaths,
+        thread_id: &str,
+        max_items: usize,
+    ) -> Result<Option<String>> {
+        if max_items == 0 {
+            return Ok(None);
+        }
+        let Some(path) = rollout_path_for_thread(paths, thread_id) else {
+            return Ok(None);
+        };
+        if !path.exists() {
+            return Ok(None);
+        }
+
+        let file =
+            fs::File::open(&path).with_context(|| format!("open rollout {}", path.display()))?;
+        let reader = BufReader::new(file);
+        let mut items = Vec::<RolloutHistoryItem>::new();
+        for line in reader.lines() {
+            let line = line.with_context(|| format!("read rollout {}", path.display()))?;
+            let Some(item) = rollout_history_item(&line) else {
+                continue;
+            };
+            items.push(item);
+            if items.len() > max_items {
+                items.remove(0);
+            }
+        }
+
+        if items.is_empty() {
+            return Ok(None);
+        }
+
+        let mut text = String::from("Recent thread history:");
+        for item in items {
+            text.push_str("\n\n");
+            text.push_str(item.role.label());
+            text.push_str(": ");
+            text.push_str(&compact_history_message(&item.message));
+        }
+        Ok(Some(text))
+    }
+
+    fn rollout_history_item(line: &str) -> Option<RolloutHistoryItem> {
+        let value = rollout_event_payload(line)?;
+        let kind = value.get("type")?.as_str()?;
+        let (role, message) = match kind {
+            "user_message" => (RolloutHistoryRole::User, value.get("message")?.as_str()?),
+            "agent_message" => (RolloutHistoryRole::Codex, value.get("message")?.as_str()?),
+            _ => return None,
+        };
+        if message.trim().is_empty() {
+            return None;
+        }
+        Some(RolloutHistoryItem {
+            role,
+            message: message.to_string(),
+        })
+    }
+
+    fn compact_history_message(message: &str) -> String {
+        let normalized = message.split_whitespace().collect::<Vec<_>>().join(" ");
+        truncate_chars(&normalized, 700)
     }
 
     fn rollout_owner_app_server_urls(paths: &ManagerPaths, thread_id: &str) -> Vec<String> {
@@ -4792,6 +4914,66 @@ pub mod telegram {
                     terminal: ObserveTerminal::Completed,
                     last_agent_message: Some("done".to_string()),
                 })
+            );
+        }
+
+        #[test]
+        fn rollout_history_text_reads_recent_user_and_agent_messages() {
+            let paths = temp_paths("rollout-history");
+            fs::create_dir_all(&paths.base_codex_home).unwrap();
+            let rollout = paths.base_codex_home.join("rollout.jsonl");
+            fs::write(
+                &rollout,
+                concat!(
+                    r#"{"type":"event_msg","payload":{"type":"user_message","message":"first question"}}"#,
+                    "\n",
+                    r#"{"type":"event_msg","payload":{"type":"agent_message","message":"first answer","phase":"final_answer"}}"#,
+                    "\n",
+                    r#"{"type":"event_msg","payload":{"type":"user_message","message":"second question"}}"#,
+                    "\n",
+                    r#"{"type":"event_msg","payload":{"type":"agent_message","message":"second answer","phase":"final_answer"}}"#,
+                    "\n",
+                    r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"}}"#,
+                    "\n"
+                ),
+            )
+            .unwrap();
+            let conn = Connection::open(paths.base_codex_home.join("state_5.sqlite")).unwrap();
+            conn.execute(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, archived INTEGER NOT NULL DEFAULT 0)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO threads (id, rollout_path, archived) VALUES (?1, ?2, 0)",
+                params!["thread-history", rollout.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+
+            let text = rollout_history_text(&paths, "thread-history", 3)
+                .unwrap()
+                .unwrap();
+
+            assert!(text.starts_with("Recent thread history:"));
+            assert!(!text.contains("first question"));
+            assert!(text.contains("Codex: first answer"));
+            assert!(text.contains("User: second question"));
+            assert!(text.contains("Codex: second answer"));
+        }
+
+        #[test]
+        fn rollout_history_item_ignores_empty_and_non_message_events() {
+            assert_eq!(
+                rollout_history_item(
+                    r#"{"type":"event_msg","payload":{"type":"agent_message","message":"  "}}"#,
+                ),
+                None
+            );
+            assert_eq!(
+                rollout_history_item(
+                    r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                ),
+                None
             );
         }
 

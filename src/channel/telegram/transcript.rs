@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -88,10 +89,8 @@ impl TelegramStatusPanel {
             return;
         }
         self.active = true;
+        self.turn_started_at_ms = Some(unix_millis());
         self.turn_finished_at_ms = None;
-        if self.turn_started_at_ms.is_none() {
-            self.turn_started_at_ms = Some(unix_millis());
-        }
         self.dirty = true;
     }
 
@@ -217,6 +216,7 @@ pub(super) struct TelegramThinkingPanel {
     text: String,
     message_id: Option<i64>,
     last_flush: Instant,
+    last_flush_at_ms: Option<u128>,
     retry_after_ms: Option<u128>,
     last_sent_text: Option<String>,
     last_sent_chars: usize,
@@ -235,6 +235,7 @@ impl TelegramThinkingPanel {
             text: String::new(),
             message_id: None,
             last_flush: Instant::now() - Self::MIN_EDIT_INTERVAL,
+            last_flush_at_ms: None,
             retry_after_ms: None,
             last_sent_text: None,
             last_sent_chars: 0,
@@ -245,9 +246,47 @@ impl TelegramThinkingPanel {
         }
     }
 
+    pub(super) fn from_state(state: Option<TelegramThinkingState>) -> Self {
+        let Some(state) = state else {
+            return Self::new();
+        };
+        Self {
+            text: state.text,
+            message_id: state.message_id,
+            last_flush: instant_from_unix_millis(state.last_flush_at_ms, Self::MIN_EDIT_INTERVAL),
+            last_flush_at_ms: state.last_flush_at_ms,
+            retry_after_ms: state.retry_after_ms,
+            last_sent_text: state.last_sent_text,
+            last_sent_chars: state.last_sent_chars,
+            sent_any: false,
+            dirty: state.active,
+            active: state.active,
+            done: state.done,
+        }
+    }
+
+    pub(super) fn to_state(&self) -> Option<TelegramThinkingState> {
+        if self.text.trim().is_empty() && self.message_id.is_none() {
+            return None;
+        }
+        if self.done && !self.dirty && self.retry_after_ms.is_none() {
+            return None;
+        }
+        Some(TelegramThinkingState {
+            text: self.text.clone(),
+            message_id: self.message_id,
+            last_flush_at_ms: self.last_flush_at_ms,
+            retry_after_ms: self.retry_after_ms,
+            last_sent_text: self.last_sent_text.clone(),
+            last_sent_chars: self.last_sent_chars,
+            active: self.active,
+            done: self.done,
+        })
+    }
+
     pub(super) fn start(&mut self) {
         if self.done {
-            return;
+            *self = Self::new();
         }
         self.active = true;
     }
@@ -311,7 +350,7 @@ impl TelegramThinkingPanel {
             }
         }
         self.dirty = false;
-        self.last_flush = Instant::now();
+        self.record_delivery_attempt();
         self.retry_after_ms = None;
         self.last_sent_chars = current_chars;
         self.last_sent_text = Some(text);
@@ -320,7 +359,7 @@ impl TelegramThinkingPanel {
     }
 
     pub(super) fn mark_delivery_attempted(&mut self) {
-        self.last_flush = Instant::now();
+        self.record_delivery_attempt();
     }
 
     pub(super) fn defer_delivery_for(&mut self, delay: Duration) {
@@ -340,6 +379,31 @@ impl TelegramThinkingPanel {
     pub(super) fn message_id(&self) -> Option<i64> {
         self.message_id
     }
+
+    fn record_delivery_attempt(&mut self) {
+        self.last_flush = Instant::now();
+        self.last_flush_at_ms = Some(unix_millis());
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct TelegramThinkingState {
+    text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    message_id: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_flush_at_ms: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retry_after_ms: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_sent_text: Option<String>,
+    #[serde(default)]
+    last_sent_chars: usize,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    done: bool,
 }
 
 pub(super) fn thinking_watch_text(panel: &TelegramThinkingPanel) -> String {
@@ -578,7 +642,10 @@ fn retry_after_is_active(retry_after_ms: Option<u128>) -> bool {
 
 impl From<CommandExecution> for TelegramActivityItem {
     fn from(command: CommandExecution) -> Self {
-        let activity = command_activity(&command);
+        let mut activity = command_activity(&command);
+        if activity_verb_is_file_change(&activity.verb) {
+            activity.target = relativize_file_change_target(&activity.target, &command.cwd);
+        }
         Self {
             verb: activity.verb,
             target: truncate_chars(activity.target.trim(), 300),
@@ -662,7 +729,11 @@ fn activity_item_is_explore(item: &TelegramActivityItem) -> bool {
 }
 
 fn activity_item_is_file_change(item: &TelegramActivityItem) -> bool {
-    matches!(item.verb.as_str(), "Added" | "Edited" | "Deleted")
+    activity_verb_is_file_change(&item.verb)
+}
+
+fn activity_verb_is_file_change(verb: &str) -> bool {
+    matches!(verb, "Added" | "Edited" | "Deleted")
 }
 
 fn activity_explore_group_lines(items: &[&TelegramActivityItem]) -> Vec<String> {
@@ -904,6 +975,42 @@ fn split_diff_count_suffix(text: &str) -> Option<(&str, &str)> {
     Some((text[..start].trim(), suffix))
 }
 
+fn relativize_file_change_target(target: &str, cwd: &str) -> String {
+    target
+        .lines()
+        .map(|line| relativize_file_change_line(line, cwd))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn relativize_file_change_line(line: &str, cwd: &str) -> String {
+    let trimmed = line.trim();
+    let Some((path, counts)) = split_diff_count_suffix(trimmed) else {
+        return trimmed.to_string();
+    };
+    format!("{} {}", relativize_path_for_cwd(path, cwd), counts)
+}
+
+fn relativize_path_for_cwd(path: &str, cwd: &str) -> String {
+    let path = path.trim();
+    let cwd = cwd.trim();
+    if path.is_empty() || cwd.is_empty() {
+        return path.to_string();
+    }
+    let path_ref = Path::new(path);
+    if !path_ref.is_absolute() {
+        return path.to_string();
+    }
+    let cwd_ref = Path::new(cwd);
+    path_ref
+        .strip_prefix(cwd_ref)
+        .ok()
+        .and_then(|relative| relative.to_str())
+        .filter(|relative| !relative.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| path.to_string())
+}
+
 fn split_skill_annotation_suffix(text: &str) -> Option<(&str, &str)> {
     let start = text.rfind(" (")?;
     let suffix = &text[start + 1..];
@@ -997,5 +1104,74 @@ fn format_duration_ms(duration_ms: i64) -> String {
         format!("{:.1}s", duration_ms as f64 / 1000.0)
     } else {
         format!("{duration_ms}ms")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+
+    use super::*;
+
+    #[derive(Default)]
+    struct CapturingTarget {
+        sent: RefCell<Vec<String>>,
+        edited: RefCell<Vec<(i64, String)>>,
+    }
+
+    impl TelegramTranscriptTarget for CapturingTarget {
+        fn send_one(&self, text: &str) -> Result<i64> {
+            self.sent.borrow_mut().push(text.to_string());
+            Ok(self.sent.borrow().len() as i64)
+        }
+
+        fn edit_one(&self, message_id: i64, text: &str) -> Result<()> {
+            self.edited
+                .borrow_mut()
+                .push((message_id, text.to_string()));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn status_start_resets_elapsed_time_for_new_turn() {
+        let mut panel = TelegramStatusPanel::new();
+        panel.turn_started_at_ms = Some(1000);
+        panel.turn_finished_at_ms = Some(2000);
+
+        panel.start();
+
+        assert!(panel.active);
+        assert_ne!(panel.turn_started_at_ms, Some(1000));
+        assert_eq!(panel.turn_finished_at_ms, None);
+    }
+
+    #[test]
+    fn status_start_preserves_elapsed_time_for_active_turn_resume() {
+        let mut panel = TelegramStatusPanel::new();
+        panel.active = true;
+        panel.turn_started_at_ms = Some(1000);
+
+        panel.start();
+
+        assert_eq!(panel.turn_started_at_ms, Some(1000));
+    }
+
+    #[test]
+    fn thinking_state_preserves_edit_target_across_drains() {
+        let target = CapturingTarget::default();
+        let mut panel = TelegramThinkingPanel::new();
+        panel.start();
+        panel.push("first thought");
+        assert!(panel.flush(&target, true).unwrap());
+
+        let mut restored = TelegramThinkingPanel::from_state(panel.to_state());
+        restored.push("\nsecond thought");
+        assert!(restored.flush(&target, true).unwrap());
+
+        assert_eq!(target.sent.borrow().len(), 1);
+        assert_eq!(target.edited.borrow().len(), 1);
+        assert_eq!(target.edited.borrow()[0].0, 1);
+        assert!(target.edited.borrow()[0].1.contains("second thought"));
     }
 }

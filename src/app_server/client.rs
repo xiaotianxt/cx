@@ -772,7 +772,12 @@ fn file_change_activity_from_item(item: &Value) -> Option<CommandExecution> {
     Some(CommandExecution {
         item_id: item.get("id")?.as_str()?.to_string(),
         command: "apply patch".to_string(),
-        cwd: String::new(),
+        cwd: item
+            .get("cwd")
+            .or_else(|| item.get("workdir"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
         activity: Some(CommandActivity {
             verb: verb.to_string(),
             target,
@@ -1318,6 +1323,7 @@ mod tests {
                         "diff": "@@\n-old\n+new\n+another\n"
                     }
                 ],
+                "cwd": "/tmp/project",
                 "status": "completed"
             },
             "completedAtMs": 10
@@ -1330,7 +1336,7 @@ mod tests {
             CommandExecution {
                 item_id: "patch-1".to_string(),
                 command: "apply patch".to_string(),
-                cwd: String::new(),
+                cwd: "/tmp/project".to_string(),
                 activity: Some(CommandActivity {
                     verb: "Edited".to_string(),
                     target: "src/channel/telegram.rs (+2 -1)".to_string(),

@@ -67,6 +67,7 @@ use self::transcript::TelegramActivityState;
 use self::transcript::TelegramStatusPanel;
 use self::transcript::TelegramStatusState;
 use self::transcript::TelegramThinkingPanel;
+use self::transcript::TelegramThinkingState;
 use self::transcript::TelegramTranscriptTarget;
 
 const TELEGRAM_STATE_SCHEMA_VERSION: u64 = 1;
@@ -118,6 +119,8 @@ struct TelegramBinding {
     watch_rollout_offset: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     watch_activity: Option<TelegramActivityState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    watch_thinking: Option<TelegramThinkingState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     watch_status: Option<TelegramStatusState>,
 }
@@ -398,6 +401,7 @@ impl TelegramState {
             watch_proxy_offset: None,
             watch_rollout_offset: None,
             watch_activity: None,
+            watch_thinking: None,
             watch_status: None,
         };
         self.bindings.push(binding.clone());
@@ -425,6 +429,7 @@ impl TelegramState {
             stored.watch_proxy_offset = None;
             stored.watch_rollout_offset = None;
             stored.watch_activity = None;
+            stored.watch_thinking = None;
             stored.watch_status = None;
             binding = stored.clone();
         }
@@ -929,17 +934,23 @@ fn drain_watched_binding(
             .binding_for_route(route, binding.alias.as_deref())
             .and_then(|stored| stored.watch_status.clone())
             .or_else(|| binding.watch_status.clone());
+        let thinking_state = state
+            .binding_for_route(route, binding.alias.as_deref())
+            .and_then(|stored| stored.watch_thinking.clone())
+            .or_else(|| binding.watch_thinking.clone());
         let proxy_had_events = !proxy_drain.events.is_empty();
         let send_result = send_watch_events(
             route,
             notifier,
             proxy_drain.events,
             activity_state,
+            thinking_state,
             status_state,
         )?;
         if let Some(stored) = state.binding_for_route_mut(route, binding.alias.as_deref()) {
             stored.watch_proxy_offset = Some(proxy_drain.next_offset);
             stored.watch_activity = send_result.activity;
+            stored.watch_thinking = send_result.thinking;
             stored.watch_status = send_result.status;
         }
         if send_result.sent_any && proxy_had_events {
@@ -980,11 +991,22 @@ fn drain_watched_binding(
         .binding_for_route(route, binding.alias.as_deref())
         .and_then(|stored| stored.watch_status.clone())
         .or_else(|| binding.watch_status.clone());
-    let send_result =
-        send_watch_events(route, notifier, drain.events, activity_state, status_state)?;
+    let thinking_state = state
+        .binding_for_route(route, binding.alias.as_deref())
+        .and_then(|stored| stored.watch_thinking.clone())
+        .or_else(|| binding.watch_thinking.clone());
+    let send_result = send_watch_events(
+        route,
+        notifier,
+        drain.events,
+        activity_state,
+        thinking_state,
+        status_state,
+    )?;
     if let Some(stored) = state.binding_for_route_mut(route, binding.alias.as_deref()) {
         stored.watch_rollout_offset = Some(drain.next_offset);
         stored.watch_activity = send_result.activity;
+        stored.watch_thinking = send_result.thinking;
         stored.watch_status = send_result.status;
     }
     Ok(())
@@ -993,6 +1015,7 @@ fn drain_watched_binding(
 struct WatchSendResult {
     sent_any: bool,
     activity: Option<TelegramActivityState>,
+    thinking: Option<TelegramThinkingState>,
     status: Option<TelegramStatusState>,
 }
 
@@ -1001,9 +1024,11 @@ fn send_watch_events(
     notifier: &TelegramNotifier<'_>,
     events: Vec<RolloutObserveEvent>,
     activity: Option<TelegramActivityState>,
+    thinking: Option<TelegramThinkingState>,
     status: Option<TelegramStatusState>,
 ) -> Result<WatchSendResult> {
-    let mut sink = TelegramWatchSink::new_best_effort(notifier, route.clone(), activity, status);
+    let mut sink =
+        TelegramWatchSink::new_best_effort(notifier, route.clone(), activity, thinking, status);
     let mut last_sent_agent_message = None::<String>;
     for event in events {
         match event {
@@ -1031,6 +1056,7 @@ fn send_watch_events(
     Ok(WatchSendResult {
         sent_any: sink.sent_any(),
         activity: sink.activity_state(),
+        thinking: sink.thinking_state(),
         status: sink.status_state(),
     })
 }
@@ -1960,6 +1986,7 @@ fn watch_bound_thread(
 
 fn initialize_watch_cursor(paths: &ManagerPaths, binding: &mut TelegramBinding) {
     binding.watch_activity = None;
+    binding.watch_thinking = None;
     binding.watch_status = None;
     if binding.watch_proxy_offset.is_none() {
         if let Ok(metadata) = fs::metadata(proxy_event_log_path(paths)) {
@@ -2628,8 +2655,9 @@ fn run_codex_turn(
             thread.upstream_thread_id
         }
     };
-    let mut sink = notifier
-        .map(|notifier| TelegramWatchSink::new_best_effort(notifier, route.clone(), None, None));
+    let mut sink = notifier.map(|notifier| {
+        TelegramWatchSink::new_best_effort(notifier, route.clone(), None, None, None)
+    });
     let turn_start = Instant::now();
     let mut first_event_seen = false;
     let turn = client.turn_start_stream(
@@ -3212,7 +3240,7 @@ fn rollout_apply_patch_start(value: &Value) -> Option<CommandExecution> {
     Some(CommandExecution {
         item_id: call_id.to_string(),
         command: "apply_patch".to_string(),
-        cwd: String::new(),
+        cwd: rollout_workdir(value),
         activity: Some(CommandActivity {
             verb: "Edited".to_string(),
             target: patch_activity_target(&patch),
@@ -3234,13 +3262,22 @@ fn rollout_patch_apply_command(
     Some(CommandExecution {
         item_id: value.get("call_id").and_then(Value::as_str)?.to_string(),
         command: "apply_patch".to_string(),
-        cwd: String::new(),
+        cwd: rollout_workdir(value),
         activity: Some(activity),
         status,
         exit_code: None,
         duration_ms: None,
         aggregated_output: output,
     })
+}
+
+fn rollout_workdir(value: &Value) -> String {
+    value
+        .get("cwd")
+        .or_else(|| value.get("workdir"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
 }
 
 fn rollout_patch_apply_status(value: &Value) -> CommandExecutionStatus {
@@ -4382,18 +4419,18 @@ impl<'a> TelegramWatchSink<'a> {
         notifier: &'a TelegramNotifier<'a>,
         route: TelegramRoute,
         activity: Option<TelegramActivityState>,
+        thinking: Option<TelegramThinkingState>,
         status: Option<TelegramStatusState>,
     ) -> Self {
         let status = TelegramStatusPanel::from_state(status);
-        let status_needs_tail = status.is_active() && status.message_id().is_some();
         Self {
             status,
-            thinking: TelegramThinkingPanel::new(),
+            thinking: TelegramThinkingPanel::from_state(thinking),
             agent: TelegramDeltaSink::new(notifier, route),
             activity: TelegramActivityPanel::from_state(activity),
             sent_any: false,
             best_effort_delivery: true,
-            status_needs_tail,
+            status_needs_tail: false,
         }
     }
 
@@ -4805,6 +4842,10 @@ impl<'a> TelegramWatchSink<'a> {
 
     fn activity_state(&self) -> Option<TelegramActivityState> {
         self.activity.to_state()
+    }
+
+    fn thinking_state(&self) -> Option<TelegramThinkingState> {
+        self.thinking.to_state()
     }
 
     fn status_state(&self) -> Option<TelegramStatusState> {
@@ -6233,6 +6274,7 @@ mod tests {
             watch_proxy_offset: None,
             watch_rollout_offset: None,
             watch_activity: None,
+            watch_thinking: None,
             watch_status: None,
         });
 
@@ -6381,6 +6423,7 @@ mod tests {
             watch_proxy_offset: None,
             watch_rollout_offset: None,
             watch_activity: None,
+            watch_thinking: None,
             watch_status: None,
         });
         let trusted = trusted_chats(&state, Vec::new());
@@ -6410,6 +6453,7 @@ mod tests {
             watch_proxy_offset: None,
             watch_rollout_offset: None,
             watch_activity: None,
+            watch_thinking: None,
             watch_status: None,
         });
         let trusted = trusted_chats(&state, Vec::new());
@@ -7533,7 +7577,8 @@ mod tests {
             chat_id: 1,
             message_thread_id: None,
         };
-        let mut sink = TelegramWatchSink::new_best_effort(&notifier, route, panel.to_state(), None);
+        let mut sink =
+            TelegramWatchSink::new_best_effort(&notifier, route, panel.to_state(), None, None);
 
         sink.seal_activity_cell().unwrap();
         sink.activity.apply_execution(CommandExecution {
@@ -7554,6 +7599,28 @@ mod tests {
             activity_watch_text(&sink.activity),
             "• **Explored**\n  └ Read `client.rs`"
         );
+    }
+
+    #[test]
+    fn watch_sink_does_not_move_persisted_status_without_new_tail_content() {
+        let target = CapturingTranscriptTarget::default();
+        let mut status = TelegramStatusPanel::from_state(None);
+        status.start();
+        assert!(status.flush(&target, true).unwrap());
+
+        let client = Client::new();
+        let notifier = TelegramNotifier {
+            client: &client,
+            token: "test-token",
+        };
+        let route = TelegramRoute {
+            chat_id: 1,
+            message_thread_id: None,
+        };
+        let sink =
+            TelegramWatchSink::new_best_effort(&notifier, route, None, None, status.to_state());
+
+        assert!(!sink.status_needs_tail);
     }
 
     #[test]
@@ -7590,7 +7657,7 @@ mod tests {
             cwd: "/tmp/project".to_string(),
             activity: Some(CommandActivity {
                 verb: "Edited".to_string(),
-                target: "src/channel/telegram.rs (+12 -3)".to_string(),
+                target: "/tmp/project/src/channel/telegram.rs (+12 -3)".to_string(),
             }),
             status: CommandExecutionStatus::Completed,
             exit_code: None,

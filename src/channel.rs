@@ -618,14 +618,20 @@ pub mod telegram {
         } else {
             for binding in state.bindings {
                 let app_thread = binding.app_thread_id.as_deref().unwrap_or("<none>");
+                let handoff = if binding.telegram_paused {
+                    "paused"
+                } else {
+                    "active"
+                };
                 println!(
-                    "{}\t{}\t{}\t{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}",
                     binding.chat_id,
                     binding.message_thread_id.unwrap_or_default(),
                     binding.alias.as_deref().unwrap_or("default"),
                     binding.channel_id,
                     binding.session_id,
-                    app_thread
+                    app_thread,
+                    handoff
                 );
             }
         }
@@ -1331,7 +1337,7 @@ pub mod telegram {
                 let Some(binding) = state.active_binding_for_route(&route).cloned() else {
                     return Ok(Some(reply(&route, no_session_bound_message(state, &route))));
                 };
-                watch_bound_thread(paths, &route, &binding, &options)
+                watch_bound_thread(paths, state, &route, &binding, &options, true)
             }
             TelegramTextCommand::Message => {
                 if is_portal_route(&route, chat_is_forum) {
@@ -1612,10 +1618,11 @@ pub mod telegram {
             route.clone()
         };
 
-        let binding =
+        let mut binding =
             state.bind_app_thread(paths, &effective_route, entry, topic_created_by_adapter)?;
         if let Some(stored) = state.binding_for_route_mut(&effective_route, None) {
             stored.telegram_paused = true;
+            binding = stored.clone();
         }
         session::record_channel_message(
             paths,
@@ -1631,7 +1638,7 @@ pub mod telegram {
             write_state(paths, state)?;
         }
 
-        watch_bound_thread(paths, &effective_route, &binding, options)
+        watch_bound_thread(paths, state, &effective_route, &binding, options, false)
     }
 
     fn takeover_handoff(
@@ -1708,11 +1715,36 @@ pub mod telegram {
         )))
     }
 
+    fn release_binding_lease_if_owned(
+        paths: &ManagerPaths,
+        binding: &TelegramBinding,
+    ) -> Result<bool> {
+        let Ok(session) = session::show_session(paths, &binding.session_id) else {
+            return Ok(false);
+        };
+        let Some(active_lease) = session.active_lease else {
+            return Ok(false);
+        };
+        if active_lease.channel_id != binding.channel_id {
+            return Ok(false);
+        }
+        session::release_lease(
+            paths,
+            session::ReleaseLeaseRequest {
+                session_id: binding.session_id.clone(),
+                lease_token: active_lease.lease_token,
+            },
+        )?;
+        Ok(true)
+    }
+
     fn watch_bound_thread(
         paths: &ManagerPaths,
+        state: &mut TelegramState,
         route: &TelegramRoute,
         binding: &TelegramBinding,
         options: &HandleOptions<'_>,
+        show_idle_reply: bool,
     ) -> Result<Option<TelegramReply>> {
         let Some(_thread_id) = binding.app_thread_id.as_deref() else {
             return Ok(Some(reply(
@@ -1720,15 +1752,31 @@ pub mod telegram {
                 "This session is not bound to a Codex thread yet. Send a message first.",
             )));
         };
+        if let Some(stored) = state.binding_for_route_mut(route, binding.alias.as_deref()) {
+            stored.telegram_paused = true;
+        }
+        release_binding_lease_if_owned(paths, binding)?;
+        let binding = state
+            .binding_for_route(route, binding.alias.as_deref())
+            .cloned()
+            .unwrap_or_else(|| binding.clone());
 
         let result = run_codex_observe(
             paths,
             route,
-            binding,
+            &binding,
             options.app_server_timeout,
             options.notifier,
         );
-        observe_result_reply(route, binding, result)
+        if show_idle_reply && matches!(&result, ObserveResult::NoActiveTurn) {
+            return Ok(Some(work_panel_reply(
+                route,
+                &binding,
+                "Telegram handoff paused. Watching for desktop activity.",
+                None,
+            )));
+        }
+        observe_result_reply(route, &binding, result)
     }
 
     fn observe_result_reply(
@@ -2120,7 +2168,7 @@ pub mod telegram {
 
     fn watch_started_text(entry: &AppThreadPortalEntry) -> String {
         format!(
-            "Watching Codex thread.\nthread: {}\ncwd: {}\nstatus: {}\nLive output will stream in this topic when a turn is active.",
+            "Watching Codex thread.\nTelegram handoff is paused for this topic.\nthread: {}\ncwd: {}\nstatus: {}\nLive output will stream here while the desktop turn runs.",
             entry.thread_id, entry.cwd, entry.status
         )
     }
@@ -2756,8 +2804,15 @@ pub mod telegram {
         let value = rollout_event_payload_value(&top_level)?;
         let kind = value.get("type")?.as_str()?;
         match kind {
+            "task_started" | "turn_started" => {
+                Some(RolloutObserveEvent::Stream(AppStreamEvent::TurnStarted))
+            }
             "agent_message" => value.get("message").and_then(Value::as_str).map(|message| {
-                RolloutObserveEvent::Stream(AppStreamEvent::AgentDelta(message.to_string()))
+                let event = match value.get("phase").and_then(Value::as_str) {
+                    Some("commentary") => AppStreamEvent::ReasoningDelta(message.to_string()),
+                    _ => AppStreamEvent::AgentDelta(message.to_string()),
+                };
+                RolloutObserveEvent::Stream(event)
             }),
             "exec_command_end" => Some(RolloutObserveEvent::Stream(
                 AppStreamEvent::CommandCompleted(rollout_exec_command_end(value)?),
@@ -2788,6 +2843,8 @@ pub mod telegram {
     fn rollout_response_item_observe_event(value: &Value) -> Option<RolloutObserveEvent> {
         let kind = value.get("type")?.as_str()?;
         match kind {
+            "reasoning" => rollout_reasoning_delta(value)
+                .map(|text| RolloutObserveEvent::Stream(AppStreamEvent::ReasoningDelta(text))),
             "function_call"
                 if value.get("name").and_then(Value::as_str) == Some("exec_command") =>
             {
@@ -2812,6 +2869,29 @@ pub mod telegram {
             }
             _ => None,
         }
+    }
+
+    fn rollout_reasoning_delta(value: &Value) -> Option<String> {
+        let mut parts = Vec::<String>::new();
+        if let Some(summary) = value.get("summary").and_then(Value::as_array) {
+            for item in summary {
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    if !text.trim().is_empty() {
+                        parts.push(text.to_string());
+                    }
+                }
+            }
+        }
+        if let Some(content) = value.get("content").and_then(Value::as_array) {
+            for item in content {
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    if !text.trim().is_empty() {
+                        parts.push(text.to_string());
+                    }
+                }
+            }
+        }
+        (!parts.is_empty()).then(|| parts.join("\n"))
     }
 
     fn rollout_exec_command_start(value: &Value) -> Option<CommandExecution> {
@@ -3557,6 +3637,7 @@ pub mod telegram {
     }
 
     struct TelegramWatchSink<'a> {
+        thinking: TelegramThinkingPanel,
         agent: TelegramDeltaSink<'a>,
         activity: TelegramActivityPanel,
         sent_any: bool,
@@ -3566,6 +3647,7 @@ pub mod telegram {
     impl<'a> TelegramWatchSink<'a> {
         fn new_best_effort(notifier: &'a TelegramNotifier<'a>, route: TelegramRoute) -> Self {
             Self {
+                thinking: TelegramThinkingPanel::new(),
                 agent: TelegramDeltaSink::new(notifier, route),
                 activity: TelegramActivityPanel::new(),
                 sent_any: false,
@@ -3575,7 +3657,58 @@ pub mod telegram {
 
         fn push_event(&mut self, event: AppStreamEvent) -> Result<()> {
             match event {
+                AppStreamEvent::TurnStarted => {
+                    self.thinking.start();
+                    if flush_thinking_panel(
+                        &mut self.thinking,
+                        self.agent.notifier,
+                        &self.agent.route,
+                        self.best_effort_delivery,
+                        false,
+                    )? {
+                        self.sent_any = true;
+                    }
+                    Ok(())
+                }
+                AppStreamEvent::ReasoningStarted => {
+                    self.thinking.start();
+                    if flush_thinking_panel(
+                        &mut self.thinking,
+                        self.agent.notifier,
+                        &self.agent.route,
+                        self.best_effort_delivery,
+                        false,
+                    )? {
+                        self.sent_any = true;
+                    }
+                    Ok(())
+                }
+                AppStreamEvent::ReasoningDelta(delta) => {
+                    self.thinking.push(&delta);
+                    if flush_thinking_panel(
+                        &mut self.thinking,
+                        self.agent.notifier,
+                        &self.agent.route,
+                        self.best_effort_delivery,
+                        false,
+                    )? {
+                        self.sent_any = true;
+                    }
+                    Ok(())
+                }
                 AppStreamEvent::AgentDelta(delta) => {
+                    if self.thinking.is_active() {
+                        self.thinking.finish();
+                        if flush_thinking_panel(
+                            &mut self.thinking,
+                            self.agent.notifier,
+                            &self.agent.route,
+                            self.best_effort_delivery,
+                            true,
+                        )? {
+                            self.sent_any = true;
+                        }
+                    }
                     if let Err(err) = self.agent.push(&delta) {
                         if is_telegram_missing_thread_error(&err) {
                             return Err(err);
@@ -3619,6 +3752,16 @@ pub mod telegram {
         }
 
         fn finish(&mut self) -> Result<()> {
+            self.thinking.finish();
+            if flush_thinking_panel(
+                &mut self.thinking,
+                self.agent.notifier,
+                &self.agent.route,
+                self.best_effort_delivery,
+                true,
+            )? {
+                self.sent_any = true;
+            }
             if let Err(err) = self.agent.finish() {
                 if is_telegram_missing_thread_error(&err) {
                     return Err(err);
@@ -3641,7 +3784,29 @@ pub mod telegram {
         }
 
         fn sent_any(&self) -> bool {
-            self.sent_any || self.agent.sent_any() || self.activity.sent_any()
+            self.sent_any
+                || self.thinking.sent_any()
+                || self.agent.sent_any()
+                || self.activity.sent_any()
+        }
+    }
+
+    fn flush_thinking_panel(
+        panel: &mut TelegramThinkingPanel,
+        notifier: &TelegramNotifier<'_>,
+        route: &TelegramRoute,
+        best_effort_delivery: bool,
+        force: bool,
+    ) -> Result<bool> {
+        match panel.flush(notifier, route, force) {
+            Ok(sent) => Ok(sent),
+            Err(err) if best_effort_delivery && is_telegram_missing_thread_error(&err) => Err(err),
+            Err(err) if best_effort_delivery => {
+                panel.mark_delivery_attempted();
+                log_watch_delivery_failure(route, "thinking", err);
+                Ok(false)
+            }
+            Err(err) => Err(err),
         }
     }
 
@@ -3669,6 +3834,127 @@ pub mod telegram {
             "telegram watch {kind} delivery failed for {}: {err:#}",
             route.display()
         );
+    }
+
+    struct TelegramThinkingPanel {
+        text: String,
+        message_id: Option<i64>,
+        last_flush: Instant,
+        last_sent_text: Option<String>,
+        last_sent_chars: usize,
+        sent_any: bool,
+        dirty: bool,
+        active: bool,
+        done: bool,
+    }
+
+    impl TelegramThinkingPanel {
+        const MIN_EDIT_INTERVAL: Duration = Duration::from_millis(900);
+        const MIN_DELTA_CHARS: usize = 160;
+
+        fn new() -> Self {
+            Self {
+                text: String::new(),
+                message_id: None,
+                last_flush: Instant::now() - Self::MIN_EDIT_INTERVAL,
+                last_sent_text: None,
+                last_sent_chars: 0,
+                sent_any: false,
+                dirty: false,
+                active: false,
+                done: false,
+            }
+        }
+
+        fn start(&mut self) {
+            if self.done {
+                return;
+            }
+            self.active = true;
+            self.dirty = true;
+        }
+
+        fn push(&mut self, delta: &str) {
+            if self.done {
+                return;
+            }
+            self.active = true;
+            self.text.push_str(delta);
+            self.dirty = true;
+        }
+
+        fn finish(&mut self) {
+            if !self.active || self.done {
+                return;
+            }
+            self.active = false;
+            self.done = true;
+            self.dirty = true;
+        }
+
+        fn is_active(&self) -> bool {
+            self.active && !self.done
+        }
+
+        fn flush(
+            &mut self,
+            notifier: &TelegramNotifier<'_>,
+            route: &TelegramRoute,
+            force: bool,
+        ) -> Result<bool> {
+            if !self.dirty {
+                return Ok(false);
+            }
+            let current_chars = self.text.chars().count();
+            if !force
+                && self.message_id.is_some()
+                && self.last_flush.elapsed() < Self::MIN_EDIT_INTERVAL
+                && current_chars.saturating_sub(self.last_sent_chars) < Self::MIN_DELTA_CHARS
+            {
+                return Ok(false);
+            }
+
+            let text = thinking_watch_text(self);
+            if self.last_sent_text.as_deref() == Some(text.as_str()) {
+                self.dirty = false;
+                return Ok(false);
+            }
+
+            match self.message_id {
+                Some(message_id) => notifier.edit_one(route, message_id, &text)?,
+                None => {
+                    self.message_id = Some(notifier.send_one(route, &text)?);
+                }
+            }
+            self.dirty = false;
+            self.last_flush = Instant::now();
+            self.last_sent_chars = current_chars;
+            self.last_sent_text = Some(text);
+            self.sent_any = true;
+            Ok(true)
+        }
+
+        fn mark_delivery_attempted(&mut self) {
+            self.last_flush = Instant::now();
+        }
+
+        fn sent_any(&self) -> bool {
+            self.sent_any
+        }
+    }
+
+    fn thinking_watch_text(panel: &TelegramThinkingPanel) -> String {
+        let title = if panel.done {
+            "Thinking done"
+        } else {
+            "Thinking"
+        };
+        let body = if panel.text.trim().is_empty() {
+            "Working on this turn."
+        } else {
+            panel.text.trim()
+        };
+        truncate_chars(&format!("{title}\n{body}"), 1800)
     }
 
     struct TelegramActivityPanel {
@@ -3893,6 +4179,7 @@ pub mod telegram {
 
     impl<'a> TelegramDeltaSink<'a> {
         const MIN_EDIT_INTERVAL: Duration = Duration::from_millis(900);
+        const MIN_DELTA_CHARS: usize = 240;
 
         fn new(notifier: &'a TelegramNotifier<'a>, route: TelegramRoute) -> Self {
             Self {
@@ -3909,7 +4196,11 @@ pub mod telegram {
         fn push(&mut self, delta: &str) -> Result<()> {
             self.text.push_str(delta);
             let current_chars = self.text.chars().count();
-            if current_chars.saturating_sub(self.last_sent_chars) >= 900 || delta.contains('\n') {
+            if self.message_id.is_none()
+                || current_chars.saturating_sub(self.last_sent_chars) >= Self::MIN_DELTA_CHARS
+                || delta.contains('\n')
+                || self.last_flush.elapsed() >= Self::MIN_EDIT_INTERVAL
+            {
                 self.flush(false)?;
             }
             Ok(())
@@ -6090,13 +6381,40 @@ pub mod telegram {
         }
 
         #[test]
+        fn thinking_watch_text_marks_active_and_done_states() {
+            let mut panel = TelegramThinkingPanel::new();
+            panel.start();
+
+            assert_eq!(
+                thinking_watch_text(&panel),
+                "Thinking\nWorking on this turn."
+            );
+
+            panel.push("Checking current state.");
+            panel.finish();
+
+            assert_eq!(
+                thinking_watch_text(&panel),
+                "Thinking done\nChecking current state."
+            );
+        }
+
+        #[test]
         fn rollout_observe_event_reads_agent_and_terminal_messages() {
             assert_eq!(
                 rollout_observe_event(
                     r#"{"type":"event_msg","payload":{"type":"agent_message","message":"hello","phase":"commentary"}}"#,
                 ),
-                Some(RolloutObserveEvent::Stream(AppStreamEvent::AgentDelta(
+                Some(RolloutObserveEvent::Stream(AppStreamEvent::ReasoningDelta(
                     "hello".to_string()
+                )))
+            );
+            assert_eq!(
+                rollout_observe_event(
+                    r#"{"type":"event_msg","payload":{"type":"agent_message","message":"done","phase":"final_answer"}}"#,
+                ),
+                Some(RolloutObserveEvent::Stream(AppStreamEvent::AgentDelta(
+                    "done".to_string()
                 )))
             );
             assert_eq!(
@@ -6108,6 +6426,20 @@ pub mod telegram {
                     terminal: ObserveTerminal::Completed,
                     last_agent_message: Some("done".to_string()),
                 })
+            );
+        }
+
+        #[test]
+        fn rollout_observe_event_reads_reasoning_summary() {
+            let event = rollout_observe_event(
+                r#"{"type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"Checking the weather API"}],"content":null,"encrypted_content":null}}"#,
+            );
+
+            assert_eq!(
+                event,
+                Some(RolloutObserveEvent::Stream(AppStreamEvent::ReasoningDelta(
+                    "Checking the weather API".to_string()
+                )))
             );
         }
 

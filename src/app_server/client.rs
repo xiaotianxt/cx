@@ -2,6 +2,8 @@ use std::time::Duration;
 
 use anyhow::Context;
 use anyhow::Result;
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use serde::Serialize;
 use serde_json::json;
 use serde_json::Value;
@@ -69,6 +71,9 @@ pub(crate) struct ObserveOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AppStreamEvent {
+    TurnStarted,
+    ReasoningStarted,
+    ReasoningDelta(String),
     AgentDelta(String),
     CommandStarted(CommandExecution),
     CommandOutputDelta { item_id: String, delta: String },
@@ -150,7 +155,10 @@ impl AppServerClient {
                     name: client_name.to_string(),
                     version: client_version.to_string(),
                 },
-                capabilities: serde_json::Map::new(),
+                capabilities: serde_json::Map::from_iter([(
+                    String::from("experimentalApi"),
+                    Value::Bool(true),
+                )]),
             },
         )?;
         let response = serde_json::from_value::<protocol::InitializeResponse>(response)
@@ -270,6 +278,7 @@ impl AppServerClient {
                     text: prompt,
                     text_elements: Vec::new(),
                 }],
+                summary: Some(String::from("auto")),
             },
         )?;
         self.collect_turn_start(request_id, thread_id, &mut on_event, &mut on_approval)
@@ -289,12 +298,29 @@ impl AppServerClient {
         let Some(turn_id) = self.active_turn_id(thread_id)? else {
             return Ok(ObserveOutcome { turn_id: None });
         };
+        on_event(AppStreamEvent::TurnStarted)?;
 
         loop {
             let frame = self.websocket.read_text()?;
             let message =
                 serde_json::from_str::<ServerMessage>(&frame).context("decode observe event")?;
             match message {
+                ServerMessage::Notification { method, params }
+                    if method == "item/reasoning/summaryPartAdded"
+                        && notification_params(&params, thread_id, Some(&turn_id)).is_some() =>
+                {
+                    on_event(AppStreamEvent::ReasoningStarted)?;
+                }
+                ServerMessage::Notification { method, params }
+                    if method == "item/reasoning/summaryTextDelta"
+                        || method == "item/reasoning/textDelta"
+                        || method == "item/plan/delta" =>
+                {
+                    if let Some(delta) = notification_text_delta(&params, thread_id, Some(&turn_id))
+                    {
+                        on_event(AppStreamEvent::ReasoningDelta(delta))?;
+                    }
+                }
                 ServerMessage::Notification { method, params }
                     if method == "item/agentMessage/delta" =>
                 {
@@ -423,6 +449,7 @@ impl AppServerClient {
         let mut turn_id = None::<String>;
         let mut assistant_text = String::new();
         let mut completed = false;
+        let mut start_response_received = false;
         loop {
             let frame = self.websocket.read_text()?;
             let message = serde_json::from_str::<ServerMessage>(&frame)
@@ -442,6 +469,7 @@ impl AppServerClient {
                     let response = serde_json::from_value::<protocol::TurnStartResponse>(response)
                         .context("decode turn/start response")?;
                     let response_turn_id = response.turn.id;
+                    start_response_received = true;
                     if completed {
                         return Ok(StartedTurn {
                             turn_id: response_turn_id,
@@ -451,7 +479,27 @@ impl AppServerClient {
                     turn_id = Some(response_turn_id);
                 }
                 ServerMessage::Notification { method, params } => {
-                    if method == "item/agentMessage/delta" {
+                    if method == "turn/started" {
+                        if let Some(started_turn_id) = started_turn_id(&params, thread_id) {
+                            if turn_id.as_deref().is_none_or(|id| id == started_turn_id) {
+                                turn_id = Some(started_turn_id.to_string());
+                                on_event(AppStreamEvent::TurnStarted)?;
+                            }
+                        }
+                    } else if method == "item/reasoning/summaryPartAdded" {
+                        if notification_params(&params, thread_id, turn_id.as_deref()).is_some() {
+                            on_event(AppStreamEvent::ReasoningStarted)?;
+                        }
+                    } else if method == "item/reasoning/summaryTextDelta"
+                        || method == "item/reasoning/textDelta"
+                        || method == "item/plan/delta"
+                    {
+                        if let Some(delta) =
+                            notification_text_delta(&params, thread_id, turn_id.as_deref())
+                        {
+                            on_event(AppStreamEvent::ReasoningDelta(delta))?;
+                        }
+                    } else if method == "item/agentMessage/delta" {
                         if let Some(delta) =
                             notification_delta(&params, thread_id, turn_id.as_deref())
                         {
@@ -482,7 +530,10 @@ impl AppServerClient {
                         if let Some(completed_turn_id) = completed_turn_id(&params, thread_id) {
                             if turn_id.as_deref().is_none_or(|id| id == completed_turn_id) {
                                 completed = true;
-                                if let Some(turn_id) = turn_id {
+                                if start_response_received {
+                                    let turn_id = turn_id
+                                        .clone()
+                                        .unwrap_or_else(|| completed_turn_id.to_string());
                                     return Ok(StartedTurn {
                                         turn_id,
                                         assistant_text,
@@ -605,6 +656,20 @@ fn notification_command_output_delta(
     Some((item_id, delta))
 }
 
+fn notification_text_delta(
+    params: &Option<Value>,
+    thread_id: &str,
+    turn_id: Option<&str>,
+) -> Option<String> {
+    let params = notification_params(params, thread_id, turn_id)?;
+    if let Some(delta) = params.get("delta").and_then(Value::as_str) {
+        return Some(delta.to_string());
+    }
+    let encoded = params.get("deltaBase64").and_then(Value::as_str)?;
+    let bytes = STANDARD.decode(encoded).ok()?;
+    String::from_utf8(bytes).ok()
+}
+
 fn notification_params<'a>(
     params: &'a Option<Value>,
     thread_id: &str,
@@ -652,6 +717,19 @@ fn command_execution_status(status: &str) -> CommandExecutionStatus {
 }
 
 fn completed_turn_id<'a>(params: &'a Option<Value>, thread_id: &str) -> Option<&'a str> {
+    let Some(params) = params else {
+        return None;
+    };
+    if params.get("threadId").and_then(Value::as_str) != Some(thread_id) {
+        return None;
+    }
+    params
+        .get("turn")
+        .and_then(|turn| turn.get("id"))
+        .and_then(Value::as_str)
+}
+
+fn started_turn_id<'a>(params: &'a Option<Value>, thread_id: &str) -> Option<&'a str> {
     let Some(params) = params else {
         return None;
     };
@@ -824,5 +902,48 @@ mod tests {
             notification_command_output_delta(&params, "thread-1", Some("other-turn")),
             None
         );
+    }
+
+    #[test]
+    fn notification_text_delta_reads_reasoning_delta() {
+        let params = Some(json!({
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "itemId": "reasoning-1",
+            "delta": "Checking location."
+        }));
+
+        assert_eq!(
+            notification_text_delta(&params, "thread-1", Some("turn-1")),
+            Some("Checking location.".to_string())
+        );
+    }
+
+    #[test]
+    fn notification_text_delta_reads_base64_delta() {
+        let params = Some(json!({
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "itemId": "reasoning-1",
+            "deltaBase64": "5L2g5aW9"
+        }));
+
+        assert_eq!(
+            notification_text_delta(&params, "thread-1", Some("turn-1")),
+            Some("你好".to_string())
+        );
+    }
+
+    #[test]
+    fn started_turn_id_filters_by_thread() {
+        let params = Some(json!({
+            "threadId": "thread-1",
+            "turn": {
+                "id": "turn-1"
+            }
+        }));
+
+        assert_eq!(started_turn_id(&params, "thread-1"), Some("turn-1"));
+        assert_eq!(started_turn_id(&params, "other-thread"), None);
     }
 }

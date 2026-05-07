@@ -157,6 +157,8 @@ pub(super) struct ThreadIdOnly {
 pub(super) struct TurnStartParams {
     pub thread_id: String,
     pub input: Vec<UserInput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

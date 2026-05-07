@@ -559,8 +559,7 @@ pub(crate) fn parse_server_event(
         }
         ServerMessage::Notification { method, params }
             if method == "item/reasoning/summaryTextDelta"
-                || method == "item/reasoning/textDelta"
-                || method == "item/plan/delta" =>
+                || method == "item/reasoning/textDelta" =>
         {
             notification_text_delta(&params, thread_id, turn_id)
                 .map(AppStreamEvent::ReasoningDelta)
@@ -661,14 +660,25 @@ fn notification_params<'a>(
 }
 
 fn command_execution_from_item(item: &Value) -> Option<CommandExecution> {
-    if item.get("type").and_then(Value::as_str)? != "commandExecution" {
-        return None;
+    match item.get("type").and_then(Value::as_str)? {
+        "commandExecution" => command_execution_activity_from_item(item),
+        "fileChange" => file_change_activity_from_item(item),
+        "plan" => plan_activity_from_item(item),
+        "mcpToolCall" => mcp_tool_activity_from_item(item),
+        "dynamicToolCall" => dynamic_tool_activity_from_item(item),
+        "webSearch" => web_search_activity_from_item(item),
+        "imageView" => image_view_activity_from_item(item),
+        "imageGeneration" => image_generation_activity_from_item(item),
+        _ => None,
     }
+}
+
+fn command_execution_activity_from_item(item: &Value) -> Option<CommandExecution> {
     Some(CommandExecution {
         item_id: item.get("id")?.as_str()?.to_string(),
         command: item.get("command")?.as_str()?.to_string(),
         cwd: item.get("cwd")?.as_str()?.to_string(),
-        activity: None,
+        activity: command_activity_from_actions(item.get("commandActions")),
         status: command_execution_status(item.get("status")?.as_str()?),
         exit_code: item.get("exitCode").and_then(Value::as_i64),
         duration_ms: item.get("durationMs").and_then(Value::as_i64),
@@ -676,6 +686,203 @@ fn command_execution_from_item(item: &Value) -> Option<CommandExecution> {
             .get("aggregatedOutput")
             .and_then(Value::as_str)
             .map(str::to_string),
+    })
+}
+
+fn plan_activity_from_item(item: &Value) -> Option<CommandExecution> {
+    Some(CommandExecution {
+        item_id: item.get("id")?.as_str()?.to_string(),
+        command: "update_plan".to_string(),
+        cwd: String::new(),
+        activity: Some(CommandActivity {
+            verb: "Plan".to_string(),
+            target: item
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or("Updated plan")
+                .to_string(),
+        }),
+        status: CommandExecutionStatus::Completed,
+        exit_code: None,
+        duration_ms: None,
+        aggregated_output: None,
+    })
+}
+
+fn file_change_activity_from_item(item: &Value) -> Option<CommandExecution> {
+    let changes = item.get("changes")?.as_array()?;
+    let status = command_execution_status(item.get("status")?.as_str()?);
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    let mut kinds = Vec::<&str>::new();
+    let mut details = Vec::<String>::new();
+
+    for change in changes {
+        let path = change.get("path").and_then(Value::as_str).unwrap_or("file");
+        let kind = change
+            .get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or("update");
+        if !kinds.contains(&kind) {
+            kinds.push(kind);
+        }
+        let (change_added, change_removed) =
+            diff_line_counts(change.get("diff").and_then(Value::as_str).unwrap_or(""));
+        added += change_added;
+        removed += change_removed;
+        details.push(format!("{path} (+{change_added} -{change_removed})"));
+    }
+
+    let verb = if kinds.len() == 1 {
+        match kinds[0] {
+            "add" | "create" => "Added",
+            "delete" | "remove" => "Deleted",
+            _ => "Edited",
+        }
+    } else {
+        "Edited"
+    };
+    let target = if details.len() == 1 {
+        details.pop().unwrap_or_else(|| "file".to_string())
+    } else {
+        let noun = if details.len() == 1 { "file" } else { "files" };
+        let mut target = format!("{} {noun} (+{added} -{removed})", details.len());
+        for detail in details {
+            target.push('\n');
+            target.push_str(&detail);
+        }
+        target
+    };
+
+    Some(CommandExecution {
+        item_id: item.get("id")?.as_str()?.to_string(),
+        command: "apply patch".to_string(),
+        cwd: String::new(),
+        activity: Some(CommandActivity {
+            verb: verb.to_string(),
+            target,
+        }),
+        status,
+        exit_code: None,
+        duration_ms: None,
+        aggregated_output: None,
+    })
+}
+
+fn mcp_tool_activity_from_item(item: &Value) -> Option<CommandExecution> {
+    let server = item.get("server").and_then(Value::as_str).unwrap_or("mcp");
+    let tool = item.get("tool").and_then(Value::as_str).unwrap_or("tool");
+    Some(CommandExecution {
+        item_id: item.get("id")?.as_str()?.to_string(),
+        command: format!("{server}.{tool}"),
+        cwd: String::new(),
+        activity: Some(CommandActivity {
+            verb: "Tool".to_string(),
+            target: format!("{server}.{tool}"),
+        }),
+        status: command_execution_status(item.get("status")?.as_str()?),
+        exit_code: None,
+        duration_ms: item.get("durationMs").and_then(Value::as_i64),
+        aggregated_output: None,
+    })
+}
+
+fn dynamic_tool_activity_from_item(item: &Value) -> Option<CommandExecution> {
+    let namespace = item.get("namespace").and_then(Value::as_str);
+    let tool = item.get("tool").and_then(Value::as_str).unwrap_or("tool");
+    let target = namespace
+        .map(|namespace| format!("{namespace}.{tool}"))
+        .unwrap_or_else(|| tool.to_string());
+    let success = item.get("success").and_then(Value::as_bool);
+    let status = match (item.get("status").and_then(Value::as_str), success) {
+        (Some("completed"), Some(false)) => CommandExecutionStatus::Failed,
+        (Some(status), _) => command_execution_status(status),
+        _ => CommandExecutionStatus::Unknown("unknown".to_string()),
+    };
+    Some(CommandExecution {
+        item_id: item.get("id")?.as_str()?.to_string(),
+        command: target.clone(),
+        cwd: String::new(),
+        activity: Some(CommandActivity {
+            verb: "Tool".to_string(),
+            target,
+        }),
+        status,
+        exit_code: None,
+        duration_ms: item.get("durationMs").and_then(Value::as_i64),
+        aggregated_output: None,
+    })
+}
+
+fn web_search_activity_from_item(item: &Value) -> Option<CommandExecution> {
+    let target = item
+        .get("query")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            item.get("action")
+                .and_then(|action| action.get("query"))
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            item.get("action")
+                .and_then(|action| action.get("url"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("web");
+    Some(CommandExecution {
+        item_id: item.get("id")?.as_str()?.to_string(),
+        command: target.to_string(),
+        cwd: String::new(),
+        activity: Some(CommandActivity {
+            verb: "Search".to_string(),
+            target: target.to_string(),
+        }),
+        status: CommandExecutionStatus::Completed,
+        exit_code: None,
+        duration_ms: None,
+        aggregated_output: None,
+    })
+}
+
+fn image_view_activity_from_item(item: &Value) -> Option<CommandExecution> {
+    let path = item.get("path").and_then(Value::as_str).unwrap_or("image");
+    Some(CommandExecution {
+        item_id: item.get("id")?.as_str()?.to_string(),
+        command: path.to_string(),
+        cwd: String::new(),
+        activity: Some(CommandActivity {
+            verb: "View".to_string(),
+            target: path.to_string(),
+        }),
+        status: CommandExecutionStatus::Completed,
+        exit_code: None,
+        duration_ms: None,
+        aggregated_output: None,
+    })
+}
+
+fn image_generation_activity_from_item(item: &Value) -> Option<CommandExecution> {
+    let status = item
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let target = item
+        .get("savedPath")
+        .and_then(Value::as_str)
+        .or_else(|| item.get("result").and_then(Value::as_str))
+        .unwrap_or("image");
+    Some(CommandExecution {
+        item_id: item.get("id")?.as_str()?.to_string(),
+        command: target.to_string(),
+        cwd: String::new(),
+        activity: Some(CommandActivity {
+            verb: "Generate".to_string(),
+            target: target.to_string(),
+        }),
+        status: command_execution_status(status),
+        exit_code: None,
+        duration_ms: None,
+        aggregated_output: None,
     })
 }
 
@@ -687,6 +894,103 @@ fn command_execution_status(status: &str) -> CommandExecutionStatus {
         "declined" => CommandExecutionStatus::Declined,
         other => CommandExecutionStatus::Unknown(other.to_string()),
     }
+}
+
+fn command_activity_from_actions(actions: Option<&Value>) -> Option<CommandActivity> {
+    let actions = actions?.as_array()?;
+    let mut verb = None::<&'static str>;
+    let mut lines = Vec::<String>::new();
+    let mut read_targets = Vec::<String>::new();
+
+    for action in actions {
+        let action_verb = match action.get("type").and_then(Value::as_str) {
+            Some("read") => "Read",
+            Some("listFiles") => "List",
+            Some("search") => "Search",
+            _ => return None,
+        };
+        verb = match verb {
+            Some(existing) if existing == action_verb => Some(existing),
+            Some(_) => Some("Explore"),
+            None => Some(action_verb),
+        };
+        match action_verb {
+            "Read" => {
+                let target = action
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .or_else(|| action.get("path").and_then(Value::as_str))
+                    .unwrap_or("file")
+                    .to_string();
+                if !read_targets.iter().any(|existing| existing == &target) {
+                    read_targets.push(target);
+                }
+            }
+            "List" => {
+                let target = action
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .or_else(|| action.get("command").and_then(Value::as_str))
+                    .unwrap_or("files");
+                lines.push(format!("List {target}"));
+            }
+            "Search" => {
+                let target = match (
+                    action.get("query").and_then(Value::as_str),
+                    action.get("path").and_then(Value::as_str),
+                ) {
+                    (Some(query), Some(path)) => format!("Search {query} in {path}"),
+                    (Some(query), None) => format!("Search {query}"),
+                    _ => action
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .map(|command| format!("Search {command}"))
+                        .unwrap_or_else(|| "Search".to_string()),
+                };
+                lines.push(target);
+            }
+            _ => {}
+        }
+    }
+
+    let verb = verb?;
+    if !read_targets.is_empty() {
+        let target = read_targets.join(", ");
+        if verb == "Read" {
+            return Some(CommandActivity {
+                verb: "Read".to_string(),
+                target,
+            });
+        }
+        lines.push(format!("Read {target}"));
+    }
+    if verb == "Explore" {
+        Some(CommandActivity {
+            verb: "Explore".to_string(),
+            target: lines.join("\n"),
+        })
+    } else {
+        Some(CommandActivity {
+            verb: verb.to_string(),
+            target: lines.join("\n"),
+        })
+    }
+}
+
+fn diff_line_counts(diff: &str) -> (usize, usize) {
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    for line in diff.lines() {
+        if line.starts_with("+++") || line.starts_with("---") {
+            continue;
+        }
+        if line.starts_with('+') {
+            added += 1;
+        } else if line.starts_with('-') {
+            removed += 1;
+        }
+    }
+    (added, removed)
 }
 
 fn completed_turn_id<'a>(params: &'a Option<Value>, thread_id: &str) -> Option<&'a str> {
@@ -854,6 +1158,105 @@ mod tests {
                 exit_code: None,
                 duration_ms: None,
                 aggregated_output: None,
+            })
+        );
+    }
+
+    #[test]
+    fn notification_command_execution_summarizes_command_actions() {
+        let params = Some(json!({
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "item": {
+                "type": "commandExecution",
+                "id": "cmd-1",
+                "command": "sed -n '1,20p' wiley.py && sed -n '1,20p' science.py",
+                "cwd": "/tmp/project",
+                "processId": null,
+                "source": "agent",
+                "status": "completed",
+                "commandActions": [
+                    {"type": "read", "command": "sed -n '1,20p' wiley.py", "name": "wiley.py", "path": "/tmp/project/wiley.py"},
+                    {"type": "read", "command": "sed -n '1,20p' science.py", "name": "science.py", "path": "/tmp/project/science.py"}
+                ],
+                "aggregatedOutput": null,
+                "exitCode": 0,
+                "durationMs": 12
+            },
+            "completedAtMs": 10
+        }));
+
+        let event = notification_command_execution(&params, "thread-1", Some("turn-1")).unwrap();
+
+        assert_eq!(
+            event.activity,
+            Some(CommandActivity {
+                verb: "Read".to_string(),
+                target: "wiley.py, science.py".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn notification_command_execution_reads_file_change_items() {
+        let params = Some(json!({
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "item": {
+                "type": "fileChange",
+                "id": "patch-1",
+                "changes": [
+                    {
+                        "path": "src/channel/telegram.rs",
+                        "kind": "update",
+                        "diff": "@@\n-old\n+new\n+another\n"
+                    }
+                ],
+                "status": "completed"
+            },
+            "completedAtMs": 10
+        }));
+
+        let event = notification_command_execution(&params, "thread-1", Some("turn-1")).unwrap();
+
+        assert_eq!(
+            event,
+            CommandExecution {
+                item_id: "patch-1".to_string(),
+                command: "apply patch".to_string(),
+                cwd: String::new(),
+                activity: Some(CommandActivity {
+                    verb: "Edited".to_string(),
+                    target: "src/channel/telegram.rs (+2 -1)".to_string(),
+                }),
+                status: CommandExecutionStatus::Completed,
+                exit_code: None,
+                duration_ms: None,
+                aggregated_output: None,
+            }
+        );
+    }
+
+    #[test]
+    fn notification_command_execution_reads_plan_items() {
+        let params = Some(json!({
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "item": {
+                "type": "plan",
+                "id": "plan-1",
+                "text": "□ Inspect UI\n□ Ship release"
+            },
+            "completedAtMs": 10
+        }));
+
+        let event = notification_command_execution(&params, "thread-1", Some("turn-1")).unwrap();
+
+        assert_eq!(
+            event.activity,
+            Some(CommandActivity {
+                verb: "Plan".to_string(),
+                target: "□ Inspect UI\n□ Ship release".to_string(),
             })
         );
     }

@@ -348,6 +348,26 @@ mod tests {
     }
 
     #[test]
+    fn telegram_run_accepts_negative_allow_chat_with_equals() {
+        let cli = Cli::parse_from([
+            "cx",
+            "channel",
+            "telegram",
+            "run",
+            "--allow-chat=-1003586916929",
+        ]);
+
+        let Command::Channel(args) = cli.command else {
+            panic!("expected channel command");
+        };
+        let ChannelCommand::Telegram(args) = args.command;
+        let TelegramCommand::Run(args) = args.command else {
+            panic!("expected telegram run command");
+        };
+        assert_eq!(args.allow_chats, vec![-1003586916929]);
+    }
+
+    #[test]
     fn telegram_bind_accepts_token_env_and_timeouts() {
         let cli = Cli::parse_from([
             "cx",
@@ -423,6 +443,19 @@ mod tests {
         assert!(!args.spec.no_telegram);
         assert_eq!(args.spec.allow_chats, vec![12345]);
         assert!(args.spec.acquire_lease);
+    }
+
+    #[test]
+    fn service_start_accepts_negative_allow_chat_with_equals() {
+        let cli = Cli::parse_from(["cx", "service", "start", "--allow-chat=-1003586916929"]);
+
+        let Command::Service(args) = cli.command else {
+            panic!("expected service command");
+        };
+        let ServiceCommand::Start(args) = args.command else {
+            panic!("expected service start command");
+        };
+        assert_eq!(args.spec.allow_chats, vec![-1003586916929]);
     }
 
     #[test]

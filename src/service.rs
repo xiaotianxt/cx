@@ -443,7 +443,7 @@ fn start_telegram_child(spec: &ServiceSpecArgs, paths: &ManagerPaths) -> Result<
         .arg("--app-server-timeout")
         .arg(spec.app_server_timeout.to_string());
     for chat in &spec.allow_chats {
-        command.arg("--allow-chat").arg(chat.to_string());
+        append_allow_chat_arg(&mut command, *chat);
     }
     if spec.acquire_lease {
         command.arg("--acquire-lease");
@@ -806,7 +806,7 @@ fn append_spec_args(command: &mut Command, spec: &ServiceSpecArgs) {
         .arg("--app-server-timeout")
         .arg(spec.app_server_timeout.to_string());
     for chat in &spec.allow_chats {
-        command.arg("--allow-chat").arg(chat.to_string());
+        append_allow_chat_arg(command, *chat);
     }
     if spec.acquire_lease {
         command.arg("--acquire-lease");
@@ -834,8 +834,7 @@ fn append_spec_argv(argv: &mut Vec<String>, spec: &ServiceSpecArgs) {
     argv.push(String::from("--app-server-timeout"));
     argv.push(spec.app_server_timeout.to_string());
     for chat in &spec.allow_chats {
-        argv.push(String::from("--allow-chat"));
-        argv.push(chat.to_string());
+        append_allow_chat_argv(argv, *chat);
     }
     if spec.acquire_lease {
         argv.push(String::from("--acquire-lease"));
@@ -872,6 +871,14 @@ fn append_string_argv(argv: &mut Vec<String>, name: &str, value: Option<&String>
         argv.push(name.to_string());
         argv.push(value.clone());
     }
+}
+
+fn append_allow_chat_arg(command: &mut Command, chat: i64) {
+    command.arg(format!("--allow-chat={chat}"));
+}
+
+fn append_allow_chat_argv(argv: &mut Vec<String>, chat: i64) {
+    argv.push(format!("--allow-chat={chat}"));
 }
 
 fn launchd_plist(argv: &[String], stdout: &Path, stderr: &Path) -> String {
@@ -1055,6 +1062,30 @@ mod tests {
 
         assert!(plist.contains("<string>A&amp;B</string>"));
         assert!(plist.contains("<string>dev.xiaotian.cx.service</string>"));
+    }
+
+    #[test]
+    fn service_argv_passes_negative_allow_chat_with_equals() {
+        let spec = ServiceSpecArgs {
+            manager_dir: None,
+            codex_bin: None,
+            slot: None,
+            target: None,
+            listen: "ws://127.0.0.1:0".to_string(),
+            no_telegram: false,
+            telegram_bot_token_env: "TELEGRAM_BOT_TOKEN".to_string(),
+            allow_chats: vec![-1003586916929],
+            acquire_lease: false,
+            steal: false,
+            log_updates: false,
+            app_server_timeout: 600.0,
+        };
+        let mut argv = Vec::new();
+
+        append_spec_argv(&mut argv, &spec);
+
+        assert!(argv.contains(&"--allow-chat=-1003586916929".to_string()));
+        assert!(!argv.contains(&"--allow-chat".to_string()));
     }
 
     #[test]

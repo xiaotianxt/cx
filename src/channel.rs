@@ -1,4 +1,5 @@
 pub mod telegram {
+    use std::collections::BTreeMap;
     use std::collections::BTreeSet;
     use std::fs;
     use std::fs::OpenOptions;
@@ -31,8 +32,12 @@ pub mod telegram {
     use serde_json::Value;
 
     use crate::app_server::AppServerClient;
+    use crate::app_server::AppStreamEvent;
     use crate::app_server::AppThreadSummary;
     use crate::app_server::ApprovalRequest;
+    use crate::app_server::CommandActivity;
+    use crate::app_server::CommandExecution;
+    use crate::app_server::CommandExecutionStatus;
     use crate::cli::TelegramBindArgs;
     use crate::cli::TelegramMenuArgs;
     use crate::cli::TelegramRunArgs;
@@ -649,11 +654,16 @@ pub mod telegram {
         options: PollOptions<'_>,
     ) -> Result<PollOutcome> {
         let mut bound_route = None;
+        let poll_timeout = if options.app_server_timeout > 0.0 && has_watched_bindings(state) {
+            options.poll_timeout.min(2)
+        } else {
+            options.poll_timeout
+        };
         let updates = get_updates(
             client,
             token,
             state.last_update_id.map(|id| id + 1),
-            options.poll_timeout,
+            poll_timeout,
         )?;
         for update in updates {
             state.last_update_id = Some(
@@ -708,17 +718,102 @@ pub mod telegram {
             write_state(paths, state)?;
             if let Some(reply) = reply {
                 let route = reply.route();
-                let panel_message_id = deliver_reply(client, token, &reply)?;
-                if reply.remember_panel_message {
-                    if let Some(message_id) = panel_message_id {
-                        state.remember_panel_message(&route, message_id);
-                        write_state(paths, state)?;
+                match deliver_reply(client, token, &reply) {
+                    Ok(panel_message_id) => {
+                        if reply.remember_panel_message {
+                            if let Some(message_id) = panel_message_id {
+                                state.remember_panel_message(&route, message_id);
+                                write_state(paths, state)?;
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "telegram reply delivery failed for {}: {err:#}",
+                            route.display()
+                        );
                     }
                 }
             }
         }
+        if options.app_server_timeout > 0.0 {
+            observe_watched_bindings(paths, client, token, state, options.app_server_timeout)?;
+        }
         write_state(paths, state)?;
         Ok(PollOutcome { bound_route })
+    }
+
+    fn has_watched_bindings(state: &TelegramState) -> bool {
+        state
+            .bindings
+            .iter()
+            .any(|binding| binding.telegram_paused && binding.app_thread_id.is_some())
+    }
+
+    fn observe_watched_bindings(
+        paths: &ManagerPaths,
+        client: &Client,
+        token: &str,
+        state: &mut TelegramState,
+        app_server_timeout: f32,
+    ) -> Result<()> {
+        let notifier = TelegramNotifier { client, token };
+        for binding in watched_bindings(state) {
+            let route = TelegramRoute {
+                chat_id: binding.chat_id,
+                message_thread_id: binding.message_thread_id,
+            };
+            let result =
+                run_codex_observe(paths, &route, &binding, app_server_timeout, Some(&notifier));
+            match result {
+                ObserveResult::Error(err) if is_telegram_missing_thread_error(&err) => {
+                    eprintln!(
+                        "telegram watch route no longer exists; removing {}: {err:#}",
+                        route.display()
+                    );
+                    state.remove_route_binding(&route, binding.alias.as_deref());
+                }
+                ObserveResult::Error(err) => {
+                    eprintln!(
+                        "telegram watch observe failed for {}: {err:#}",
+                        route.display()
+                    );
+                }
+                result => {
+                    if let Some(reply) = observe_result_reply(&route, &binding, result)? {
+                        if let Err(err) = deliver_reply(client, token, &reply) {
+                            if is_telegram_missing_thread_error(&err) {
+                                eprintln!(
+                                    "telegram watch route no longer exists; removing {}: {err:#}",
+                                    route.display()
+                                );
+                                state.remove_route_binding(&route, binding.alias.as_deref());
+                            } else {
+                                eprintln!(
+                                    "telegram watch delivery failed for {}: {err:#}",
+                                    route.display()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn watched_bindings(state: &TelegramState) -> Vec<TelegramBinding> {
+        let mut seen = BTreeSet::<(i64, Option<i64>, String)>::new();
+        state
+            .bindings
+            .iter()
+            .filter(|binding| binding.telegram_paused)
+            .filter_map(|binding| {
+                let thread_id = binding.app_thread_id.clone()?;
+                let key = (binding.chat_id, binding.message_thread_id, thread_id);
+                seen.insert(key).then(|| binding.clone())
+            })
+            .collect()
     }
 
     fn validate_timeouts(poll_timeout: u64, request_timeout: f32) -> Result<()> {
@@ -1409,12 +1504,20 @@ pub mod telegram {
         let mut topic_created_by_adapter = false;
         let effective_route = if should_create_work_topic(state, route, chat_is_forum) {
             if let Some(notifier) = options.notifier {
-                let topic_id = create_forum_topic(
+                let topic_id = match create_forum_topic(
                     notifier.client,
                     notifier.token,
                     route.chat_id,
                     &work_topic_title(&entry),
-                )?;
+                ) {
+                    Ok(topic_id) => topic_id,
+                    Err(err) => {
+                        return Ok(reply(
+                            route,
+                            format!("Failed to create Telegram topic: {err:#}"),
+                        ));
+                    }
+                };
                 topic_created_by_adapter = true;
                 TelegramRoute {
                     chat_id: route.chat_id,
@@ -1482,12 +1585,20 @@ pub mod telegram {
         let mut topic_created_by_adapter = false;
         let effective_route = if should_create_work_topic(state, route, chat_is_forum) {
             if let Some(notifier) = options.notifier {
-                let topic_id = create_forum_topic(
+                let topic_id = match create_forum_topic(
                     notifier.client,
                     notifier.token,
                     route.chat_id,
                     &work_topic_title(entry),
-                )?;
+                ) {
+                    Ok(topic_id) => topic_id,
+                    Err(err) => {
+                        return Ok(Some(reply(
+                            route,
+                            format!("Failed to create Telegram topic: {err:#}"),
+                        )));
+                    }
+                };
                 topic_created_by_adapter = true;
                 TelegramRoute {
                     chat_id: route.chat_id,
@@ -1502,6 +1613,9 @@ pub mod telegram {
 
         let binding =
             state.bind_app_thread(paths, &effective_route, entry, topic_created_by_adapter)?;
+        if let Some(stored) = state.binding_for_route_mut(&effective_route, None) {
+            stored.telegram_paused = true;
+        }
         session::record_channel_message(
             paths,
             RecordChannelMessageRequest {
@@ -1613,14 +1727,16 @@ pub mod telegram {
             options.app_server_timeout,
             options.notifier,
         );
+        observe_result_reply(route, binding, result)
+    }
 
+    fn observe_result_reply(
+        route: &TelegramRoute,
+        binding: &TelegramBinding,
+        result: ObserveResult,
+    ) -> Result<Option<TelegramReply>> {
         match result {
-            ObserveResult::NoActiveTurn => Ok(Some(work_panel_reply(
-                route,
-                binding,
-                "No live app-server turn or active TUI rollout to observe.",
-                None,
-            ))),
+            ObserveResult::NoActiveTurn => Ok(None),
             ObserveResult::TurnFinished {
                 turn_id,
                 streamed,
@@ -1812,7 +1928,9 @@ pub mod telegram {
             .map(AppThreadPortalEntry::from)
             .collect::<Vec<_>>();
         mark_rollout_watchable_threads(paths, &mut entries);
-        Ok(entries)
+        let open_tui_entries =
+            open_tui_portal_entries(paths, limit.saturating_mul(4)).unwrap_or_else(|_| Vec::new());
+        Ok(merge_portal_entries(open_tui_entries, entries, limit))
     }
 
     fn mark_rollout_watchable_threads(paths: &ManagerPaths, entries: &mut [AppThreadPortalEntry]) {
@@ -1824,8 +1942,79 @@ pub mod telegram {
             {
                 entry.watchable = true;
                 entry.status = "active-tui".to_string();
+            } else if rollout_file_is_open(paths, &entry.thread_id) {
+                entry.watchable = true;
+                entry.status = "open-tui".to_string();
             }
         }
+    }
+
+    fn open_tui_portal_entries(
+        paths: &ManagerPaths,
+        max_candidates: u64,
+    ) -> Result<Vec<AppThreadPortalEntry>> {
+        let db_path = paths.base_codex_home.join("state_5.sqlite");
+        let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("open {}", db_path.display()))?;
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, title, first_user_message, cwd \
+                 FROM threads \
+                 WHERE rollout_path <> '' \
+                 ORDER BY updated_at DESC \
+                 LIMIT ?1",
+            )
+            .with_context(|| format!("prepare open tui query for {}", db_path.display()))?;
+        let rows = stmt.query_map(params![max_candidates as i64], |row| {
+            let thread_id: String = row.get(0)?;
+            let title: String = row.get(1)?;
+            let preview: String = row.get(2)?;
+            let cwd: String = row.get(3)?;
+            Ok(AppThreadPortalEntry {
+                thread_id,
+                title: (!title.trim().is_empty()).then_some(title),
+                preview,
+                cwd,
+                active: false,
+                watchable: true,
+                status: String::from("open-tui"),
+            })
+        })?;
+
+        let mut entries = Vec::new();
+        for row in rows {
+            let mut entry = row?;
+            if !rollout_file_is_open(paths, &entry.thread_id) {
+                continue;
+            }
+            if active_rollout_turn(paths, &entry.thread_id)
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                entry.status = String::from("active-tui");
+            }
+            entries.push(entry);
+        }
+        Ok(entries)
+    }
+
+    fn merge_portal_entries(
+        preferred: Vec<AppThreadPortalEntry>,
+        fallback: Vec<AppThreadPortalEntry>,
+        limit: u64,
+    ) -> Vec<AppThreadPortalEntry> {
+        let mut seen = BTreeSet::<String>::new();
+        let mut merged = Vec::new();
+        for entry in preferred.into_iter().chain(fallback) {
+            if seen.insert(entry.thread_id.clone()) {
+                merged.push(entry);
+            }
+            if merged.len() >= limit as usize {
+                break;
+            }
+        }
+        merged
     }
 
     fn portal_text(entries: &[AppThreadPortalEntry]) -> String {
@@ -1901,22 +2090,32 @@ pub mod telegram {
         entry: &AppThreadPortalEntry,
     ) -> Result<()> {
         let panel_text = watch_started_text(entry);
-        let panel_message_id = notifier.send_with_keyboard(
-            route,
-            &panel_text,
-            &work_panel_keyboard(binding, route),
-        )?;
-        state.remember_panel_message(route, panel_message_id);
+        match notifier.send_with_keyboard(route, &panel_text, &work_panel_keyboard(binding, route))
+        {
+            Ok(panel_message_id) => state.remember_panel_message(route, panel_message_id),
+            Err(err) => {
+                eprintln!(
+                    "telegram watch intro delivery failed for {}: {err:#}",
+                    route.display()
+                );
+                return Ok(());
+            }
+        }
 
         if let Some(history) = rollout_history_text(paths, &entry.thread_id, 6)? {
-            notifier.send_one(route, &history)?;
+            if let Err(err) = notifier.send_one(route, &history) {
+                eprintln!(
+                    "telegram watch history delivery failed for {}: {err:#}",
+                    route.display()
+                );
+            }
         }
         Ok(())
     }
 
     fn watch_started_text(entry: &AppThreadPortalEntry) -> String {
         format!(
-            "Watching Codex thread.\nthread: {}\ncwd: {}\nstatus: {}\nNew output will stream in this topic.",
+            "Watching Codex thread.\nthread: {}\ncwd: {}\nstatus: {}\nLive output will stream in this topic when a turn is active.",
             entry.thread_id, entry.cwd, entry.status
         )
     }
@@ -2073,13 +2272,14 @@ pub mod telegram {
                 thread.upstream_thread_id
             }
         };
-        let mut sink = notifier.map(|notifier| TelegramDeltaSink::new(notifier, route.clone()));
+        let mut sink =
+            notifier.map(|notifier| TelegramWatchSink::new_best_effort(notifier, route.clone()));
         let turn = client.turn_start_stream(
             &thread_id,
             prompt,
-            |delta| {
+            |event| {
                 if let Some(sink) = sink.as_mut() {
-                    sink.push(delta)?;
+                    sink.push_event(event)?;
                 }
                 Ok(())
             },
@@ -2131,6 +2331,14 @@ pub mod telegram {
             return ObserveResult::NoActiveTurn;
         };
 
+        match active_rollout_turn(paths, thread_id) {
+            Ok(Some(active)) => {
+                return run_active_rollout_observe(route, active, timeout_secs, notifier);
+            }
+            Ok(None) => {}
+            Err(err) => return ObserveResult::Error(err),
+        }
+
         let app_url = match resolve_observe_app_url(paths, thread_id, timeout_secs) {
             Ok(Some(url)) => url,
             Ok(None) => {
@@ -2147,13 +2355,13 @@ pub mod telegram {
             return ObserveResult::Error(err);
         }
 
-        let mut sink = notifier.map(|n| TelegramDeltaSink::new(n, route.clone()));
+        let mut sink = notifier.map(|n| TelegramWatchSink::new_best_effort(n, route.clone()));
         let outcome = match client.observe_thread_events(
             thread_id,
             binding.app_thread_cwd.as_deref(),
-            |delta| {
+            |event| {
                 if let Some(sink) = sink.as_mut() {
-                    sink.push(delta)?;
+                    sink.push_event(event)?;
                 }
                 Ok(())
             },
@@ -2191,17 +2399,24 @@ pub mod telegram {
             Ok(None) => return ObserveResult::NoActiveTurn,
             Err(err) => return ObserveResult::Error(err),
         };
+        run_active_rollout_observe(route, active, timeout_secs, notifier)
+    }
 
-        let mut sink = notifier.map(|n| TelegramDeltaSink::new(n, route.clone()));
+    fn run_active_rollout_observe(
+        route: &TelegramRoute,
+        active: ActiveRolloutTurn,
+        timeout_secs: f32,
+        notifier: Option<&TelegramNotifier<'_>>,
+    ) -> ObserveResult {
+        let mut sink = notifier.map(|n| TelegramWatchSink::new_best_effort(n, route.clone()));
         let observed = observe_active_rollout(
             &active.path,
             &active.turn_id,
             active.offset,
             Duration::from_secs_f32(timeout_secs),
-            |message| {
+            |event| {
                 if let Some(sink) = sink.as_mut() {
-                    sink.push(message)?;
-                    sink.push("\n\n")?;
+                    sink.push_event(event)?;
                 }
                 Ok(())
             },
@@ -2304,7 +2519,7 @@ pub mod telegram {
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum RolloutObserveEvent {
-        AgentMessage(String),
+        Stream(AppStreamEvent),
         Terminal {
             turn_id: Option<String>,
             terminal: ObserveTerminal,
@@ -2360,9 +2575,12 @@ pub mod telegram {
         let file =
             fs::File::open(path).with_context(|| format!("open rollout {}", path.display()))?;
         let mut reader = BufReader::new(file);
-        let mut active_turns = Vec::<String>::new();
+        let mut active_turns = Vec::<(String, u64)>::new();
         let mut line = String::new();
         loop {
+            let line_offset = reader
+                .stream_position()
+                .with_context(|| format!("read rollout position {}", path.display()))?;
             line.clear();
             let read = reader
                 .read_line(&mut line)
@@ -2370,30 +2588,32 @@ pub mod telegram {
             if read == 0 {
                 break;
             }
-            apply_rollout_task_event(&mut active_turns, rollout_task_event(&line));
+            apply_rollout_task_event(&mut active_turns, rollout_task_event(&line), line_offset);
         }
-        let offset = reader
-            .stream_position()
-            .with_context(|| format!("read rollout position {}", path.display()))?;
         Ok(active_turns
             .last()
-            .cloned()
-            .map(|turn_id| (turn_id, offset)))
+            .map(|(turn_id, offset)| (turn_id.clone(), *offset)))
     }
 
-    fn apply_rollout_task_event(active_turns: &mut Vec<String>, event: Option<RolloutTaskEvent>) {
+    fn apply_rollout_task_event(
+        active_turns: &mut Vec<(String, u64)>,
+        event: Option<RolloutTaskEvent>,
+        offset: u64,
+    ) {
         match event {
             Some(RolloutTaskEvent::Started(turn_id))
-                if !active_turns.iter().any(|active| active == &turn_id) =>
+                if !active_turns
+                    .iter()
+                    .any(|(active_turn_id, _)| active_turn_id == &turn_id) =>
             {
-                active_turns.push(turn_id);
+                active_turns.push((turn_id, offset));
             }
             Some(RolloutTaskEvent::Started(_)) => {}
             Some(RolloutTaskEvent::Terminal {
                 turn_id: Some(turn_id),
                 ..
             }) => {
-                active_turns.retain(|active| active != &turn_id);
+                active_turns.retain(|(active_turn_id, _)| active_turn_id != &turn_id);
             }
             Some(RolloutTaskEvent::Terminal { turn_id: None, .. }) => {
                 active_turns.clear();
@@ -2407,10 +2627,10 @@ pub mod telegram {
         active_turn_id: &str,
         start_offset: u64,
         timeout: Duration,
-        mut on_message: F,
+        mut on_event: F,
     ) -> Result<ObservedRolloutTerminal>
     where
-        F: FnMut(&str) -> Result<()>,
+        F: FnMut(AppStreamEvent) -> Result<()>,
     {
         let mut file =
             fs::File::open(path).with_context(|| format!("open rollout {}", path.display()))?;
@@ -2435,13 +2655,14 @@ pub mod telegram {
 
             last_activity = Instant::now();
             match rollout_observe_event(&line) {
-                Some(RolloutObserveEvent::AgentMessage(message)) => {
+                Some(RolloutObserveEvent::Stream(AppStreamEvent::AgentDelta(message))) => {
                     send_rollout_agent_message(
                         &message,
                         &mut last_sent_agent_message,
-                        &mut on_message,
+                        &mut on_event,
                     )?;
                 }
+                Some(RolloutObserveEvent::Stream(event)) => on_event(event)?,
                 Some(RolloutObserveEvent::Terminal {
                     turn_id,
                     terminal,
@@ -2451,7 +2672,7 @@ pub mod telegram {
                         send_rollout_agent_message(
                             &message,
                             &mut last_sent_agent_message,
-                            &mut on_message,
+                            &mut on_event,
                         )?;
                     }
                     return Ok(ObservedRolloutTerminal {
@@ -2467,10 +2688,10 @@ pub mod telegram {
     fn send_rollout_agent_message<F>(
         message: &str,
         last_sent_agent_message: &mut Option<String>,
-        on_message: &mut F,
+        on_event: &mut F,
     ) -> Result<()>
     where
-        F: FnMut(&str) -> Result<()>,
+        F: FnMut(AppStreamEvent) -> Result<()>,
     {
         if message.trim().is_empty() {
             return Ok(());
@@ -2478,7 +2699,7 @@ pub mod telegram {
         if last_sent_agent_message.as_deref() == Some(message) {
             return Ok(());
         }
-        on_message(message)?;
+        on_event(AppStreamEvent::AgentDelta(message.to_string()))?;
         *last_sent_agent_message = Some(message.to_string());
         Ok(())
     }
@@ -2519,13 +2740,20 @@ pub mod telegram {
     }
 
     fn rollout_observe_event(line: &str) -> Option<RolloutObserveEvent> {
-        let value = rollout_event_payload(line)?;
+        let top_level = serde_json::from_str::<Value>(line).ok()?;
+        if top_level.get("type").and_then(Value::as_str) == Some("response_item") {
+            return rollout_response_item_observe_event(top_level.get("payload")?);
+        }
+
+        let value = rollout_event_payload_value(&top_level)?;
         let kind = value.get("type")?.as_str()?;
         match kind {
-            "agent_message" => value
-                .get("message")
-                .and_then(Value::as_str)
-                .map(|message| RolloutObserveEvent::AgentMessage(message.to_string())),
+            "agent_message" => value.get("message").and_then(Value::as_str).map(|message| {
+                RolloutObserveEvent::Stream(AppStreamEvent::AgentDelta(message.to_string()))
+            }),
+            "exec_command_end" => Some(RolloutObserveEvent::Stream(
+                AppStreamEvent::CommandCompleted(rollout_exec_command_end(value)?),
+            )),
             "task_complete" | "turn_complete" => Some(RolloutObserveEvent::Terminal {
                 turn_id: value
                     .get("turn_id")
@@ -2547,6 +2775,204 @@ pub mod telegram {
             }),
             _ => None,
         }
+    }
+
+    fn rollout_response_item_observe_event(value: &Value) -> Option<RolloutObserveEvent> {
+        let kind = value.get("type")?.as_str()?;
+        match kind {
+            "function_call"
+                if value.get("name").and_then(Value::as_str) == Some("exec_command") =>
+            {
+                Some(RolloutObserveEvent::Stream(AppStreamEvent::CommandStarted(
+                    rollout_exec_command_start(value)?,
+                )))
+            }
+            "function_call_output" => {
+                let call_id = value.get("call_id").and_then(Value::as_str)?;
+                let output = value.get("output").and_then(Value::as_str)?;
+                let output = exec_command_output_body(output);
+                if output.trim().is_empty() {
+                    None
+                } else {
+                    Some(RolloutObserveEvent::Stream(
+                        AppStreamEvent::CommandOutputDelta {
+                            item_id: call_id.to_string(),
+                            delta: output.to_string(),
+                        },
+                    ))
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn rollout_exec_command_start(value: &Value) -> Option<CommandExecution> {
+        let call_id = value.get("call_id").and_then(Value::as_str)?;
+        let arguments = value.get("arguments").and_then(Value::as_str)?;
+        let arguments = serde_json::from_str::<Value>(arguments).ok()?;
+        Some(CommandExecution {
+            item_id: call_id.to_string(),
+            command: arguments
+                .get("cmd")
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown command>")
+                .to_string(),
+            cwd: arguments
+                .get("workdir")
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown>")
+                .to_string(),
+            activity: None,
+            status: CommandExecutionStatus::InProgress,
+            exit_code: None,
+            duration_ms: None,
+            aggregated_output: None,
+        })
+    }
+
+    fn rollout_exec_command_end(value: &Value) -> Option<CommandExecution> {
+        let call_id = value.get("call_id").and_then(Value::as_str)?;
+        let exit_code = value.get("exit_code").and_then(Value::as_i64);
+        Some(CommandExecution {
+            item_id: call_id.to_string(),
+            command: rollout_command_string(value).unwrap_or_else(|| format!("command {call_id}")),
+            cwd: value
+                .get("cwd")
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown>")
+                .to_string(),
+            activity: rollout_command_activity(value),
+            status: rollout_command_status(value.get("status").and_then(Value::as_str), exit_code),
+            exit_code,
+            duration_ms: rollout_duration_ms(value),
+            aggregated_output: command_end_output(value),
+        })
+    }
+
+    fn rollout_command_activity(value: &Value) -> Option<CommandActivity> {
+        let parsed = value.get("parsed_cmd")?.as_array()?;
+        let first = parsed.first()?;
+        let command_type = first.get("type").and_then(Value::as_str)?;
+        let verb = match command_type {
+            "read" => "Read",
+            "write" | "edit" | "patch" => "Write",
+            "search" => "Search",
+            "list" => "List",
+            "delete" | "remove" => "Delete",
+            "move" | "rename" => "Move",
+            "copy" => "Copy",
+            "format" => "Format",
+            "test" => "Test",
+            "build" => "Build",
+            "lint" => "Lint",
+            _ => "Run",
+        };
+        let target = first
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| {
+                first
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .and_then(command_path_label)
+            })
+            .or_else(|| first.get("cmd").and_then(Value::as_str))
+            .unwrap_or("<unknown>")
+            .to_string();
+        Some(CommandActivity {
+            verb: verb.to_string(),
+            target,
+        })
+    }
+
+    fn command_path_label(path: &str) -> Option<&str> {
+        let path = path.trim();
+        if path.is_empty() {
+            return None;
+        }
+        Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .or(Some(path))
+    }
+
+    fn rollout_command_status(
+        status: Option<&str>,
+        exit_code: Option<i64>,
+    ) -> CommandExecutionStatus {
+        match status {
+            Some("completed") if exit_code.is_some_and(|code| code != 0) => {
+                CommandExecutionStatus::Failed
+            }
+            Some("completed") => CommandExecutionStatus::Completed,
+            Some("failed") => CommandExecutionStatus::Failed,
+            Some("declined") => CommandExecutionStatus::Declined,
+            Some("running" | "in_progress") => CommandExecutionStatus::InProgress,
+            Some(other) => CommandExecutionStatus::Unknown(other.to_string()),
+            None if exit_code.is_some_and(|code| code != 0) => CommandExecutionStatus::Failed,
+            None => CommandExecutionStatus::Completed,
+        }
+    }
+
+    fn rollout_command_string(value: &Value) -> Option<String> {
+        let command = value.get("command")?.as_array()?;
+        if command.len() >= 3
+            && command.get(1).and_then(Value::as_str) == Some("-lc")
+            && command
+                .first()
+                .and_then(Value::as_str)
+                .is_some_and(|program| {
+                    program.ends_with("/zsh")
+                        || program.ends_with("/bash")
+                        || program == "zsh"
+                        || program == "bash"
+                })
+        {
+            return command.get(2).and_then(Value::as_str).map(str::to_string);
+        }
+        Some(
+            command
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
+    }
+
+    fn rollout_duration_ms(value: &Value) -> Option<i64> {
+        if let Some(ms) = value.get("duration_ms").and_then(Value::as_i64) {
+            return Some(ms);
+        }
+        let duration = value.get("duration")?;
+        let secs = duration.get("secs").and_then(Value::as_i64).unwrap_or(0);
+        let nanos = duration.get("nanos").and_then(Value::as_i64).unwrap_or(0);
+        Some(secs.saturating_mul(1000) + nanos / 1_000_000)
+    }
+
+    fn command_end_output(value: &Value) -> Option<String> {
+        let mut output = String::new();
+        if let Some(stdout) = value.get("stdout").and_then(Value::as_str) {
+            output.push_str(stdout);
+        }
+        if let Some(stderr) = value.get("stderr").and_then(Value::as_str) {
+            output.push_str(stderr);
+        }
+        if output.trim().is_empty() {
+            output = value
+                .get("aggregated_output")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+        }
+        (!output.trim().is_empty()).then_some(output)
+    }
+
+    fn exec_command_output_body(output: &str) -> &str {
+        output
+            .split_once("\nOutput:\n")
+            .map_or(output, |(_, body)| body)
     }
 
     fn rollout_event_payload(line: &str) -> Option<Value> {
@@ -2669,6 +3095,13 @@ pub mod telegram {
             .ok()?;
         let path: String = stmt.query_row(params![thread_id], |row| row.get(0)).ok()?;
         Some(PathBuf::from(path))
+    }
+
+    fn rollout_file_is_open(paths: &ManagerPaths, thread_id: &str) -> bool {
+        rollout_path_for_thread(paths, thread_id)
+            .as_deref()
+            .and_then(pid_holding_file)
+            .is_some()
     }
 
     fn pid_holding_file(path: &Path) -> Option<u32> {
@@ -3075,16 +3508,344 @@ pub mod telegram {
         }
     }
 
+    struct TelegramWatchSink<'a> {
+        agent: TelegramDeltaSink<'a>,
+        activity: TelegramActivityPanel,
+        sent_any: bool,
+        best_effort_delivery: bool,
+    }
+
+    impl<'a> TelegramWatchSink<'a> {
+        fn new_best_effort(notifier: &'a TelegramNotifier<'a>, route: TelegramRoute) -> Self {
+            Self {
+                agent: TelegramDeltaSink::new(notifier, route),
+                activity: TelegramActivityPanel::new(),
+                sent_any: false,
+                best_effort_delivery: true,
+            }
+        }
+
+        fn push_event(&mut self, event: AppStreamEvent) -> Result<()> {
+            match event {
+                AppStreamEvent::AgentDelta(delta) => {
+                    if let Err(err) = self.agent.push(&delta) {
+                        if is_telegram_missing_thread_error(&err) {
+                            return Err(err);
+                        }
+                        if !self.best_effort_delivery {
+                            return Err(err);
+                        }
+                        self.agent.last_sent_chars = self.agent.text.chars().count();
+                        log_watch_delivery_failure(&self.agent.route, "agent message", err);
+                    }
+                    Ok(())
+                }
+                AppStreamEvent::CommandStarted(command) => {
+                    self.activity.apply_execution(command);
+                    if flush_activity_panel(
+                        &mut self.activity,
+                        self.agent.notifier,
+                        &self.agent.route,
+                        self.best_effort_delivery,
+                        false,
+                    )? {
+                        self.sent_any = true;
+                    }
+                    Ok(())
+                }
+                AppStreamEvent::CommandOutputDelta { .. } => Ok(()),
+                AppStreamEvent::CommandCompleted(command) => {
+                    self.activity.apply_execution(command);
+                    if flush_activity_panel(
+                        &mut self.activity,
+                        self.agent.notifier,
+                        &self.agent.route,
+                        self.best_effort_delivery,
+                        false,
+                    )? {
+                        self.sent_any = true;
+                    }
+                    Ok(())
+                }
+            }
+        }
+
+        fn finish(&mut self) -> Result<()> {
+            if let Err(err) = self.agent.finish() {
+                if is_telegram_missing_thread_error(&err) {
+                    return Err(err);
+                }
+                if !self.best_effort_delivery {
+                    return Err(err);
+                }
+                log_watch_delivery_failure(&self.agent.route, "agent message", err);
+            }
+            if flush_activity_panel(
+                &mut self.activity,
+                self.agent.notifier,
+                &self.agent.route,
+                self.best_effort_delivery,
+                true,
+            )? {
+                self.sent_any = true;
+            }
+            Ok(())
+        }
+
+        fn sent_any(&self) -> bool {
+            self.sent_any || self.agent.sent_any() || self.activity.sent_any()
+        }
+    }
+
+    fn flush_activity_panel(
+        panel: &mut TelegramActivityPanel,
+        notifier: &TelegramNotifier<'_>,
+        route: &TelegramRoute,
+        best_effort_delivery: bool,
+        force: bool,
+    ) -> Result<bool> {
+        match panel.flush(notifier, route, force) {
+            Ok(sent) => Ok(sent),
+            Err(err) if best_effort_delivery && is_telegram_missing_thread_error(&err) => Err(err),
+            Err(err) if best_effort_delivery => {
+                panel.mark_delivery_attempted();
+                log_watch_delivery_failure(route, "activity", err);
+                Ok(false)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn log_watch_delivery_failure(route: &TelegramRoute, kind: &str, err: anyhow::Error) {
+        eprintln!(
+            "telegram watch {kind} delivery failed for {}: {err:#}",
+            route.display()
+        );
+    }
+
+    struct TelegramActivityPanel {
+        order: Vec<String>,
+        items: BTreeMap<String, TelegramActivityItem>,
+        message_id: Option<i64>,
+        last_flush: Instant,
+        last_sent_text: Option<String>,
+        sent_any: bool,
+        dirty: bool,
+    }
+
+    impl TelegramActivityPanel {
+        const MAX_ITEMS: usize = 8;
+        const MIN_EDIT_INTERVAL: Duration = Duration::from_secs(2);
+
+        fn new() -> Self {
+            Self {
+                order: Vec::new(),
+                items: BTreeMap::new(),
+                message_id: None,
+                last_flush: Instant::now() - Self::MIN_EDIT_INTERVAL,
+                last_sent_text: None,
+                sent_any: false,
+                dirty: false,
+            }
+        }
+
+        fn apply_execution(&mut self, command: CommandExecution) {
+            if !self.items.contains_key(&command.item_id) {
+                self.order.push(command.item_id.clone());
+            }
+            self.items
+                .insert(command.item_id.clone(), TelegramActivityItem::from(command));
+            while self.order.len() > Self::MAX_ITEMS {
+                if let Some(item_id) = self.order.first().cloned() {
+                    self.order.remove(0);
+                    self.items.remove(&item_id);
+                }
+            }
+            self.dirty = true;
+        }
+
+        fn flush(
+            &mut self,
+            notifier: &TelegramNotifier<'_>,
+            route: &TelegramRoute,
+            force: bool,
+        ) -> Result<bool> {
+            if !self.dirty {
+                return Ok(false);
+            }
+            if !force
+                && self.message_id.is_some()
+                && self.last_flush.elapsed() < Self::MIN_EDIT_INTERVAL
+            {
+                return Ok(false);
+            }
+
+            let text = activity_watch_text(self);
+            if self.last_sent_text.as_deref() == Some(text.as_str()) {
+                self.dirty = false;
+                return Ok(false);
+            }
+
+            match self.message_id {
+                Some(message_id) => notifier.edit_one(route, message_id, &text)?,
+                None => {
+                    self.message_id = Some(notifier.send_one(route, &text)?);
+                }
+            }
+            self.dirty = false;
+            self.last_flush = Instant::now();
+            self.last_sent_text = Some(text);
+            self.sent_any = true;
+            Ok(true)
+        }
+
+        fn mark_delivery_attempted(&mut self) {
+            self.last_flush = Instant::now();
+        }
+
+        fn sent_any(&self) -> bool {
+            self.sent_any
+        }
+    }
+
+    struct TelegramActivityItem {
+        summary: String,
+        status: CommandExecutionStatus,
+        exit_code: Option<i64>,
+        duration_ms: Option<i64>,
+    }
+
+    impl From<CommandExecution> for TelegramActivityItem {
+        fn from(command: CommandExecution) -> Self {
+            Self {
+                summary: command_activity_summary(&command),
+                status: command.status,
+                exit_code: command.exit_code,
+                duration_ms: command.duration_ms,
+            }
+        }
+    }
+
+    fn activity_watch_text(panel: &TelegramActivityPanel) -> String {
+        let mut lines = vec![String::from("Activity")];
+        for item_id in &panel.order {
+            if let Some(item) = panel.items.get(item_id) {
+                lines.push(activity_item_line(item));
+            }
+        }
+        truncate_chars(&lines.join("\n"), 1800)
+    }
+
+    fn activity_item_line(item: &TelegramActivityItem) -> String {
+        let prefix = match &item.status {
+            CommandExecutionStatus::InProgress => "Running",
+            CommandExecutionStatus::Completed => "Done",
+            CommandExecutionStatus::Failed => "Failed",
+            CommandExecutionStatus::Declined => "Declined",
+            CommandExecutionStatus::Unknown(_) => "Status",
+        };
+        let mut line = format!("{prefix}: {}", truncate_chars(&item.summary, 160));
+        let mut metadata = Vec::new();
+        if let Some(exit_code) = item.exit_code.filter(|code| *code != 0) {
+            metadata.push(format!("exit {exit_code}"));
+        }
+        if let Some(duration_ms) = item.duration_ms {
+            metadata.push(format_duration_ms(duration_ms));
+        }
+        if !metadata.is_empty() {
+            line.push_str(&format!(" ({})", metadata.join(", ")));
+        }
+        line
+    }
+
+    fn command_activity_summary(command: &CommandExecution) -> String {
+        if let Some(activity) = command.activity.as_ref() {
+            return format!(
+                "{} {}",
+                activity.verb,
+                truncate_chars(activity.target.trim(), 120)
+            );
+        }
+        let command_text = command.command.trim();
+        let activity = command_activity_from_shell(command_text);
+        format!(
+            "{} {}",
+            activity.verb,
+            truncate_chars(activity.target.trim(), 120)
+        )
+    }
+
+    fn command_activity_from_shell(command: &str) -> CommandActivity {
+        let trimmed = command.trim();
+        let first_word = trimmed.split_whitespace().next().unwrap_or("");
+        let verb = match first_word {
+            "cargo" if trimmed.starts_with("cargo test") => "Test",
+            "cargo" if trimmed.starts_with("cargo build") => "Build",
+            "cargo" if trimmed.starts_with("cargo clippy") => "Lint",
+            "cargo" if trimmed.starts_with("cargo fmt") => "Format",
+            "git"
+                if trimmed.starts_with("git status")
+                    || trimmed.starts_with("git diff")
+                    || trimmed.starts_with("git log")
+                    || trimmed.starts_with("git show") =>
+            {
+                "Read"
+            }
+            "rg" | "grep" => "Search",
+            "sed" | "cat" | "tail" | "head" | "ls" | "find" | "wc" => "Read",
+            "git" if trimmed.starts_with("git add") => "Stage",
+            "git" if trimmed.starts_with("git commit") => "Commit",
+            "git" if trimmed.starts_with("git push") => "Push",
+            "mkdir" | "touch" | "cp" | "mv" | "rsync" | "install" => "Write",
+            _ => "Run",
+        };
+        CommandActivity {
+            verb: verb.to_string(),
+            target: command_activity_target(verb, trimmed),
+        }
+    }
+
+    fn command_activity_target(verb: &str, command: &str) -> String {
+        if verb == "Read" && command.starts_with("git ") {
+            return command
+                .split_whitespace()
+                .take(2)
+                .collect::<Vec<_>>()
+                .join(" ");
+        }
+        if verb == "Read" || verb == "Write" {
+            if let Some(path) = command
+                .split_whitespace()
+                .last()
+                .and_then(command_path_label)
+            {
+                return path.to_string();
+            }
+        }
+        command.to_string()
+    }
+
+    fn format_duration_ms(duration_ms: i64) -> String {
+        if duration_ms >= 1000 {
+            format!("{:.1}s", duration_ms as f64 / 1000.0)
+        } else {
+            format!("{duration_ms}ms")
+        }
+    }
+
     struct TelegramDeltaSink<'a> {
         notifier: &'a TelegramNotifier<'a>,
         route: TelegramRoute,
         text: String,
         message_id: Option<i64>,
         last_sent_chars: usize,
+        last_flush: Instant,
         sent_any: bool,
     }
 
     impl<'a> TelegramDeltaSink<'a> {
+        const MIN_EDIT_INTERVAL: Duration = Duration::from_millis(900);
+
         fn new(notifier: &'a TelegramNotifier<'a>, route: TelegramRoute) -> Self {
             Self {
                 notifier,
@@ -3092,6 +3853,7 @@ pub mod telegram {
                 text: String::new(),
                 message_id: None,
                 last_sent_chars: 0,
+                last_flush: Instant::now() - Self::MIN_EDIT_INTERVAL,
                 sent_any: false,
             }
         }
@@ -3117,6 +3879,12 @@ pub mod telegram {
             if self.text.trim().is_empty() {
                 return Ok(());
             }
+            if !final_flush
+                && self.message_id.is_some()
+                && self.last_flush.elapsed() < Self::MIN_EDIT_INTERVAL
+            {
+                return Ok(());
+            }
             let chunks = telegram_text_chunks(&self.text);
             let first = chunks
                 .first()
@@ -3134,6 +3902,7 @@ pub mod telegram {
                 }
             }
             self.last_sent_chars = self.text.chars().count();
+            self.last_flush = Instant::now();
             self.sent_any = true;
             Ok(())
         }
@@ -3727,6 +4496,11 @@ pub mod telegram {
     fn is_telegram_noop_error(description: &str) -> bool {
         description.contains("message is not modified")
             || description.contains("TOPIC_NOT_MODIFIED")
+    }
+
+    fn is_telegram_missing_thread_error(err: &anyhow::Error) -> bool {
+        let message = format!("{err:#}");
+        message.contains("message thread not found") || message.contains("MESSAGE_THREAD_NOT_FOUND")
     }
 
     #[derive(Debug, Serialize)]
@@ -4849,6 +5623,46 @@ pub mod telegram {
         }
 
         #[test]
+        fn merge_portal_entries_prefers_open_tui_threads() {
+            let preferred = vec![AppThreadPortalEntry {
+                thread_id: "thread-open".to_string(),
+                title: Some("Open TUI".to_string()),
+                preview: String::new(),
+                cwd: "/Users/yupeit/dev/cx".to_string(),
+                active: false,
+                watchable: true,
+                status: "open-tui".to_string(),
+            }];
+            let fallback = vec![
+                AppThreadPortalEntry {
+                    thread_id: "thread-old".to_string(),
+                    title: Some("Old".to_string()),
+                    preview: String::new(),
+                    cwd: "/Users/yupeit/dev/cx".to_string(),
+                    active: false,
+                    watchable: false,
+                    status: "notLoaded".to_string(),
+                },
+                AppThreadPortalEntry {
+                    thread_id: "thread-open".to_string(),
+                    title: Some("Duplicate".to_string()),
+                    preview: String::new(),
+                    cwd: "/Users/yupeit/dev/cx".to_string(),
+                    active: false,
+                    watchable: false,
+                    status: "notLoaded".to_string(),
+                },
+            ];
+
+            let merged = merge_portal_entries(preferred, fallback, 2);
+
+            assert_eq!(merged.len(), 2);
+            assert_eq!(merged[0].thread_id, "thread-open");
+            assert_eq!(merged[0].status, "open-tui");
+            assert_eq!(merged[1].thread_id, "thread-old");
+        }
+
+        #[test]
         fn loopback_listen_urls_accepts_only_loopback_addresses() {
             let urls = loopback_listen_urls(
                 "p1\nn127.0.0.1:1234\nnlocalhost:4567\nn[::1]:2345\nn0.0.0.0:9999\nn127.0.0.1:not-a-port\nn127.0.0.1:1234\n",
@@ -4866,46 +5680,51 @@ pub mod telegram {
 
         #[test]
         fn rollout_task_events_track_active_turn_lifecycle() {
-            let mut active_turns = Vec::<String>::new();
+            let mut active_turns = Vec::<(String, u64)>::new();
             apply_rollout_task_event(
                 &mut active_turns,
                 rollout_task_event(
                     r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
                 ),
+                42,
             );
             apply_rollout_task_event(
                 &mut active_turns,
                 rollout_task_event(
                     r#"{"type":"event_msg","payload":{"type":"agent_message","message":"working"}}"#,
                 ),
+                84,
             );
-            assert_eq!(active_turns, vec!["turn-1".to_string()]);
+            assert_eq!(active_turns, vec![("turn-1".to_string(), 42)]);
 
             apply_rollout_task_event(
                 &mut active_turns,
                 rollout_task_event(
                     r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"}}"#,
                 ),
+                126,
             );
             assert!(active_turns.is_empty());
         }
 
         #[test]
         fn rollout_task_events_accept_turn_aliases_and_abort() {
-            let mut active_turns = Vec::<String>::new();
+            let mut active_turns = Vec::<(String, u64)>::new();
             apply_rollout_task_event(
                 &mut active_turns,
                 rollout_task_event(
                     r#"{"type":"event_msg","payload":{"type":"turn_started","turn_id":"turn-2"}}"#,
                 ),
+                7,
             );
-            assert_eq!(active_turns, vec!["turn-2".to_string()]);
+            assert_eq!(active_turns, vec![("turn-2".to_string(), 7)]);
 
             apply_rollout_task_event(
                 &mut active_turns,
                 rollout_task_event(
                     r#"{"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn-2","reason":"interrupted"}}"#,
                 ),
+                8,
             );
             assert!(active_turns.is_empty());
         }
@@ -4944,12 +5763,88 @@ pub mod telegram {
         }
 
         #[test]
+        fn observe_result_no_active_turn_is_quiet() {
+            let route = TelegramRoute {
+                chat_id: -10042,
+                message_thread_id: Some(7),
+            };
+            let binding = TelegramBinding {
+                chat_id: -10042,
+                message_thread_id: Some(7),
+                alias: None,
+                channel_id: ChannelId::parse("telegram:-10042:topic:7").unwrap(),
+                session_id: SessionId::parse("sess_manual").unwrap(),
+                app_thread_id: Some("thread-watch".to_string()),
+                app_thread_title: Some("Watching".to_string()),
+                app_thread_cwd: Some("/tmp".to_string()),
+                topic_title: Some("Watching".to_string()),
+                panel_message_id: None,
+                telegram_paused: true,
+                topic_created_by_adapter: false,
+            };
+
+            assert_eq!(
+                observe_result_reply(&route, &binding, ObserveResult::NoActiveTurn).unwrap(),
+                None
+            );
+        }
+
+        #[test]
+        fn activity_watch_text_renders_concise_running_command() {
+            let mut panel = TelegramActivityPanel::new();
+            panel.apply_execution(CommandExecution {
+                item_id: "cmd-1".to_string(),
+                command: "sed -n '1,20p' src/channel.rs".to_string(),
+                cwd: "/tmp/project".to_string(),
+                activity: Some(CommandActivity {
+                    verb: "Read".to_string(),
+                    target: "channel.rs".to_string(),
+                }),
+                status: CommandExecutionStatus::InProgress,
+                exit_code: None,
+                duration_ms: None,
+                aggregated_output: Some("long command output that should not be sent".to_string()),
+            });
+
+            let text = activity_watch_text(&panel);
+
+            assert!(text.contains("Activity"));
+            assert!(text.contains("Running: Read channel.rs"));
+            assert!(!text.contains("cwd:"));
+            assert!(!text.contains("output"));
+            assert!(!text.contains("long command output"));
+        }
+
+        #[test]
+        fn activity_watch_text_renders_completion_metadata() {
+            let mut panel = TelegramActivityPanel::new();
+            panel.apply_execution(CommandExecution {
+                item_id: "cmd-1".to_string(),
+                command: "cargo test".to_string(),
+                cwd: "/tmp/project".to_string(),
+                activity: None,
+                status: CommandExecutionStatus::Completed,
+                exit_code: Some(0),
+                duration_ms: Some(1234),
+                aggregated_output: Some("ok\n".to_string()),
+            });
+
+            let text = activity_watch_text(&panel);
+
+            assert!(text.contains("Done: Test cargo test (1.2s)"));
+            assert!(!text.contains("exit: 0"));
+            assert!(!text.contains("ok"));
+        }
+
+        #[test]
         fn rollout_observe_event_reads_agent_and_terminal_messages() {
             assert_eq!(
                 rollout_observe_event(
                     r#"{"type":"event_msg","payload":{"type":"agent_message","message":"hello","phase":"commentary"}}"#,
                 ),
-                Some(RolloutObserveEvent::AgentMessage("hello".to_string()))
+                Some(RolloutObserveEvent::Stream(AppStreamEvent::AgentDelta(
+                    "hello".to_string()
+                )))
             );
             assert_eq!(
                 rollout_observe_event(
@@ -4960,6 +5855,64 @@ pub mod telegram {
                     terminal: ObserveTerminal::Completed,
                     last_agent_message: Some("done".to_string()),
                 })
+            );
+        }
+
+        #[test]
+        fn rollout_observe_event_reads_command_execution_events() {
+            let started = rollout_observe_event(
+                r#"{"type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"echo hi\",\"workdir\":\"/tmp\"}","call_id":"call-1"}}"#,
+            );
+            assert_eq!(
+                started,
+                Some(RolloutObserveEvent::Stream(AppStreamEvent::CommandStarted(
+                    CommandExecution {
+                        item_id: "call-1".to_string(),
+                        command: "echo hi".to_string(),
+                        cwd: "/tmp".to_string(),
+                        activity: None,
+                        status: CommandExecutionStatus::InProgress,
+                        exit_code: None,
+                        duration_ms: None,
+                        aggregated_output: None,
+                    }
+                )))
+            );
+
+            let output = rollout_observe_event(concat!(
+                r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"#,
+                r#""Chunk ID: abc\nOutput:\nhi\n"}}"#
+            ));
+            assert_eq!(
+                output,
+                Some(RolloutObserveEvent::Stream(
+                    AppStreamEvent::CommandOutputDelta {
+                        item_id: "call-1".to_string(),
+                        delta: "hi\n".to_string(),
+                    }
+                ))
+            );
+
+            let completed = rollout_observe_event(
+                r#"{"type":"event_msg","payload":{"type":"exec_command_end","call_id":"call-1","turn_id":"turn-1","command":["/bin/zsh","-lc","sed -n '1,20p' src/channel.rs"],"cwd":"/tmp","parsed_cmd":[{"type":"read","cmd":"sed -n '1,20p' src/channel.rs","name":"channel.rs","path":"src/channel.rs"}],"exit_code":0,"duration":{"secs":1,"nanos":250000000},"status":"completed"}}"#,
+            );
+            assert_eq!(
+                completed,
+                Some(RolloutObserveEvent::Stream(
+                    AppStreamEvent::CommandCompleted(CommandExecution {
+                        item_id: "call-1".to_string(),
+                        command: "sed -n '1,20p' src/channel.rs".to_string(),
+                        cwd: "/tmp".to_string(),
+                        activity: Some(CommandActivity {
+                            verb: "Read".to_string(),
+                            target: "channel.rs".to_string(),
+                        }),
+                        status: CommandExecutionStatus::Completed,
+                        exit_code: Some(0),
+                        duration_ms: Some(1250),
+                        aggregated_output: None,
+                    })
+                ))
             );
         }
 
@@ -5066,8 +6019,10 @@ pub mod telegram {
                 "turn-live",
                 start_offset,
                 Duration::from_secs(2),
-                |message| {
-                    messages.push(message.to_string());
+                |event| {
+                    if let AppStreamEvent::AgentDelta(message) = event {
+                        messages.push(message);
+                    }
                     Ok(())
                 },
             )
@@ -5121,8 +6076,10 @@ pub mod telegram {
                 "turn-live",
                 start_offset,
                 Duration::from_secs(2),
-                |message| {
-                    messages.push(message.to_string());
+                |event| {
+                    if let AppStreamEvent::AgentDelta(message) = event {
+                        messages.push(message);
+                    }
                     Ok(())
                 },
             )

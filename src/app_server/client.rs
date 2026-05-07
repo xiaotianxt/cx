@@ -67,6 +67,41 @@ pub(crate) struct ObserveOutcome {
     pub turn_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AppStreamEvent {
+    AgentDelta(String),
+    CommandStarted(CommandExecution),
+    CommandOutputDelta { item_id: String, delta: String },
+    CommandCompleted(CommandExecution),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommandExecution {
+    pub item_id: String,
+    pub command: String,
+    pub cwd: String,
+    pub activity: Option<CommandActivity>,
+    pub status: CommandExecutionStatus,
+    pub exit_code: Option<i64>,
+    pub duration_ms: Option<i64>,
+    pub aggregated_output: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommandActivity {
+    pub verb: String,
+    pub target: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CommandExecutionStatus {
+    InProgress,
+    Completed,
+    Failed,
+    Declined,
+    Unknown(String),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ApprovalRequest {
     pub id: Value,
@@ -221,11 +256,11 @@ impl AppServerClient {
         &mut self,
         thread_id: &str,
         prompt: String,
-        mut on_delta: F,
+        mut on_event: F,
         mut on_approval: impl FnMut(ApprovalRequest) -> Result<Value>,
     ) -> Result<StartedTurn>
     where
-        F: FnMut(&str) -> Result<()>,
+        F: FnMut(AppStreamEvent) -> Result<()>,
     {
         let request_id = self.send_request(
             "turn/start",
@@ -237,17 +272,17 @@ impl AppServerClient {
                 }],
             },
         )?;
-        self.collect_turn_start(request_id, thread_id, &mut on_delta, &mut on_approval)
+        self.collect_turn_start(request_id, thread_id, &mut on_event, &mut on_approval)
     }
 
     pub(crate) fn observe_thread_events<F>(
         &mut self,
         thread_id: &str,
         cwd: Option<&str>,
-        mut on_delta: F,
+        mut on_event: F,
     ) -> Result<ObserveOutcome>
     where
-        F: FnMut(&str) -> Result<()>,
+        F: FnMut(AppStreamEvent) -> Result<()>,
     {
         self.thread_resume(thread_id, cwd)?;
 
@@ -264,7 +299,30 @@ impl AppServerClient {
                     if method == "item/agentMessage/delta" =>
                 {
                     if let Some(delta) = notification_delta(&params, thread_id, Some(&turn_id)) {
-                        on_delta(delta)?;
+                        on_event(AppStreamEvent::AgentDelta(delta.to_string()))?;
+                    }
+                }
+                ServerMessage::Notification { method, params } if method == "item/started" => {
+                    if let Some(command) =
+                        notification_command_execution(&params, thread_id, Some(&turn_id))
+                    {
+                        on_event(AppStreamEvent::CommandStarted(command))?;
+                    }
+                }
+                ServerMessage::Notification { method, params }
+                    if method == "item/commandExecution/outputDelta" =>
+                {
+                    if let Some((item_id, delta)) =
+                        notification_command_output_delta(&params, thread_id, Some(&turn_id))
+                    {
+                        on_event(AppStreamEvent::CommandOutputDelta { item_id, delta })?;
+                    }
+                }
+                ServerMessage::Notification { method, params } if method == "item/completed" => {
+                    if let Some(command) =
+                        notification_command_execution(&params, thread_id, Some(&turn_id))
+                    {
+                        on_event(AppStreamEvent::CommandCompleted(command))?;
                     }
                 }
                 ServerMessage::Notification { method, params } if method == "turn/completed" => {
@@ -356,11 +414,11 @@ impl AppServerClient {
         &mut self,
         request_id: u64,
         thread_id: &str,
-        on_delta: &mut F,
+        on_event: &mut F,
         on_approval: &mut impl FnMut(ApprovalRequest) -> Result<Value>,
     ) -> Result<StartedTurn>
     where
-        F: FnMut(&str) -> Result<()>,
+        F: FnMut(AppStreamEvent) -> Result<()>,
     {
         let mut turn_id = None::<String>;
         let mut assistant_text = String::new();
@@ -398,7 +456,27 @@ impl AppServerClient {
                             notification_delta(&params, thread_id, turn_id.as_deref())
                         {
                             assistant_text.push_str(delta);
-                            on_delta(delta)?;
+                            on_event(AppStreamEvent::AgentDelta(delta.to_string()))?;
+                        }
+                    } else if method == "item/started" {
+                        if let Some(command) =
+                            notification_command_execution(&params, thread_id, turn_id.as_deref())
+                        {
+                            on_event(AppStreamEvent::CommandStarted(command))?;
+                        }
+                    } else if method == "item/commandExecution/outputDelta" {
+                        if let Some((item_id, delta)) = notification_command_output_delta(
+                            &params,
+                            thread_id,
+                            turn_id.as_deref(),
+                        ) {
+                            on_event(AppStreamEvent::CommandOutputDelta { item_id, delta })?;
+                        }
+                    } else if method == "item/completed" {
+                        if let Some(command) =
+                            notification_command_execution(&params, thread_id, turn_id.as_deref())
+                        {
+                            on_event(AppStreamEvent::CommandCompleted(command))?;
                         }
                     } else if method == "turn/completed" {
                         if let Some(completed_turn_id) = completed_turn_id(&params, thread_id) {
@@ -503,6 +581,35 @@ fn notification_delta<'a>(
     thread_id: &str,
     turn_id: Option<&str>,
 ) -> Option<&'a str> {
+    let params = notification_params(params, thread_id, turn_id)?;
+    params.get("delta").and_then(Value::as_str)
+}
+
+fn notification_command_execution(
+    params: &Option<Value>,
+    thread_id: &str,
+    turn_id: Option<&str>,
+) -> Option<CommandExecution> {
+    let params = notification_params(params, thread_id, turn_id)?;
+    command_execution_from_item(params.get("item")?)
+}
+
+fn notification_command_output_delta(
+    params: &Option<Value>,
+    thread_id: &str,
+    turn_id: Option<&str>,
+) -> Option<(String, String)> {
+    let params = notification_params(params, thread_id, turn_id)?;
+    let item_id = params.get("itemId")?.as_str()?.to_string();
+    let delta = params.get("delta")?.as_str()?.to_string();
+    Some((item_id, delta))
+}
+
+fn notification_params<'a>(
+    params: &'a Option<Value>,
+    thread_id: &str,
+    turn_id: Option<&str>,
+) -> Option<&'a Value> {
     let params = params.as_ref()?;
     if params.get("threadId").and_then(Value::as_str)? != thread_id {
         return None;
@@ -512,7 +619,36 @@ fn notification_delta<'a>(
             return None;
         }
     }
-    params.get("delta").and_then(Value::as_str)
+    Some(params)
+}
+
+fn command_execution_from_item(item: &Value) -> Option<CommandExecution> {
+    if item.get("type").and_then(Value::as_str)? != "commandExecution" {
+        return None;
+    }
+    Some(CommandExecution {
+        item_id: item.get("id")?.as_str()?.to_string(),
+        command: item.get("command")?.as_str()?.to_string(),
+        cwd: item.get("cwd")?.as_str()?.to_string(),
+        activity: None,
+        status: command_execution_status(item.get("status")?.as_str()?),
+        exit_code: item.get("exitCode").and_then(Value::as_i64),
+        duration_ms: item.get("durationMs").and_then(Value::as_i64),
+        aggregated_output: item
+            .get("aggregatedOutput")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    })
+}
+
+fn command_execution_status(status: &str) -> CommandExecutionStatus {
+    match status {
+        "inProgress" => CommandExecutionStatus::InProgress,
+        "completed" => CommandExecutionStatus::Completed,
+        "failed" => CommandExecutionStatus::Failed,
+        "declined" => CommandExecutionStatus::Declined,
+        other => CommandExecutionStatus::Unknown(other.to_string()),
+    }
 }
 
 fn completed_turn_id<'a>(params: &'a Option<Value>, thread_id: &str) -> Option<&'a str> {
@@ -633,5 +769,60 @@ mod tests {
             }
             other => panic!("expected server request, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn notification_command_execution_reads_started_item() {
+        let params = Some(json!({
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "item": {
+                "type": "commandExecution",
+                "id": "cmd-1",
+                "command": "printf hello",
+                "cwd": "/tmp/project",
+                "processId": null,
+                "source": "agent",
+                "status": "inProgress",
+                "commandActions": [],
+                "aggregatedOutput": null,
+                "exitCode": null,
+                "durationMs": null
+            },
+            "startedAtMs": 10
+        }));
+
+        assert_eq!(
+            notification_command_execution(&params, "thread-1", Some("turn-1")),
+            Some(CommandExecution {
+                item_id: "cmd-1".to_string(),
+                command: "printf hello".to_string(),
+                cwd: "/tmp/project".to_string(),
+                activity: None,
+                status: CommandExecutionStatus::InProgress,
+                exit_code: None,
+                duration_ms: None,
+                aggregated_output: None,
+            })
+        );
+    }
+
+    #[test]
+    fn notification_command_output_delta_filters_by_turn() {
+        let params = Some(json!({
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "itemId": "cmd-1",
+            "delta": "hello\n"
+        }));
+
+        assert_eq!(
+            notification_command_output_delta(&params, "thread-1", Some("turn-1")),
+            Some(("cmd-1".to_string(), "hello\n".to_string()))
+        );
+        assert_eq!(
+            notification_command_output_delta(&params, "thread-1", Some("other-turn")),
+            None
+        );
     }
 }

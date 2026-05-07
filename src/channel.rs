@@ -2,9 +2,14 @@ pub mod telegram {
     use std::collections::BTreeSet;
     use std::fs;
     use std::fs::OpenOptions;
+    use std::io::BufRead;
+    use std::io::BufReader;
     use std::io::Read;
+    use std::io::Seek;
+    use std::io::SeekFrom;
     use std::io::Write;
     use std::path::Path;
+    use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
@@ -861,6 +866,7 @@ pub mod telegram {
         preview: String,
         cwd: String,
         active: bool,
+        watchable: bool,
         status: String,
     }
 
@@ -872,6 +878,7 @@ pub mod telegram {
                 preview: summary.preview,
                 cwd: summary.cwd,
                 active: summary.active,
+                watchable: summary.active,
                 status: summary.status,
             }
         }
@@ -1465,10 +1472,10 @@ pub mod telegram {
                 "That Codex thread is no longer visible. Open /portal and choose again.",
             )));
         };
-        if !entry.active {
+        if !entry.watchable {
             return Ok(Some(reply(
                 route,
-                "That thread is not active. Use 'Take over' instead to resume it.",
+                "That thread is not watchable. Use Open instead to resume it.",
             )));
         }
 
@@ -1602,26 +1609,24 @@ pub mod telegram {
         );
 
         match result {
-            ObserveResult::NoObservableAppServer => Ok(Some(work_panel_reply(
-                route,
-                binding,
-                "No app-server with an active turn is available for this thread. Use Take over to continue from Telegram.",
-                None,
-            ))),
             ObserveResult::NoActiveTurn => Ok(Some(work_panel_reply(
                 route,
                 binding,
-                "No active turn to observe.",
+                "No live app-server turn or active TUI rollout to observe.",
                 None,
             ))),
-            ObserveResult::TurnCompleted {
+            ObserveResult::TurnFinished {
                 turn_id,
                 streamed,
+                terminal,
             } => {
                 if streamed {
                     return Ok(None);
                 }
-                let headline = format!("Watched turn {turn_id} complete.");
+                let headline = match terminal {
+                    ObserveTerminal::Completed => format!("Watched turn {turn_id} complete."),
+                    ObserveTerminal::Aborted => format!("Watched turn {turn_id} abort."),
+                };
                 Ok(Some(work_panel_reply(route, binding, headline, None)))
             }
             ObserveResult::Error(err) => {
@@ -1795,11 +1800,26 @@ pub mod telegram {
     ) -> Result<Vec<AppThreadPortalEntry>> {
         let mut client = connect_app_server(paths, timeout_secs)?;
         let page = client.thread_list(limit)?;
-        Ok(page
+        let mut entries = page
             .threads
             .into_iter()
             .map(AppThreadPortalEntry::from)
-            .collect())
+            .collect::<Vec<_>>();
+        mark_rollout_watchable_threads(paths, &mut entries);
+        Ok(entries)
+    }
+
+    fn mark_rollout_watchable_threads(paths: &ManagerPaths, entries: &mut [AppThreadPortalEntry]) {
+        for entry in entries.iter_mut().filter(|entry| !entry.watchable) {
+            if active_rollout_turn(paths, &entry.thread_id)
+                .ok()
+                .flatten()
+                .is_some()
+            {
+                entry.watchable = true;
+                entry.status = "active-tui".to_string();
+            }
+        }
     }
 
     fn portal_text(entries: &[AppThreadPortalEntry]) -> String {
@@ -1814,7 +1834,7 @@ pub mod telegram {
             ));
         }
         lines.push(String::from(
-            "Active threads can be watched or taken over. Tap Watch to observe, then Take over when ready.",
+            "Watchable threads can be observed. App-server active threads can also be taken over.",
         ));
         lines.join("\n")
     }
@@ -1822,11 +1842,12 @@ pub mod telegram {
     fn portal_keyboard(entries: &[AppThreadPortalEntry]) -> TelegramInlineKeyboardMarkup {
         let mut rows = Vec::new();
         for entry in entries {
-            if entry.active {
+            if entry.watchable {
+                let open_label = if entry.active { "Take over" } else { "Open" };
                 rows.push(vec![
                     TelegramInlineKeyboardButton {
                         text: format!(
-                            "Take over: {}",
+                            "{open_label}: {}",
                             truncate_chars(&work_topic_title(entry), 36)
                         ),
                         callback_data: format!("cx:a:{}", entry.thread_id),
@@ -2049,10 +2070,19 @@ pub mod telegram {
     }
 
     enum ObserveResult {
-        NoObservableAppServer,
         NoActiveTurn,
-        TurnCompleted { turn_id: String, streamed: bool },
+        TurnFinished {
+            turn_id: String,
+            streamed: bool,
+            terminal: ObserveTerminal,
+        },
         Error(anyhow::Error),
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ObserveTerminal {
+        Completed,
+        Aborted,
     }
 
     fn run_codex_observe(
@@ -2068,7 +2098,9 @@ pub mod telegram {
 
         let app_url = match resolve_observe_app_url(paths, thread_id, timeout_secs) {
             Ok(Some(url)) => url,
-            Ok(None) => return ObserveResult::NoObservableAppServer,
+            Ok(None) => {
+                return run_rollout_observe(paths, route, thread_id, timeout_secs, notifier);
+            }
             Err(err) => return ObserveResult::Error(err),
         };
         let mut client =
@@ -2103,8 +2135,56 @@ pub mod telegram {
         let streamed = sink.is_some_and(|s| s.sent_any());
 
         match outcome.turn_id {
-            Some(turn_id) => ObserveResult::TurnCompleted { turn_id, streamed },
+            Some(turn_id) => ObserveResult::TurnFinished {
+                turn_id,
+                streamed,
+                terminal: ObserveTerminal::Completed,
+            },
             None => ObserveResult::NoActiveTurn,
+        }
+    }
+
+    fn run_rollout_observe(
+        paths: &ManagerPaths,
+        route: &TelegramRoute,
+        thread_id: &str,
+        timeout_secs: f32,
+        notifier: Option<&TelegramNotifier<'_>>,
+    ) -> ObserveResult {
+        let active = match active_rollout_turn(paths, thread_id) {
+            Ok(Some(active)) => active,
+            Ok(None) => return ObserveResult::NoActiveTurn,
+            Err(err) => return ObserveResult::Error(err),
+        };
+
+        let mut sink = notifier.map(|n| TelegramDeltaSink::new(n, route.clone()));
+        let observed = observe_active_rollout(
+            &active.path,
+            &active.turn_id,
+            active.offset,
+            Duration::from_secs_f32(timeout_secs),
+            |message| {
+                if let Some(sink) = sink.as_mut() {
+                    sink.push(message)?;
+                    sink.push("\n\n")?;
+                }
+                Ok(())
+            },
+        );
+        let terminal = match observed {
+            Ok(terminal) => terminal,
+            Err(err) => return ObserveResult::Error(err),
+        };
+        if let Some(sink) = sink.as_mut() {
+            if let Err(err) = sink.finish() {
+                return ObserveResult::Error(err);
+            }
+        }
+        let streamed = sink.as_ref().is_some_and(|sink| sink.sent_any());
+        ObserveResult::TurnFinished {
+            turn_id: terminal.turn_id,
+            streamed,
+            terminal: terminal.terminal,
         }
     }
 
@@ -2165,6 +2245,253 @@ pub mod telegram {
         None
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ActiveRolloutTurn {
+        path: PathBuf,
+        turn_id: String,
+        offset: u64,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct ObservedRolloutTerminal {
+        turn_id: String,
+        terminal: ObserveTerminal,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum RolloutTaskEvent {
+        Started(String),
+        Terminal {
+            turn_id: Option<String>,
+            terminal: ObserveTerminal,
+        },
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum RolloutObserveEvent {
+        AgentMessage(String),
+        Terminal {
+            turn_id: Option<String>,
+            terminal: ObserveTerminal,
+            last_agent_message: Option<String>,
+        },
+    }
+
+    fn active_rollout_turn(
+        paths: &ManagerPaths,
+        thread_id: &str,
+    ) -> Result<Option<ActiveRolloutTurn>> {
+        let Some(path) = rollout_path_for_thread(paths, thread_id) else {
+            return Ok(None);
+        };
+        if !path.exists() {
+            return Ok(None);
+        }
+        let Some((turn_id, offset)) = latest_active_rollout_turn(&path)? else {
+            return Ok(None);
+        };
+        if pid_holding_file(&path).is_none() {
+            return Ok(None);
+        }
+        Ok(Some(ActiveRolloutTurn {
+            path,
+            turn_id,
+            offset,
+        }))
+    }
+
+    fn latest_active_rollout_turn(path: &Path) -> Result<Option<(String, u64)>> {
+        let file =
+            fs::File::open(path).with_context(|| format!("open rollout {}", path.display()))?;
+        let mut reader = BufReader::new(file);
+        let mut active_turns = Vec::<String>::new();
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read = reader
+                .read_line(&mut line)
+                .with_context(|| format!("read rollout {}", path.display()))?;
+            if read == 0 {
+                break;
+            }
+            apply_rollout_task_event(&mut active_turns, rollout_task_event(&line));
+        }
+        let offset = reader
+            .stream_position()
+            .with_context(|| format!("read rollout position {}", path.display()))?;
+        Ok(active_turns
+            .last()
+            .cloned()
+            .map(|turn_id| (turn_id, offset)))
+    }
+
+    fn apply_rollout_task_event(active_turns: &mut Vec<String>, event: Option<RolloutTaskEvent>) {
+        match event {
+            Some(RolloutTaskEvent::Started(turn_id))
+                if !active_turns.iter().any(|active| active == &turn_id) =>
+            {
+                active_turns.push(turn_id);
+            }
+            Some(RolloutTaskEvent::Started(_)) => {}
+            Some(RolloutTaskEvent::Terminal {
+                turn_id: Some(turn_id),
+                ..
+            }) => {
+                active_turns.retain(|active| active != &turn_id);
+            }
+            Some(RolloutTaskEvent::Terminal { turn_id: None, .. }) => {
+                active_turns.clear();
+            }
+            None => {}
+        }
+    }
+
+    fn observe_active_rollout<F>(
+        path: &Path,
+        active_turn_id: &str,
+        start_offset: u64,
+        timeout: Duration,
+        mut on_message: F,
+    ) -> Result<ObservedRolloutTerminal>
+    where
+        F: FnMut(&str) -> Result<()>,
+    {
+        let mut file =
+            fs::File::open(path).with_context(|| format!("open rollout {}", path.display()))?;
+        file.seek(SeekFrom::Start(start_offset))
+            .with_context(|| format!("seek rollout {}", path.display()))?;
+        let mut reader = BufReader::new(file);
+        let mut last_activity = Instant::now();
+        let mut last_sent_agent_message = None::<String>;
+
+        loop {
+            let mut line = String::new();
+            let read = reader
+                .read_line(&mut line)
+                .with_context(|| format!("read rollout {}", path.display()))?;
+            if read == 0 {
+                if last_activity.elapsed() >= timeout {
+                    anyhow::bail!("timed out waiting for rollout events in {}", path.display());
+                }
+                thread::sleep(Duration::from_millis(200));
+                continue;
+            }
+
+            last_activity = Instant::now();
+            match rollout_observe_event(&line) {
+                Some(RolloutObserveEvent::AgentMessage(message)) => {
+                    send_rollout_agent_message(
+                        &message,
+                        &mut last_sent_agent_message,
+                        &mut on_message,
+                    )?;
+                }
+                Some(RolloutObserveEvent::Terminal {
+                    turn_id,
+                    terminal,
+                    last_agent_message,
+                }) if turn_id.as_deref().is_none_or(|id| id == active_turn_id) => {
+                    if let Some(message) = last_agent_message {
+                        send_rollout_agent_message(
+                            &message,
+                            &mut last_sent_agent_message,
+                            &mut on_message,
+                        )?;
+                    }
+                    return Ok(ObservedRolloutTerminal {
+                        turn_id: turn_id.unwrap_or_else(|| active_turn_id.to_string()),
+                        terminal,
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn send_rollout_agent_message<F>(
+        message: &str,
+        last_sent_agent_message: &mut Option<String>,
+        on_message: &mut F,
+    ) -> Result<()>
+    where
+        F: FnMut(&str) -> Result<()>,
+    {
+        if message.trim().is_empty() {
+            return Ok(());
+        }
+        if last_sent_agent_message.as_deref() == Some(message) {
+            return Ok(());
+        }
+        on_message(message)?;
+        *last_sent_agent_message = Some(message.to_string());
+        Ok(())
+    }
+
+    fn rollout_task_event(line: &str) -> Option<RolloutTaskEvent> {
+        let value = rollout_event_payload(line)?;
+        let kind = value.get("type")?.as_str()?;
+        match kind {
+            "task_started" | "turn_started" => value
+                .get("turn_id")
+                .and_then(Value::as_str)
+                .map(|turn_id| RolloutTaskEvent::Started(turn_id.to_string())),
+            "task_complete" | "turn_complete" => Some(RolloutTaskEvent::Terminal {
+                turn_id: value
+                    .get("turn_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                terminal: ObserveTerminal::Completed,
+            }),
+            "turn_aborted" => Some(RolloutTaskEvent::Terminal {
+                turn_id: value
+                    .get("turn_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                terminal: ObserveTerminal::Aborted,
+            }),
+            _ => None,
+        }
+    }
+
+    fn rollout_observe_event(line: &str) -> Option<RolloutObserveEvent> {
+        let value = rollout_event_payload(line)?;
+        let kind = value.get("type")?.as_str()?;
+        match kind {
+            "agent_message" => value
+                .get("message")
+                .and_then(Value::as_str)
+                .map(|message| RolloutObserveEvent::AgentMessage(message.to_string())),
+            "task_complete" | "turn_complete" => Some(RolloutObserveEvent::Terminal {
+                turn_id: value
+                    .get("turn_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                terminal: ObserveTerminal::Completed,
+                last_agent_message: value
+                    .get("last_agent_message")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            }),
+            "turn_aborted" => Some(RolloutObserveEvent::Terminal {
+                turn_id: value
+                    .get("turn_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                terminal: ObserveTerminal::Aborted,
+                last_agent_message: None,
+            }),
+            _ => None,
+        }
+    }
+
+    fn rollout_event_payload(line: &str) -> Option<Value> {
+        let value = serde_json::from_str::<Value>(line).ok()?;
+        if value.get("type").and_then(Value::as_str) != Some("event_msg") {
+            return None;
+        }
+        value.get("payload").cloned()
+    }
+
     fn rollout_owner_app_server_urls(paths: &ManagerPaths, thread_id: &str) -> Vec<String> {
         let rollout = match rollout_path_for_thread(paths, thread_id) {
             Some(p) => p,
@@ -2199,19 +2526,20 @@ pub mod telegram {
         urls
     }
 
-    fn rollout_path_for_thread(paths: &ManagerPaths, thread_id: &str) -> Option<String> {
+    fn rollout_path_for_thread(paths: &ManagerPaths, thread_id: &str) -> Option<PathBuf> {
         let db_path = paths.base_codex_home.join("state_5.sqlite");
         let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
         let mut stmt = conn
             .prepare("SELECT rollout_path FROM threads WHERE id = ?1 AND archived = 0")
             .ok()?;
         let path: String = stmt.query_row(params![thread_id], |row| row.get(0)).ok()?;
-        Some(path)
+        Some(PathBuf::from(path))
     }
 
-    fn pid_holding_file(path: &str) -> Option<u32> {
+    fn pid_holding_file(path: &Path) -> Option<u32> {
         let output = std::process::Command::new("lsof")
-            .args(["-nP", "-Fp", "--", path])
+            .args(["-nP", "-Fp", "--"])
+            .arg(path)
             .stdin(std::process::Stdio::null())
             .output()
             .ok()?;
@@ -4312,6 +4640,7 @@ pub mod telegram {
                 preview: String::new(),
                 cwd: "/Users/yupeit/dev/cx".to_string(),
                 active: true,
+                watchable: true,
                 status: "active".to_string(),
             }];
 
@@ -4343,6 +4672,7 @@ pub mod telegram {
                 preview: String::new(),
                 cwd: "/Users/yupeit/dev/cx".to_string(),
                 active: false,
+                watchable: false,
                 status: "idle".to_string(),
             }];
 
@@ -4354,6 +4684,33 @@ pub mod telegram {
                 "cx:a:thread-idle"
             );
             assert!(keyboard.inline_keyboard[0][0].text.starts_with("Open:"));
+        }
+
+        #[test]
+        fn portal_keyboard_offers_watch_for_watchable_tui_threads() {
+            let entries = vec![AppThreadPortalEntry {
+                thread_id: "thread-tui-active".to_string(),
+                title: Some("Running in TUI".to_string()),
+                preview: String::new(),
+                cwd: "/Users/yupeit/dev/cx".to_string(),
+                active: false,
+                watchable: true,
+                status: "active-tui".to_string(),
+            }];
+
+            let keyboard = portal_keyboard(&entries);
+
+            assert_eq!(keyboard.inline_keyboard[0].len(), 2);
+            assert!(keyboard.inline_keyboard[0][0].text.starts_with("Open:"));
+            assert_eq!(
+                keyboard.inline_keyboard[0][0].callback_data,
+                "cx:a:thread-tui-active"
+            );
+            assert_eq!(keyboard.inline_keyboard[0][1].text, "Watch");
+            assert_eq!(
+                keyboard.inline_keyboard[0][1].callback_data,
+                "cx:o:thread-tui-active"
+            );
         }
 
         #[test]
@@ -4370,6 +4727,181 @@ pub mod telegram {
                     "ws://127.0.0.1:4567",
                 ]
             );
+        }
+
+        #[test]
+        fn rollout_task_events_track_active_turn_lifecycle() {
+            let mut active_turns = Vec::<String>::new();
+            apply_rollout_task_event(
+                &mut active_turns,
+                rollout_task_event(
+                    r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+                ),
+            );
+            apply_rollout_task_event(
+                &mut active_turns,
+                rollout_task_event(
+                    r#"{"type":"event_msg","payload":{"type":"agent_message","message":"working"}}"#,
+                ),
+            );
+            assert_eq!(active_turns, vec!["turn-1".to_string()]);
+
+            apply_rollout_task_event(
+                &mut active_turns,
+                rollout_task_event(
+                    r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"}}"#,
+                ),
+            );
+            assert!(active_turns.is_empty());
+        }
+
+        #[test]
+        fn rollout_task_events_accept_turn_aliases_and_abort() {
+            let mut active_turns = Vec::<String>::new();
+            apply_rollout_task_event(
+                &mut active_turns,
+                rollout_task_event(
+                    r#"{"type":"event_msg","payload":{"type":"turn_started","turn_id":"turn-2"}}"#,
+                ),
+            );
+            assert_eq!(active_turns, vec!["turn-2".to_string()]);
+
+            apply_rollout_task_event(
+                &mut active_turns,
+                rollout_task_event(
+                    r#"{"type":"event_msg","payload":{"type":"turn_aborted","turn_id":"turn-2","reason":"interrupted"}}"#,
+                ),
+            );
+            assert!(active_turns.is_empty());
+        }
+
+        #[test]
+        fn rollout_observe_event_reads_agent_and_terminal_messages() {
+            assert_eq!(
+                rollout_observe_event(
+                    r#"{"type":"event_msg","payload":{"type":"agent_message","message":"hello","phase":"commentary"}}"#,
+                ),
+                Some(RolloutObserveEvent::AgentMessage("hello".to_string()))
+            );
+            assert_eq!(
+                rollout_observe_event(
+                    r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","last_agent_message":"done"}}"#,
+                ),
+                Some(RolloutObserveEvent::Terminal {
+                    turn_id: Some("turn-1".to_string()),
+                    terminal: ObserveTerminal::Completed,
+                    last_agent_message: Some("done".to_string()),
+                })
+            );
+        }
+
+        #[test]
+        fn observe_active_rollout_streams_until_task_complete() {
+            use std::io::Write as _;
+
+            let paths = temp_paths("rollout-observe");
+            fs::create_dir_all(&paths.base_codex_home).unwrap();
+            let rollout = paths.base_codex_home.join("rollout.jsonl");
+            fs::write(
+                &rollout,
+                concat!(
+                    r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-live"}}"#,
+                    "\n"
+                ),
+            )
+            .unwrap();
+
+            let writer_rollout = rollout.clone();
+            let writer = thread::spawn(move || {
+                thread::sleep(Duration::from_millis(50));
+                let mut file = OpenOptions::new()
+                    .append(true)
+                    .open(writer_rollout)
+                    .unwrap();
+                file.write_all(
+                    concat!(
+                        r#"{"type":"event_msg","payload":{"type":"agent_message","message":"done","phase":"final_answer"}}"#,
+                        "\n",
+                        r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-live","last_agent_message":"done"}}"#,
+                        "\n"
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+                file.flush().unwrap();
+            });
+
+            let mut messages = Vec::<String>::new();
+            let start_offset = fs::metadata(&rollout).unwrap().len();
+            let observed = observe_active_rollout(
+                &rollout,
+                "turn-live",
+                start_offset,
+                Duration::from_secs(2),
+                |message| {
+                    messages.push(message.to_string());
+                    Ok(())
+                },
+            )
+            .unwrap();
+            writer.join().unwrap();
+
+            assert_eq!(messages, vec!["done".to_string()]);
+            assert_eq!(
+                observed,
+                ObservedRolloutTerminal {
+                    turn_id: "turn-live".to_string(),
+                    terminal: ObserveTerminal::Completed,
+                }
+            );
+        }
+
+        #[test]
+        fn observe_active_rollout_does_not_skip_events_written_after_scan() {
+            use std::io::Write as _;
+
+            let paths = temp_paths("rollout-observe-race");
+            fs::create_dir_all(&paths.base_codex_home).unwrap();
+            let rollout = paths.base_codex_home.join("rollout.jsonl");
+            fs::write(
+                &rollout,
+                concat!(
+                    r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-live"}}"#,
+                    "\n"
+                ),
+            )
+            .unwrap();
+            let start_offset = fs::metadata(&rollout).unwrap().len();
+            fs::OpenOptions::new()
+                .append(true)
+                .open(&rollout)
+                .unwrap()
+                .write_all(
+                    concat!(
+                        r#"{"type":"event_msg","payload":{"type":"agent_message","message":"done","phase":"final_answer"}}"#,
+                        "\n",
+                        r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-live","last_agent_message":"done"}}"#,
+                        "\n"
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+
+            let mut messages = Vec::<String>::new();
+            let observed = observe_active_rollout(
+                &rollout,
+                "turn-live",
+                start_offset,
+                Duration::from_secs(2),
+                |message| {
+                    messages.push(message.to_string());
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+            assert_eq!(messages, vec!["done".to_string()]);
+            assert_eq!(observed.terminal, ObserveTerminal::Completed);
         }
 
         #[test]

@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs;
 use std::fs::OpenOptions;
@@ -54,6 +53,20 @@ use crate::session::CreateSessionRequest;
 use crate::session::RecordChannelMessageRequest;
 use crate::session::SessionId;
 
+mod transcript;
+
+#[cfg(test)]
+use self::transcript::activity_watch_text;
+#[cfg(test)]
+use self::transcript::thinking_watch_text;
+use self::transcript::user_watch_text;
+use self::transcript::TelegramActivityPanel;
+use self::transcript::TelegramActivityState;
+use self::transcript::TelegramStatusPanel;
+use self::transcript::TelegramStatusState;
+use self::transcript::TelegramThinkingPanel;
+use self::transcript::TelegramTranscriptTarget;
+
 const TELEGRAM_STATE_SCHEMA_VERSION: u64 = 1;
 const PORTAL_TOPIC_TITLE: &str = "cx portal";
 const PORTAL_APP_SERVER_TIMEOUT: Duration = Duration::from_millis(750);
@@ -102,6 +115,10 @@ struct TelegramBinding {
     watch_proxy_offset: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     watch_rollout_offset: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    watch_activity: Option<TelegramActivityState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    watch_status: Option<TelegramStatusState>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -379,6 +396,8 @@ impl TelegramState {
             topic_created_by_adapter: false,
             watch_proxy_offset: None,
             watch_rollout_offset: None,
+            watch_activity: None,
+            watch_status: None,
         };
         self.bindings.push(binding.clone());
         self.set_active_route(route, alias);
@@ -404,6 +423,8 @@ impl TelegramState {
             stored.topic_created_by_adapter = topic_created_by_adapter;
             stored.watch_proxy_offset = None;
             stored.watch_rollout_offset = None;
+            stored.watch_activity = None;
+            stored.watch_status = None;
             binding = stored.clone();
         }
         debug_assert_eq!(binding.session_id, existing_session_id);
@@ -899,10 +920,28 @@ fn drain_watched_binding(
             .unwrap_or(proxy_len);
         let proxy_drain =
             proxy_events_since(&proxy_path, proxy_offset, WATCH_DRAIN_MAX_LINES, thread_id)?;
+        let activity_state = state
+            .binding_for_route(route, binding.alias.as_deref())
+            .and_then(|stored| stored.watch_activity.clone())
+            .or_else(|| binding.watch_activity.clone());
+        let status_state = state
+            .binding_for_route(route, binding.alias.as_deref())
+            .and_then(|stored| stored.watch_status.clone())
+            .or_else(|| binding.watch_status.clone());
+        let proxy_had_events = !proxy_drain.events.is_empty();
+        let send_result = send_watch_events(
+            route,
+            notifier,
+            proxy_drain.events,
+            activity_state,
+            status_state,
+        )?;
         if let Some(stored) = state.binding_for_route_mut(route, binding.alias.as_deref()) {
             stored.watch_proxy_offset = Some(proxy_drain.next_offset);
+            stored.watch_activity = send_result.activity;
+            stored.watch_status = send_result.status;
         }
-        if send_watch_events(route, notifier, proxy_drain.events)? {
+        if send_result.sent_any && proxy_had_events {
             return Ok(());
         }
     }
@@ -923,22 +962,38 @@ fn drain_watched_binding(
         .unwrap_or(file_len);
     let drain = rollout_events_since(&path, start_offset, WATCH_DRAIN_MAX_LINES)?;
 
+    let activity_state = state
+        .binding_for_route(route, binding.alias.as_deref())
+        .and_then(|stored| stored.watch_activity.clone())
+        .or_else(|| binding.watch_activity.clone());
+    let status_state = state
+        .binding_for_route(route, binding.alias.as_deref())
+        .and_then(|stored| stored.watch_status.clone())
+        .or_else(|| binding.watch_status.clone());
+    let send_result =
+        send_watch_events(route, notifier, drain.events, activity_state, status_state)?;
     if let Some(stored) = state.binding_for_route_mut(route, binding.alias.as_deref()) {
         stored.watch_rollout_offset = Some(drain.next_offset);
+        stored.watch_activity = send_result.activity;
+        stored.watch_status = send_result.status;
     }
-    send_watch_events(route, notifier, drain.events)?;
     Ok(())
+}
+
+struct WatchSendResult {
+    sent_any: bool,
+    activity: Option<TelegramActivityState>,
+    status: Option<TelegramStatusState>,
 }
 
 fn send_watch_events(
     route: &TelegramRoute,
     notifier: &TelegramNotifier<'_>,
     events: Vec<RolloutObserveEvent>,
-) -> Result<bool> {
-    if events.is_empty() {
-        return Ok(false);
-    }
-    let mut sink = TelegramWatchSink::new_best_effort(notifier, route.clone());
+    activity: Option<TelegramActivityState>,
+    status: Option<TelegramStatusState>,
+) -> Result<WatchSendResult> {
+    let mut sink = TelegramWatchSink::new_best_effort(notifier, route.clone(), activity, status);
     let mut last_sent_agent_message = None::<String>;
     for event in events {
         match event {
@@ -951,6 +1006,7 @@ fn send_watch_events(
             RolloutObserveEvent::Terminal {
                 last_agent_message, ..
             } => {
+                sink.turn_completed()?;
                 if let Some(message) = last_agent_message {
                     send_rollout_agent_message(
                         &message,
@@ -962,7 +1018,11 @@ fn send_watch_events(
         }
     }
     sink.finish()?;
-    Ok(true)
+    Ok(WatchSendResult {
+        sent_any: sink.sent_any(),
+        activity: sink.activity_state(),
+        status: sink.status_state(),
+    })
 }
 
 fn watched_bindings(state: &TelegramState) -> Vec<TelegramBinding> {
@@ -1889,6 +1949,8 @@ fn watch_bound_thread(
 }
 
 fn initialize_watch_cursor(paths: &ManagerPaths, binding: &mut TelegramBinding) {
+    binding.watch_activity = None;
+    binding.watch_status = None;
     if binding.watch_proxy_offset.is_none() {
         if let Ok(metadata) = fs::metadata(proxy_event_log_path(paths)) {
             binding.watch_proxy_offset = Some(metadata.len());
@@ -2412,8 +2474,8 @@ fn run_codex_turn(
             thread.upstream_thread_id
         }
     };
-    let mut sink =
-        notifier.map(|notifier| TelegramWatchSink::new_best_effort(notifier, route.clone()));
+    let mut sink = notifier
+        .map(|notifier| TelegramWatchSink::new_best_effort(notifier, route.clone(), None, None));
     let turn_start = Instant::now();
     let mut first_event_seen = false;
     let turn = client.turn_start_stream(
@@ -2451,6 +2513,7 @@ fn run_codex_turn(
             );
     }
     if let Some(sink) = sink.as_mut() {
+        sink.turn_completed()?;
         let finish_start = Instant::now();
         sink.finish()?;
         if trace_timings {
@@ -2893,6 +2956,15 @@ fn rollout_observe_event(line: &str) -> Option<RolloutObserveEvent> {
             };
             RolloutObserveEvent::Stream(event)
         }),
+        "patch_apply_begin" => Some(RolloutObserveEvent::Stream(AppStreamEvent::CommandStarted(
+            rollout_patch_apply_command(value, CommandExecutionStatus::InProgress)?,
+        ))),
+        "patch_apply_end" => Some(RolloutObserveEvent::Stream(
+            AppStreamEvent::CommandCompleted(rollout_patch_apply_command(
+                value,
+                rollout_patch_apply_status(value),
+            )?),
+        )),
         "exec_command_end" => Some(RolloutObserveEvent::Stream(
             AppStreamEvent::CommandCompleted(rollout_exec_command_end(value)?),
         )),
@@ -2929,15 +3001,25 @@ fn rollout_response_item_observe_event(value: &Value) -> Option<RolloutObserveEv
                 rollout_exec_command_start(value)?,
             )))
         }
+        "function_call" if value.get("name").and_then(Value::as_str) == Some("apply_patch") => {
+            Some(RolloutObserveEvent::Stream(AppStreamEvent::CommandStarted(
+                rollout_apply_patch_start(value)?,
+            )))
+        }
+        "custom_tool_call" if value.get("name").and_then(Value::as_str) == Some("apply_patch") => {
+            Some(RolloutObserveEvent::Stream(AppStreamEvent::CommandStarted(
+                rollout_apply_patch_start(value)?,
+            )))
+        }
         "function_call" if value.get("name").and_then(Value::as_str) == Some("update_plan") => {
             Some(RolloutObserveEvent::Stream(
                 AppStreamEvent::CommandCompleted(rollout_update_plan_command(value)?),
             ))
         }
-        "function_call_output" => {
+        "function_call_output" | "custom_tool_call_output" => {
             let call_id = value.get("call_id").and_then(Value::as_str)?;
             let output = value.get("output").and_then(Value::as_str)?;
-            let output = exec_command_output_body(output);
+            let output = rollout_tool_output_body(output);
             if output.trim().is_empty() {
                 None
             } else {
@@ -2951,6 +3033,180 @@ fn rollout_response_item_observe_event(value: &Value) -> Option<RolloutObserveEv
         }
         _ => None,
     }
+}
+
+fn rollout_apply_patch_start(value: &Value) -> Option<CommandExecution> {
+    let call_id = value.get("call_id").and_then(Value::as_str)?;
+    let patch = value
+        .get("input")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            value
+                .get("arguments")
+                .and_then(Value::as_str)
+                .map(apply_patch_arguments_text)
+        })
+        .unwrap_or_default();
+    Some(CommandExecution {
+        item_id: call_id.to_string(),
+        command: "apply_patch".to_string(),
+        cwd: String::new(),
+        activity: Some(CommandActivity {
+            verb: "Edited".to_string(),
+            target: patch_activity_target(&patch),
+        }),
+        status: CommandExecutionStatus::InProgress,
+        exit_code: None,
+        duration_ms: None,
+        aggregated_output: None,
+    })
+}
+
+fn rollout_patch_apply_command(
+    value: &Value,
+    status: CommandExecutionStatus,
+) -> Option<CommandExecution> {
+    let changes = value.get("changes")?;
+    let activity = patch_changes_activity(changes);
+    let output = patch_apply_output(value);
+    Some(CommandExecution {
+        item_id: value.get("call_id").and_then(Value::as_str)?.to_string(),
+        command: "apply_patch".to_string(),
+        cwd: String::new(),
+        activity: Some(activity),
+        status,
+        exit_code: None,
+        duration_ms: None,
+        aggregated_output: output,
+    })
+}
+
+fn rollout_patch_apply_status(value: &Value) -> CommandExecutionStatus {
+    match value.get("status").and_then(Value::as_str) {
+        Some("completed") => CommandExecutionStatus::Completed,
+        Some("failed") => CommandExecutionStatus::Failed,
+        Some("declined") => CommandExecutionStatus::Declined,
+        Some(other) => CommandExecutionStatus::Unknown(other.to_string()),
+        None if value.get("success").and_then(Value::as_bool) == Some(false) => {
+            CommandExecutionStatus::Failed
+        }
+        None => CommandExecutionStatus::Completed,
+    }
+}
+
+fn patch_apply_output(value: &Value) -> Option<String> {
+    let mut output = String::new();
+    if let Some(stdout) = value.get("stdout").and_then(Value::as_str) {
+        output.push_str(stdout);
+    }
+    if let Some(stderr) = value.get("stderr").and_then(Value::as_str) {
+        output.push_str(stderr);
+    }
+    (!output.trim().is_empty()).then_some(output)
+}
+
+fn apply_patch_arguments_text(arguments: &str) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(arguments) else {
+        return arguments.to_string();
+    };
+    value
+        .get("patch")
+        .or_else(|| value.get("input"))
+        .or_else(|| value.get("text"))
+        .and_then(Value::as_str)
+        .unwrap_or(arguments)
+        .to_string()
+}
+
+fn patch_changes_activity(changes: &Value) -> CommandActivity {
+    let Some(changes) = changes.as_object() else {
+        return CommandActivity {
+            verb: "Edited".to_string(),
+            target: "patch".to_string(),
+        };
+    };
+
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    let mut kinds = Vec::<&str>::new();
+    let mut details = Vec::<String>::new();
+    for (path, change) in changes {
+        let kind = change
+            .get("type")
+            .or_else(|| change.get("kind"))
+            .and_then(Value::as_str)
+            .unwrap_or("update");
+        if !kinds.contains(&kind) {
+            kinds.push(kind);
+        }
+        let (change_added, change_removed) = patch_change_line_counts(change, kind);
+        added += change_added;
+        removed += change_removed;
+        details.push(format!("{path} (+{change_added} -{change_removed})"));
+    }
+
+    let verb = if kinds.len() == 1 {
+        match kinds[0] {
+            "add" | "create" => "Added",
+            "delete" | "remove" => "Deleted",
+            _ => "Edited",
+        }
+    } else {
+        "Edited"
+    };
+    let target = if details.len() == 1 {
+        details.pop().unwrap_or_else(|| "file".to_string())
+    } else {
+        let noun = if details.len() == 1 { "file" } else { "files" };
+        let mut target = format!("{} {noun} (+{added} -{removed})", details.len());
+        for detail in details {
+            target.push('\n');
+            target.push_str(&detail);
+        }
+        target
+    };
+
+    CommandActivity {
+        verb: verb.to_string(),
+        target,
+    }
+}
+
+fn patch_change_line_counts(change: &Value, kind: &str) -> (usize, usize) {
+    if let Some(diff) = change
+        .get("unified_diff")
+        .or_else(|| change.get("diff"))
+        .and_then(Value::as_str)
+    {
+        return diff_line_counts(diff);
+    }
+    let line_count = change
+        .get("content")
+        .and_then(Value::as_str)
+        .map(|content| content.lines().count())
+        .unwrap_or(0);
+    match kind {
+        "add" | "create" => (line_count, 0),
+        "delete" | "remove" => (0, line_count),
+        _ => (0, 0),
+    }
+}
+
+fn diff_line_counts(diff: &str) -> (usize, usize) {
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    for line in diff.lines() {
+        if line.starts_with("+++") || line.starts_with("---") {
+            continue;
+        }
+        if line.starts_with('+') {
+            added += 1;
+        } else if line.starts_with('-') {
+            removed += 1;
+        }
+    }
+    (added, removed)
 }
 
 fn rollout_update_plan_command(value: &Value) -> Option<CommandExecution> {
@@ -2995,6 +3251,11 @@ fn update_plan_activity_target(arguments: &str) -> String {
                 Some("completed") => "✔",
                 _ => "□",
             };
+            let step = if marker == "✔" {
+                format!("~~{step}~~")
+            } else {
+                step.to_string()
+            };
             lines.push(format!("{marker} {step}"));
         }
     }
@@ -3003,6 +3264,62 @@ fn update_plan_activity_target(arguments: &str) -> String {
     } else {
         lines.join("\n")
     }
+}
+
+fn patch_activity_target(patch: &str) -> String {
+    #[derive(Default)]
+    struct FilePatchSummary {
+        path: String,
+        added: usize,
+        removed: usize,
+    }
+
+    let mut files = Vec::<FilePatchSummary>::new();
+    let mut current = None::<usize>;
+    for line in patch.lines() {
+        if let Some(path) = line
+            .strip_prefix("*** Update File: ")
+            .or_else(|| line.strip_prefix("*** Add File: "))
+            .or_else(|| line.strip_prefix("*** Delete File: "))
+        {
+            files.push(FilePatchSummary {
+                path: path.trim().to_string(),
+                ..Default::default()
+            });
+            current = Some(files.len() - 1);
+            continue;
+        }
+        let Some(index) = current else {
+            continue;
+        };
+        if line.starts_with("+++") || line.starts_with("---") || line.starts_with("***") {
+            continue;
+        }
+        if line.starts_with('+') {
+            files[index].added += 1;
+        } else if line.starts_with('-') {
+            files[index].removed += 1;
+        }
+    }
+
+    if files.is_empty() {
+        return "patch".to_string();
+    }
+    if files.len() == 1 {
+        let file = &files[0];
+        return format!("{} (+{} -{})", file.path, file.added, file.removed);
+    }
+    let added = files.iter().map(|file| file.added).sum::<usize>();
+    let removed = files.iter().map(|file| file.removed).sum::<usize>();
+    let mut target = format!("{} files (+{added} -{removed})", files.len());
+    for file in files {
+        target.push('\n');
+        target.push_str(&format!(
+            "{} (+{} -{})",
+            file.path, file.added, file.removed
+        ));
+    }
+    target
 }
 
 fn rollout_reasoning_delta(value: &Value) -> Option<String> {
@@ -3123,6 +3440,48 @@ fn command_activity_verb(command_type: &str) -> &'static str {
 }
 
 fn parsed_command_target(item: &Value) -> Option<String> {
+    match item.get("type").and_then(Value::as_str) {
+        Some("read") => parsed_read_target(item),
+        Some("search") => parsed_search_target(item),
+        _ => parsed_generic_command_target(item),
+    }
+}
+
+fn parsed_read_target(item: &Value) -> Option<String> {
+    let name = item
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty());
+    let path = item
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|path| !path.trim().is_empty());
+    if let Some(label) = skill_command_label(name, path) {
+        return Some(label);
+    }
+    name.map(str::to_string)
+        .or_else(|| path.and_then(command_path_label).map(str::to_string))
+        .or_else(|| parsed_command_string(item))
+}
+
+fn parsed_search_target(item: &Value) -> Option<String> {
+    let query = item
+        .get("query")
+        .and_then(Value::as_str)
+        .filter(|query| !query.trim().is_empty());
+    let path = item
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|path| !path.trim().is_empty())
+        .and_then(command_path_label);
+    match (query, path) {
+        (Some(query), Some(path)) => Some(format!("{query} in {path}")),
+        (Some(query), None) => Some(query.to_string()),
+        _ => parsed_generic_command_target(item),
+    }
+}
+
+fn parsed_generic_command_target(item: &Value) -> Option<String> {
     item.get("name")
         .and_then(Value::as_str)
         .filter(|name| !name.trim().is_empty())
@@ -3133,12 +3492,30 @@ fn parsed_command_target(item: &Value) -> Option<String> {
                 .and_then(command_path_label)
                 .map(str::to_string)
         })
-        .or_else(|| {
-            item.get("cmd")
-                .and_then(Value::as_str)
-                .filter(|cmd| !cmd.trim().is_empty())
-                .map(str::to_string)
-        })
+        .or_else(|| parsed_command_string(item))
+}
+
+fn parsed_command_string(item: &Value) -> Option<String> {
+    item.get("cmd")
+        .and_then(Value::as_str)
+        .filter(|cmd| !cmd.trim().is_empty())
+        .map(str::to_string)
+}
+
+fn skill_command_label(name: Option<&str>, path: Option<&str>) -> Option<String> {
+    let path = path?;
+    let path = Path::new(path.trim());
+    if path.file_name().and_then(|name| name.to_str()) != Some("SKILL.md") {
+        return None;
+    }
+    let skill_name = path.parent()?.file_name()?.to_str()?;
+    if skill_name.trim().is_empty() {
+        return None;
+    }
+    let label = name
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("SKILL.md");
+    Some(format!("{label} ({skill_name} skill)"))
 }
 
 fn command_path_label(path: &str) -> Option<&str> {
@@ -3225,6 +3602,15 @@ fn exec_command_output_body(output: &str) -> &str {
     output
         .split_once("\nOutput:\n")
         .map_or(output, |(_, body)| body)
+}
+
+fn rollout_tool_output_body(output: &str) -> String {
+    if let Ok(value) = serde_json::from_str::<Value>(output) {
+        if let Some(output) = value.get("output").and_then(Value::as_str) {
+            return exec_command_output_body(output).to_string();
+        }
+    }
+    exec_command_output_body(output).to_string()
 }
 
 fn rollout_event_payload(line: &str) -> Option<Value> {
@@ -3787,6 +4173,7 @@ impl Drop for TelegramTypingGuard {
 }
 
 struct TelegramWatchSink<'a> {
+    status: TelegramStatusPanel,
     thinking: TelegramThinkingPanel,
     agent: TelegramDeltaSink<'a>,
     activity: TelegramActivityPanel,
@@ -3795,11 +4182,17 @@ struct TelegramWatchSink<'a> {
 }
 
 impl<'a> TelegramWatchSink<'a> {
-    fn new_best_effort(notifier: &'a TelegramNotifier<'a>, route: TelegramRoute) -> Self {
+    fn new_best_effort(
+        notifier: &'a TelegramNotifier<'a>,
+        route: TelegramRoute,
+        activity: Option<TelegramActivityState>,
+        status: Option<TelegramStatusState>,
+    ) -> Self {
         Self {
+            status: TelegramStatusPanel::from_state(status),
             thinking: TelegramThinkingPanel::new(),
             agent: TelegramDeltaSink::new(notifier, route),
-            activity: TelegramActivityPanel::new(),
+            activity: TelegramActivityPanel::from_state(activity),
             sent_any: false,
             best_effort_delivery: true,
         }
@@ -3826,6 +4219,7 @@ impl<'a> TelegramWatchSink<'a> {
                 Ok(())
             }
             AppStreamEvent::TurnStarted => {
+                self.ensure_status_started(false)?;
                 self.thinking.start();
                 if flush_thinking_panel(
                     &mut self.thinking,
@@ -3839,6 +4233,7 @@ impl<'a> TelegramWatchSink<'a> {
                 Ok(())
             }
             AppStreamEvent::ReasoningStarted => {
+                self.ensure_status_started(false)?;
                 self.thinking.start();
                 if flush_thinking_panel(
                     &mut self.thinking,
@@ -3852,6 +4247,7 @@ impl<'a> TelegramWatchSink<'a> {
                 Ok(())
             }
             AppStreamEvent::ReasoningDelta(delta) => {
+                self.ensure_status_started(false)?;
                 self.thinking.push(&delta);
                 if flush_thinking_panel(
                     &mut self.thinking,
@@ -3865,6 +4261,7 @@ impl<'a> TelegramWatchSink<'a> {
                 Ok(())
             }
             AppStreamEvent::AgentDelta(delta) => {
+                self.ensure_status_started(false)?;
                 if self.thinking.is_active() {
                     self.thinking.finish();
                     if flush_thinking_panel(
@@ -3890,6 +4287,7 @@ impl<'a> TelegramWatchSink<'a> {
                 Ok(())
             }
             AppStreamEvent::CommandStarted(command) => {
+                self.ensure_status_started(false)?;
                 self.activity.apply_execution(command);
                 if flush_activity_panel(
                     &mut self.activity,
@@ -3902,8 +4300,22 @@ impl<'a> TelegramWatchSink<'a> {
                 }
                 Ok(())
             }
-            AppStreamEvent::CommandOutputDelta { .. } => Ok(()),
+            AppStreamEvent::CommandOutputDelta { item_id, delta } => {
+                self.ensure_status_started(false)?;
+                self.activity.apply_output_delta(&item_id, &delta);
+                if flush_activity_panel(
+                    &mut self.activity,
+                    self.agent.notifier,
+                    &self.agent.route,
+                    self.best_effort_delivery,
+                    false,
+                )? {
+                    self.sent_any = true;
+                }
+                Ok(())
+            }
             AppStreamEvent::CommandCompleted(command) => {
+                self.ensure_status_started(false)?;
                 self.activity.apply_execution(command);
                 if flush_activity_panel(
                     &mut self.activity,
@@ -3919,7 +4331,54 @@ impl<'a> TelegramWatchSink<'a> {
         }
     }
 
+    fn ensure_status_started(&mut self, force: bool) -> Result<()> {
+        self.status.start();
+        if flush_status_panel(
+            &mut self.status,
+            self.agent.notifier,
+            &self.agent.route,
+            self.best_effort_delivery,
+            force,
+        )? {
+            self.sent_any = true;
+        }
+        Ok(())
+    }
+
+    fn turn_completed(&mut self) -> Result<()> {
+        self.status.finish();
+        self.activity.finish_turn();
+        if flush_status_panel(
+            &mut self.status,
+            self.agent.notifier,
+            &self.agent.route,
+            self.best_effort_delivery,
+            true,
+        )? {
+            self.sent_any = true;
+        }
+        if flush_activity_panel(
+            &mut self.activity,
+            self.agent.notifier,
+            &self.agent.route,
+            self.best_effort_delivery,
+            true,
+        )? {
+            self.sent_any = true;
+        }
+        Ok(())
+    }
+
     fn finish(&mut self) -> Result<()> {
+        if flush_status_panel(
+            &mut self.status,
+            self.agent.notifier,
+            &self.agent.route,
+            self.best_effort_delivery,
+            false,
+        )? {
+            self.sent_any = true;
+        }
         self.thinking.finish();
         if flush_thinking_panel(
             &mut self.thinking,
@@ -3953,9 +4412,18 @@ impl<'a> TelegramWatchSink<'a> {
 
     fn sent_any(&self) -> bool {
         self.sent_any
+            || self.status.sent_any()
             || self.thinking.sent_any()
             || self.agent.sent_any()
             || self.activity.sent_any()
+    }
+
+    fn activity_state(&self) -> Option<TelegramActivityState> {
+        self.activity.to_state()
+    }
+
+    fn status_state(&self) -> Option<TelegramStatusState> {
+        self.status.to_state()
     }
 }
 
@@ -3966,7 +4434,8 @@ fn flush_thinking_panel(
     best_effort_delivery: bool,
     force: bool,
 ) -> Result<bool> {
-    match panel.flush(notifier, route, force) {
+    let delivery = TelegramTranscriptDelivery { notifier, route };
+    match panel.flush(&delivery, force) {
         Ok(sent) => Ok(sent),
         Err(err) if best_effort_delivery && is_telegram_missing_thread_error(&err) => Err(err),
         Err(err) if best_effort_delivery => {
@@ -3985,12 +4454,33 @@ fn flush_activity_panel(
     best_effort_delivery: bool,
     force: bool,
 ) -> Result<bool> {
-    match panel.flush(notifier, route, force) {
+    let delivery = TelegramTranscriptDelivery { notifier, route };
+    match panel.flush(&delivery, force) {
         Ok(sent) => Ok(sent),
         Err(err) if best_effort_delivery && is_telegram_missing_thread_error(&err) => Err(err),
         Err(err) if best_effort_delivery => {
             panel.mark_delivery_attempted();
             log_watch_delivery_failure(route, "activity", err);
+            Ok(false)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn flush_status_panel(
+    panel: &mut TelegramStatusPanel,
+    notifier: &TelegramNotifier<'_>,
+    route: &TelegramRoute,
+    best_effort_delivery: bool,
+    force: bool,
+) -> Result<bool> {
+    let delivery = TelegramTranscriptDelivery { notifier, route };
+    match panel.flush(&delivery, force) {
+        Ok(sent) => Ok(sent),
+        Err(err) if best_effort_delivery && is_telegram_missing_thread_error(&err) => Err(err),
+        Err(err) if best_effort_delivery => {
+            panel.mark_delivery_attempted();
+            log_watch_delivery_failure(route, "status", err);
             Ok(false)
         }
         Err(err) => Err(err),
@@ -4004,475 +4494,18 @@ fn log_watch_delivery_failure(route: &TelegramRoute, kind: &str, err: anyhow::Er
     );
 }
 
-struct TelegramThinkingPanel {
-    text: String,
-    message_id: Option<i64>,
-    last_flush: Instant,
-    last_sent_text: Option<String>,
-    last_sent_chars: usize,
-    sent_any: bool,
-    dirty: bool,
-    active: bool,
-    done: bool,
+struct TelegramTranscriptDelivery<'a, 'b> {
+    notifier: &'a TelegramNotifier<'b>,
+    route: &'a TelegramRoute,
 }
 
-impl TelegramThinkingPanel {
-    const MIN_EDIT_INTERVAL: Duration = Duration::from_millis(900);
-    const MIN_DELTA_CHARS: usize = 160;
-
-    fn new() -> Self {
-        Self {
-            text: String::new(),
-            message_id: None,
-            last_flush: Instant::now() - Self::MIN_EDIT_INTERVAL,
-            last_sent_text: None,
-            last_sent_chars: 0,
-            sent_any: false,
-            dirty: false,
-            active: false,
-            done: false,
-        }
+impl TelegramTranscriptTarget for TelegramTranscriptDelivery<'_, '_> {
+    fn send_one(&self, text: &str) -> Result<i64> {
+        self.notifier.send_one(self.route, text)
     }
 
-    fn start(&mut self) {
-        if self.done {
-            return;
-        }
-        self.active = true;
-        self.dirty = true;
-    }
-
-    fn push(&mut self, delta: &str) {
-        if self.done {
-            return;
-        }
-        self.active = true;
-        self.text.push_str(delta);
-        self.dirty = true;
-    }
-
-    fn finish(&mut self) {
-        if !self.active || self.done {
-            return;
-        }
-        self.active = false;
-        self.done = true;
-        self.dirty = true;
-    }
-
-    fn is_active(&self) -> bool {
-        self.active && !self.done
-    }
-
-    fn flush(
-        &mut self,
-        notifier: &TelegramNotifier<'_>,
-        route: &TelegramRoute,
-        force: bool,
-    ) -> Result<bool> {
-        if !self.dirty {
-            return Ok(false);
-        }
-        let current_chars = self.text.chars().count();
-        if !force
-            && self.message_id.is_some()
-            && self.last_flush.elapsed() < Self::MIN_EDIT_INTERVAL
-            && current_chars.saturating_sub(self.last_sent_chars) < Self::MIN_DELTA_CHARS
-        {
-            return Ok(false);
-        }
-
-        let text = thinking_watch_text(self);
-        if self.last_sent_text.as_deref() == Some(text.as_str()) {
-            self.dirty = false;
-            return Ok(false);
-        }
-
-        match self.message_id {
-            Some(message_id) => notifier.edit_one(route, message_id, &text)?,
-            None => {
-                self.message_id = Some(notifier.send_one(route, &text)?);
-            }
-        }
-        self.dirty = false;
-        self.last_flush = Instant::now();
-        self.last_sent_chars = current_chars;
-        self.last_sent_text = Some(text);
-        self.sent_any = true;
-        Ok(true)
-    }
-
-    fn mark_delivery_attempted(&mut self) {
-        self.last_flush = Instant::now();
-    }
-
-    fn sent_any(&self) -> bool {
-        self.sent_any
-    }
-}
-
-fn thinking_watch_text(panel: &TelegramThinkingPanel) -> String {
-    let title = if panel.done {
-        "Codex"
-    } else {
-        "Codex is working"
-    };
-    let body = if panel.text.trim().is_empty() {
-        "Working on this turn."
-    } else {
-        panel.text.trim()
-    };
-    truncate_chars(&format!("{title}\n{body}"), 1800)
-}
-
-fn user_watch_text(message: &str) -> String {
-    truncate_chars(&format!("You\n{}", message.trim()), 1800)
-}
-
-struct TelegramActivityPanel {
-    order: Vec<String>,
-    items: BTreeMap<String, TelegramActivityItem>,
-    message_id: Option<i64>,
-    last_flush: Instant,
-    last_sent_text: Option<String>,
-    sent_any: bool,
-    dirty: bool,
-}
-
-impl TelegramActivityPanel {
-    const MAX_ITEMS: usize = 8;
-    const MIN_EDIT_INTERVAL: Duration = Duration::from_secs(2);
-
-    fn new() -> Self {
-        Self {
-            order: Vec::new(),
-            items: BTreeMap::new(),
-            message_id: None,
-            last_flush: Instant::now() - Self::MIN_EDIT_INTERVAL,
-            last_sent_text: None,
-            sent_any: false,
-            dirty: false,
-        }
-    }
-
-    fn apply_execution(&mut self, command: CommandExecution) {
-        if !self.items.contains_key(&command.item_id) {
-            self.order.push(command.item_id.clone());
-        }
-        self.items
-            .insert(command.item_id.clone(), TelegramActivityItem::from(command));
-        while self.order.len() > Self::MAX_ITEMS {
-            if let Some(item_id) = self.order.first().cloned() {
-                self.order.remove(0);
-                self.items.remove(&item_id);
-            }
-        }
-        self.dirty = true;
-    }
-
-    fn flush(
-        &mut self,
-        notifier: &TelegramNotifier<'_>,
-        route: &TelegramRoute,
-        force: bool,
-    ) -> Result<bool> {
-        if !self.dirty {
-            return Ok(false);
-        }
-        if !force
-            && self.message_id.is_some()
-            && self.last_flush.elapsed() < Self::MIN_EDIT_INTERVAL
-        {
-            return Ok(false);
-        }
-
-        let text = activity_watch_text(self);
-        if self.last_sent_text.as_deref() == Some(text.as_str()) {
-            self.dirty = false;
-            return Ok(false);
-        }
-
-        match self.message_id {
-            Some(message_id) => notifier.edit_one(route, message_id, &text)?,
-            None => {
-                self.message_id = Some(notifier.send_one(route, &text)?);
-            }
-        }
-        self.dirty = false;
-        self.last_flush = Instant::now();
-        self.last_sent_text = Some(text);
-        self.sent_any = true;
-        Ok(true)
-    }
-
-    fn mark_delivery_attempted(&mut self) {
-        self.last_flush = Instant::now();
-    }
-
-    fn sent_any(&self) -> bool {
-        self.sent_any
-    }
-}
-
-struct TelegramActivityItem {
-    verb: String,
-    target: String,
-    command: String,
-    status: CommandExecutionStatus,
-    exit_code: Option<i64>,
-    duration_ms: Option<i64>,
-}
-
-impl From<CommandExecution> for TelegramActivityItem {
-    fn from(command: CommandExecution) -> Self {
-        let activity = command_activity(&command);
-        Self {
-            verb: activity.verb,
-            target: truncate_chars(activity.target.trim(), 300),
-            command: truncate_chars(command.command.trim(), 240),
-            status: command.status,
-            exit_code: command.exit_code,
-            duration_ms: command.duration_ms,
-        }
-    }
-}
-
-fn activity_watch_text(panel: &TelegramActivityPanel) -> String {
-    let mut lines = Vec::<String>::new();
-    for item_id in &panel.order {
-        if let Some(item) = panel.items.get(item_id) {
-            lines.extend(activity_item_lines(item));
-        }
-    }
-    truncate_chars(&lines.join("\n"), 1800)
-}
-
-fn activity_item_lines(item: &TelegramActivityItem) -> Vec<String> {
-    if item.verb == "Plan" {
-        return activity_plan_lines(item);
-    }
-    if activity_item_is_explore(item) {
-        return activity_explore_lines(item);
-    }
-    if activity_item_is_file_change(item) {
-        return activity_file_change_lines(item);
-    }
-    vec![activity_command_line(item)]
-}
-
-fn activity_plan_lines(item: &TelegramActivityItem) -> Vec<String> {
-    let mut lines = vec![String::from("• **Updated Plan**")];
-    for (index, detail) in item
-        .target
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .enumerate()
-    {
-        let prefix = if index == 0 { "  └ " } else { "    " };
-        lines.push(format!("{prefix}{}", detail.trim()));
-    }
-    lines
-}
-
-fn activity_item_is_explore(item: &TelegramActivityItem) -> bool {
-    matches!(item.verb.as_str(), "Explore" | "Read" | "List" | "Search")
-}
-
-fn activity_item_is_file_change(item: &TelegramActivityItem) -> bool {
-    matches!(item.verb.as_str(), "Added" | "Edited" | "Deleted")
-}
-
-fn activity_explore_lines(item: &TelegramActivityItem) -> Vec<String> {
-    let title = match &item.status {
-        CommandExecutionStatus::InProgress => "Exploring",
-        CommandExecutionStatus::Completed => "Explored",
-        CommandExecutionStatus::Failed => "Failed exploring",
-        CommandExecutionStatus::Declined => "Declined exploring",
-        CommandExecutionStatus::Unknown(_) => "Explored",
-    };
-    let mut lines = vec![format!("• **{title}**{}", activity_metadata(item))];
-    let detail_lines = activity_detail_lines(item);
-    for (index, detail) in detail_lines.iter().enumerate() {
-        let prefix = if index == 0 { "  └ " } else { "    " };
-        lines.push(format!("{prefix}{detail}"));
-    }
-    lines
-}
-
-fn activity_file_change_lines(item: &TelegramActivityItem) -> Vec<String> {
-    let title = match &item.status {
-        CommandExecutionStatus::InProgress => "Editing",
-        CommandExecutionStatus::Completed => item.verb.as_str(),
-        CommandExecutionStatus::Failed => "Failed editing",
-        CommandExecutionStatus::Declined => "Declined editing",
-        CommandExecutionStatus::Unknown(_) => item.verb.as_str(),
-    };
-    let mut target_lines = item.target.lines();
-    let first = target_lines.next().unwrap_or("file");
-    let mut lines = vec![format!(
-        "• **{title}** {}{}",
-        activity_code_summary(first),
-        activity_metadata(item)
-    )];
-    for (index, detail) in target_lines.enumerate() {
-        let prefix = if index == 0 { "  └ " } else { "    " };
-        lines.push(format!("{prefix}{}", activity_code_summary(detail)));
-    }
-    lines
-}
-
-fn activity_command_line(item: &TelegramActivityItem) -> String {
-    let title = match &item.status {
-        CommandExecutionStatus::InProgress => "Running",
-        CommandExecutionStatus::Completed => "Ran",
-        CommandExecutionStatus::Failed => "Failed",
-        CommandExecutionStatus::Declined => "Declined",
-        CommandExecutionStatus::Unknown(_) => "Ran",
-    };
-    let target = if item.verb == "Tool" {
-        activity_code_summary(&item.target)
-    } else if !item.command.is_empty() {
-        activity_code_summary(&item.command)
-    } else {
-        activity_code_summary(&item.target)
-    };
-    format!("• **{title}** {target}{}", activity_metadata(item))
-}
-
-fn activity_detail_lines(item: &TelegramActivityItem) -> Vec<String> {
-    if item.verb == "Explore" {
-        return item
-            .target
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(activity_markup_action_line)
-            .collect();
-    }
-    vec![format!(
-        "{} {}",
-        item.verb,
-        activity_code_targets(&item.target)
-    )]
-}
-
-fn activity_markup_action_line(line: &str) -> String {
-    let trimmed = line.trim();
-    for verb in ["Read ", "List ", "Search ", "Run "] {
-        if let Some(target) = trimmed.strip_prefix(verb) {
-            return format!("{} {}", verb.trim(), activity_code_targets(target));
-        }
-    }
-    activity_code_summary(trimmed)
-}
-
-fn activity_code_targets(target: &str) -> String {
-    target
-        .split(", ")
-        .map(activity_code_summary)
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn activity_code_summary(text: &str) -> String {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return "`unknown`".to_string();
-    }
-    if let Some((path, counts)) = split_diff_count_suffix(trimmed) {
-        return format!("`{}` {}", path, counts);
-    }
-    format!("`{trimmed}`")
-}
-
-fn split_diff_count_suffix(text: &str) -> Option<(&str, &str)> {
-    let start = text.rfind(" (+")?;
-    let suffix = &text[start + 1..];
-    if !suffix.starts_with("(+") || !suffix.ends_with(')') || !suffix.contains(" -") {
-        return None;
-    }
-    Some((text[..start].trim(), suffix))
-}
-
-fn activity_metadata(item: &TelegramActivityItem) -> String {
-    let mut metadata = Vec::new();
-    if let CommandExecutionStatus::Unknown(status) = &item.status {
-        metadata.push(status.clone());
-    }
-    if let Some(exit_code) = item.exit_code.filter(|code| *code != 0) {
-        metadata.push(format!("exit {exit_code}"));
-    }
-    if let Some(duration_ms) = item.duration_ms.filter(|duration| *duration > 0) {
-        metadata.push(format_duration_ms(duration_ms));
-    }
-    if metadata.is_empty() {
-        String::new()
-    } else {
-        format!(" ({})", metadata.join(", "))
-    }
-}
-
-fn command_activity(command: &CommandExecution) -> CommandActivity {
-    if let Some(activity) = command.activity.as_ref() {
-        return activity.clone();
-    }
-    command_activity_from_shell(command.command.trim())
-}
-
-fn command_activity_from_shell(command: &str) -> CommandActivity {
-    let trimmed = command.trim();
-    let first_word = trimmed.split_whitespace().next().unwrap_or("");
-    let verb = match first_word {
-        "cargo" if trimmed.starts_with("cargo test") => "Test",
-        "cargo" if trimmed.starts_with("cargo build") => "Build",
-        "cargo" if trimmed.starts_with("cargo clippy") => "Lint",
-        "cargo" if trimmed.starts_with("cargo fmt") => "Format",
-        "git"
-            if trimmed.starts_with("git status")
-                || trimmed.starts_with("git diff")
-                || trimmed.starts_with("git log")
-                || trimmed.starts_with("git show") =>
-        {
-            "Read"
-        }
-        "rg" | "grep" => "Search",
-        "sed" | "cat" | "tail" | "head" | "ls" | "find" | "wc" => "Read",
-        "git" if trimmed.starts_with("git add") => "Stage",
-        "git" if trimmed.starts_with("git commit") => "Commit",
-        "git" if trimmed.starts_with("git push") => "Push",
-        "mkdir" | "touch" | "cp" | "mv" | "rsync" | "install" => "Write",
-        _ => "Run",
-    };
-    CommandActivity {
-        verb: verb.to_string(),
-        target: command_activity_target(verb, trimmed),
-    }
-}
-
-fn command_activity_target(verb: &str, command: &str) -> String {
-    if verb == "Read" && command.starts_with("git ") {
-        return command
-            .split_whitespace()
-            .take(2)
-            .collect::<Vec<_>>()
-            .join(" ");
-    }
-    if verb == "Read" || verb == "Write" {
-        if let Some(path) = command
-            .split_whitespace()
-            .last()
-            .and_then(command_path_label)
-        {
-            return path.to_string();
-        }
-    }
-    command.to_string()
-}
-
-fn format_duration_ms(duration_ms: i64) -> String {
-    if duration_ms >= 1000 {
-        format!("{:.1}s", duration_ms as f64 / 1000.0)
-    } else {
-        format!("{duration_ms}ms")
+    fn edit_one(&self, message_id: i64, text: &str) -> Result<()> {
+        self.notifier.edit_one(self.route, message_id, text)
     }
 }
 
@@ -4794,12 +4827,16 @@ fn elapsed_ms(start: Instant) -> u128 {
     start.elapsed().as_millis()
 }
 
+fn unix_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
+}
+
 fn telegram_age_ms(message_date_secs: Option<i64>) -> Option<i128> {
     let message_date_secs = message_date_secs?;
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_millis() as i128;
+    let now_ms = unix_millis() as i128;
     Some(now_ms - i128::from(message_date_secs) * 1000)
 }
 
@@ -5384,38 +5421,74 @@ fn append_inline_markup_html(mut text: &str, output: &mut String) {
     while !text.is_empty() {
         let code_at = text.find('`');
         let bold_at = text.find("**");
-        let (start, token) = match (code_at, bold_at) {
-            (Some(code_at), Some(bold_at)) if code_at <= bold_at => (code_at, "`"),
-            (Some(_), Some(bold_at)) => (bold_at, "**"),
-            (Some(code_at), None) => (code_at, "`"),
-            (None, Some(bold_at)) => (bold_at, "**"),
-            (None, None) => {
+        let strike_at = text.find("~~");
+        let mut candidates = Vec::new();
+        if let Some(index) = code_at {
+            candidates.push((index, "`"));
+        }
+        if let Some(index) = bold_at {
+            candidates.push((index, "**"));
+        }
+        if let Some(index) = strike_at {
+            candidates.push((index, "~~"));
+        }
+        let Some((start, token)) = candidates.into_iter().min_by_key(|(index, _)| *index) else {
+            push_html_escaped(output, text);
+            return;
+        };
+        if start > text.len() {
+            // This branch is unreachable for valid `find` results, but keeps
+            // future token additions from indexing stale text.
+            push_html_escaped(output, text);
+            return;
+        }
+        if token.is_empty() {
+            push_html_escaped(output, text);
+            return;
+        }
+        if start == text.len() {
+            return;
+        }
+
+        push_html_escaped(output, &text[..start]);
+        match token {
+            "`" => {
+                let after_open = &text[start + 1..];
+                let Some(end) = after_open.find('`') else {
+                    push_html_escaped(output, &text[start..]);
+                    return;
+                };
+                output.push_str("<code>");
+                push_html_escaped(output, &after_open[..end]);
+                output.push_str("</code>");
+                text = &after_open[end + 1..];
+            }
+            "**" => {
+                let after_open = &text[start + 2..];
+                let Some(end) = after_open.find("**") else {
+                    push_html_escaped(output, &text[start..]);
+                    return;
+                };
+                output.push_str("<b>");
+                push_html_escaped(output, &after_open[..end]);
+                output.push_str("</b>");
+                text = &after_open[end + 2..];
+            }
+            "~~" => {
+                let after_open = &text[start + 2..];
+                let Some(end) = after_open.find("~~") else {
+                    push_html_escaped(output, &text[start..]);
+                    return;
+                };
+                output.push_str("<s>");
+                push_html_escaped(output, &after_open[..end]);
+                output.push_str("</s>");
+                text = &after_open[end + 2..];
+            }
+            _ => {
                 push_html_escaped(output, text);
                 return;
             }
-        };
-
-        push_html_escaped(output, &text[..start]);
-        if token == "`" {
-            let after_open = &text[start + 1..];
-            let Some(end) = after_open.find('`') else {
-                push_html_escaped(output, &text[start..]);
-                return;
-            };
-            output.push_str("<code>");
-            push_html_escaped(output, &after_open[..end]);
-            output.push_str("</code>");
-            text = &after_open[end + 1..];
-        } else {
-            let after_open = &text[start + 2..];
-            let Some(end) = after_open.find("**") else {
-                push_html_escaped(output, &text[start..]);
-                return;
-            };
-            output.push_str("<b>");
-            push_html_escaped(output, &after_open[..end]);
-            output.push_str("</b>");
-            text = &after_open[end + 2..];
         }
     }
 }
@@ -5680,6 +5753,8 @@ mod tests {
             topic_created_by_adapter: false,
             watch_proxy_offset: None,
             watch_rollout_offset: None,
+            watch_activity: None,
+            watch_status: None,
         });
 
         write_state(&paths, &state).unwrap();
@@ -5826,6 +5901,8 @@ mod tests {
             topic_created_by_adapter: false,
             watch_proxy_offset: None,
             watch_rollout_offset: None,
+            watch_activity: None,
+            watch_status: None,
         });
         let trusted = trusted_chats(&state, Vec::new());
 
@@ -5853,6 +5930,8 @@ mod tests {
             topic_created_by_adapter: false,
             watch_proxy_offset: None,
             watch_rollout_offset: None,
+            watch_activity: None,
+            watch_status: None,
         });
         let trusted = trusted_chats(&state, Vec::new());
         let message = text_message(-10042, Some(99), "/new build");
@@ -6790,9 +6869,9 @@ mod tests {
         let text = activity_watch_text(&panel);
 
         assert!(text.contains("• **Ran** `cargo test` (1.2s)"));
+        assert!(text.contains("  └ `ok`"));
         assert!(!text.contains("Done:"));
         assert!(!text.contains("exit: 0"));
-        assert!(!text.contains("ok"));
     }
 
     #[test]
@@ -6825,6 +6904,71 @@ mod tests {
         assert_eq!(
             activity_watch_text(&panel),
             "• **Explored**\n  └ Read `wiley.py`, `science.py`, `pnas.py`\n• **Ran** `cargo test` (1.2s)"
+        );
+    }
+
+    #[test]
+    fn activity_watch_text_merges_adjacent_explore_items_like_tui() {
+        let mut panel = TelegramActivityPanel::new();
+        for (item_id, verb, target) in [
+            ("read-skill", "Read", "SKILL.md (rust-systems-style skill)"),
+            ("read-telegram", "Read", "telegram.rs"),
+            (
+                "search-telegram",
+                "Search",
+                "paused|telegram_paused|AcquireLease in telegram.rs",
+            ),
+            ("read-client", "Read", "telegram.rs, client.rs"),
+        ] {
+            panel.apply_execution(CommandExecution {
+                item_id: item_id.to_string(),
+                command: "tool call".to_string(),
+                cwd: "/tmp/project".to_string(),
+                activity: Some(CommandActivity {
+                    verb: verb.to_string(),
+                    target: target.to_string(),
+                }),
+                status: CommandExecutionStatus::Completed,
+                exit_code: Some(0),
+                duration_ms: Some(0),
+                aggregated_output: None,
+            });
+        }
+
+        let text = activity_watch_text(&panel);
+
+        assert_eq!(text.matches("• **Explored**").count(), 1);
+        assert_eq!(
+            text,
+            "• **Explored**\n  └ Read `SKILL.md` (rust-systems-style skill), `telegram.rs`\n    Search `paused|telegram_paused|AcquireLease` in `telegram.rs`\n    Read `telegram.rs`, `client.rs`"
+        );
+    }
+
+    #[test]
+    fn activity_panel_state_preserves_edit_target_across_drains() {
+        let mut panel = TelegramActivityPanel::new();
+        panel.apply_execution(CommandExecution {
+            item_id: "read-1".to_string(),
+            command: "sed -n '1,80p' telegram.rs".to_string(),
+            cwd: "/tmp/project".to_string(),
+            activity: Some(CommandActivity {
+                verb: "Read".to_string(),
+                target: "telegram.rs".to_string(),
+            }),
+            status: CommandExecutionStatus::Completed,
+            exit_code: Some(0),
+            duration_ms: Some(0),
+            aggregated_output: None,
+        });
+        panel.message_id = Some(42);
+        panel.last_sent_text = Some(activity_watch_text(&panel));
+
+        let restored = TelegramActivityPanel::from_state(panel.to_state());
+
+        assert_eq!(restored.message_id, Some(42));
+        assert_eq!(
+            activity_watch_text(&restored),
+            "• **Explored**\n  └ Read `telegram.rs`"
         );
     }
 
@@ -6866,7 +7010,7 @@ mod tests {
                     cwd: String::new(),
                     activity: Some(CommandActivity {
                         verb: "Plan".to_string(),
-                        target: "Converging on the TUI transcript model.\n✔ Mirror activity cells\n□ Ship release".to_string(),
+                        target: "Converging on the TUI transcript model.\n✔ ~~Mirror activity cells~~\n□ Ship release".to_string(),
                     }),
                     status: CommandExecutionStatus::Completed,
                     exit_code: None,
@@ -7007,6 +7151,76 @@ mod tests {
     }
 
     #[test]
+    fn rollout_observe_event_reads_custom_apply_patch_as_file_change() {
+        let started = rollout_observe_event(
+            r#"{"type":"response_item","payload":{"type":"custom_tool_call","status":"completed","call_id":"patch-1","name":"apply_patch","input":"*** Begin Patch\n*** Update File: src/channel/telegram.rs\n@@\n-old\n+new\n+another\n*** End Patch"}}"#,
+        );
+
+        assert_eq!(
+            started,
+            Some(RolloutObserveEvent::Stream(AppStreamEvent::CommandStarted(
+                CommandExecution {
+                    item_id: "patch-1".to_string(),
+                    command: "apply_patch".to_string(),
+                    cwd: String::new(),
+                    activity: Some(CommandActivity {
+                        verb: "Edited".to_string(),
+                        target: "src/channel/telegram.rs (+2 -1)".to_string(),
+                    }),
+                    status: CommandExecutionStatus::InProgress,
+                    exit_code: None,
+                    duration_ms: None,
+                    aggregated_output: None,
+                }
+            )))
+        );
+
+        let output = rollout_observe_event(
+            r#"{"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"patch-1","output":"{\"output\":\"Success. Updated the following files:\\nM src/channel/telegram.rs\\n\",\"metadata\":{\"exit_code\":0}}"}}"#,
+        );
+
+        assert_eq!(
+            output,
+            Some(RolloutObserveEvent::Stream(
+                AppStreamEvent::CommandOutputDelta {
+                    item_id: "patch-1".to_string(),
+                    delta: "Success. Updated the following files:\nM src/channel/telegram.rs\n"
+                        .to_string(),
+                }
+            ))
+        );
+    }
+
+    #[test]
+    fn rollout_observe_event_reads_patch_apply_end_as_file_change() {
+        let completed = rollout_observe_event(
+            r#"{"type":"event_msg","payload":{"type":"patch_apply_end","call_id":"patch-1","turn_id":"turn-1","stdout":"Success. Updated the following files:\nM src/channel/telegram.rs\n","stderr":"","success":true,"changes":{"src/channel/telegram.rs":{"type":"update","unified_diff":"@@\n-old\n+new\n+another\n","move_path":null}},"status":"completed"}}"#,
+        );
+
+        assert_eq!(
+            completed,
+            Some(RolloutObserveEvent::Stream(
+                AppStreamEvent::CommandCompleted(CommandExecution {
+                    item_id: "patch-1".to_string(),
+                    command: "apply_patch".to_string(),
+                    cwd: String::new(),
+                    activity: Some(CommandActivity {
+                        verb: "Edited".to_string(),
+                        target: "src/channel/telegram.rs (+2 -1)".to_string(),
+                    }),
+                    status: CommandExecutionStatus::Completed,
+                    exit_code: None,
+                    duration_ms: None,
+                    aggregated_output: Some(
+                        "Success. Updated the following files:\nM src/channel/telegram.rs\n"
+                            .to_string()
+                    ),
+                })
+            ))
+        );
+    }
+
+    #[test]
     fn rollout_command_activity_summarizes_multiple_parsed_commands() {
         let completed = rollout_observe_event(
             r#"{"type":"event_msg","payload":{"type":"exec_command_end","call_id":"call-1","turn_id":"turn-1","command":["/bin/zsh","-lc","sed -n '1,80p' wiley.py && sed -n '1,60p' science.py && sed -n '1,60p' pnas.py"],"cwd":"/tmp","parsed_cmd":[{"type":"read","cmd":"sed -n '1,80p' wiley.py","name":"wiley.py","path":"/tmp/wiley.py"},{"type":"read","cmd":"sed -n '1,60p' science.py","name":"science.py","path":"/tmp/science.py"},{"type":"read","cmd":"sed -n '1,60p' pnas.py","name":"pnas.py","path":"/tmp/pnas.py"}],"exit_code":0,"duration":{"secs":0,"nanos":0},"status":"completed"}}"#,
@@ -7022,6 +7236,62 @@ mod tests {
                     activity: Some(CommandActivity {
                         verb: "Read".to_string(),
                         target: "wiley.py, science.py, pnas.py".to_string(),
+                    }),
+                    status: CommandExecutionStatus::Completed,
+                    exit_code: Some(0),
+                    duration_ms: Some(0),
+                    aggregated_output: None,
+                })
+            ))
+        );
+    }
+
+    #[test]
+    fn rollout_command_activity_preserves_search_query() {
+        let completed = rollout_observe_event(
+            r#"{"type":"event_msg","payload":{"type":"exec_command_end","call_id":"call-search","turn_id":"turn-1","command":["/bin/zsh","-lc","rg -n \"paused|telegram_paused|AcquireLease\" src/channel/telegram.rs"],"cwd":"/tmp","parsed_cmd":[{"type":"search","cmd":"rg -n \"paused|telegram_paused|AcquireLease\" src/channel/telegram.rs","query":"paused|telegram_paused|AcquireLease","path":"src/channel/telegram.rs"}],"exit_code":0,"duration":{"secs":0,"nanos":0},"status":"completed"}}"#,
+        );
+
+        assert_eq!(
+            completed,
+            Some(RolloutObserveEvent::Stream(
+                AppStreamEvent::CommandCompleted(CommandExecution {
+                    item_id: "call-search".to_string(),
+                    command:
+                        "rg -n \"paused|telegram_paused|AcquireLease\" src/channel/telegram.rs"
+                            .to_string(),
+                    cwd: "/tmp".to_string(),
+                    activity: Some(CommandActivity {
+                        verb: "Search".to_string(),
+                        target: "paused|telegram_paused|AcquireLease in telegram.rs".to_string(),
+                    }),
+                    status: CommandExecutionStatus::Completed,
+                    exit_code: Some(0),
+                    duration_ms: Some(0),
+                    aggregated_output: None,
+                })
+            ))
+        );
+    }
+
+    #[test]
+    fn rollout_command_activity_preserves_skill_read_label() {
+        let completed = rollout_observe_event(
+            r#"{"type":"event_msg","payload":{"type":"exec_command_end","call_id":"call-skill","turn_id":"turn-1","command":["/bin/zsh","-lc","sed -n '1,80p' /Users/yupeit/dev/skills/skills/rust-systems-style/SKILL.md"],"cwd":"/tmp","parsed_cmd":[{"type":"read","cmd":"sed -n '1,80p' /Users/yupeit/dev/skills/skills/rust-systems-style/SKILL.md","name":"SKILL.md","path":"/Users/yupeit/dev/skills/skills/rust-systems-style/SKILL.md"}],"exit_code":0,"duration":{"secs":0,"nanos":0},"status":"completed"}}"#,
+        );
+
+        assert_eq!(
+            completed,
+            Some(RolloutObserveEvent::Stream(
+                AppStreamEvent::CommandCompleted(CommandExecution {
+                    item_id: "call-skill".to_string(),
+                    command:
+                        "sed -n '1,80p' /Users/yupeit/dev/skills/skills/rust-systems-style/SKILL.md"
+                            .to_string(),
+                    cwd: "/tmp".to_string(),
+                    activity: Some(CommandActivity {
+                        verb: "Read".to_string(),
+                        target: "SKILL.md (rust-systems-style skill)".to_string(),
                     }),
                     status: CommandExecutionStatus::Completed,
                     exit_code: Some(0),

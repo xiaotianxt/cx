@@ -4,6 +4,7 @@ use anyhow::Context;
 use anyhow::Result;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use serde::Deserialize;
 use serde::Serialize;
 use serde_json::json;
 use serde_json::Value;
@@ -94,7 +95,8 @@ pub(crate) struct CommandActivity {
     pub target: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) enum CommandExecutionStatus {
     InProgress,
     Completed,
@@ -916,12 +918,7 @@ fn command_activity_from_actions(actions: Option<&Value>) -> Option<CommandActiv
         };
         match action_verb {
             "Read" => {
-                let target = action
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .or_else(|| action.get("path").and_then(Value::as_str))
-                    .unwrap_or("file")
-                    .to_string();
+                let target = command_action_read_label(action);
                 if !read_targets.iter().any(|existing| existing == &target) {
                     read_targets.push(target);
                 }
@@ -939,15 +936,17 @@ fn command_activity_from_actions(actions: Option<&Value>) -> Option<CommandActiv
                     action.get("query").and_then(Value::as_str),
                     action.get("path").and_then(Value::as_str),
                 ) {
-                    (Some(query), Some(path)) => format!("Search {query} in {path}"),
-                    (Some(query), None) => format!("Search {query}"),
+                    (Some(query), Some(path)) => {
+                        format!("{query} in {}", command_action_path_label(path))
+                    }
+                    (Some(query), None) => query.to_string(),
                     _ => action
                         .get("command")
                         .and_then(Value::as_str)
-                        .map(|command| format!("Search {command}"))
-                        .unwrap_or_else(|| "Search".to_string()),
+                        .map(str::to_string)
+                        .unwrap_or_else(|| "search".to_string()),
                 };
-                lines.push(target);
+                lines.push(format!("Search {target}"));
             }
             _ => {}
         }
@@ -970,11 +969,60 @@ fn command_activity_from_actions(actions: Option<&Value>) -> Option<CommandActiv
             target: lines.join("\n"),
         })
     } else {
+        let prefix = format!("{verb} ");
+        let target = lines
+            .iter()
+            .map(|line| line.strip_prefix(prefix.as_str()).unwrap_or(line.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n");
         Some(CommandActivity {
             verb: verb.to_string(),
-            target: lines.join("\n"),
+            target,
         })
     }
+}
+
+fn command_action_read_label(action: &Value) -> String {
+    let name = action
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.trim().is_empty());
+    let path = action
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|path| !path.trim().is_empty());
+    if let Some(label) = skill_read_label(name, path) {
+        return label;
+    }
+    name.or(path).unwrap_or("file").to_string()
+}
+
+fn command_action_path_label(path: &str) -> &str {
+    let path = path.trim();
+    if path.is_empty() {
+        return path;
+    }
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(path)
+}
+
+fn skill_read_label(name: Option<&str>, path: Option<&str>) -> Option<String> {
+    let path = path?;
+    let path = std::path::Path::new(path.trim());
+    if path.file_name().and_then(|name| name.to_str()) != Some("SKILL.md") {
+        return None;
+    }
+    let skill_name = path.parent()?.file_name()?.to_str()?;
+    if skill_name.trim().is_empty() {
+        return None;
+    }
+    let label = name
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("SKILL.md");
+    Some(format!("{label} ({skill_name} skill)"))
 }
 
 fn diff_line_counts(diff: &str) -> (usize, usize) {
@@ -1193,6 +1241,51 @@ mod tests {
             Some(CommandActivity {
                 verb: "Read".to_string(),
                 target: "wiley.py, science.py".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn notification_command_execution_preserves_search_and_skill_actions() {
+        let params = Some(json!({
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "item": {
+                "type": "commandExecution",
+                "id": "cmd-1",
+                "command": "rg -n paused src/channel/telegram.rs",
+                "cwd": "/tmp/project",
+                "processId": null,
+                "source": "agent",
+                "status": "completed",
+                "commandActions": [
+                    {
+                        "type": "search",
+                        "command": "rg -n paused src/channel/telegram.rs",
+                        "query": "paused|telegram_paused|AcquireLease",
+                        "path": "src/channel/telegram.rs"
+                    },
+                    {
+                        "type": "read",
+                        "command": "sed -n '1,80p' /Users/yupeit/dev/skills/skills/rust-systems-style/SKILL.md",
+                        "name": "SKILL.md",
+                        "path": "/Users/yupeit/dev/skills/skills/rust-systems-style/SKILL.md"
+                    }
+                ],
+                "aggregatedOutput": null,
+                "exitCode": 0,
+                "durationMs": 12
+            },
+            "completedAtMs": 10
+        }));
+
+        let event = notification_command_execution(&params, "thread-1", Some("turn-1")).unwrap();
+
+        assert_eq!(
+            event.activity,
+            Some(CommandActivity {
+                verb: "Explore".to_string(),
+                target: "Search paused|telegram_paused|AcquireLease in telegram.rs\nRead SKILL.md (rust-systems-style skill)".to_string(),
             })
         );
     }

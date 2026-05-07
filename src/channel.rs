@@ -17,6 +17,8 @@ pub mod telegram {
     use std::thread;
     use std::time::Duration;
     use std::time::Instant;
+    use std::time::SystemTime;
+    use std::time::UNIX_EPOCH;
 
     use anyhow::Context;
     use anyhow::Result;
@@ -136,6 +138,7 @@ pub mod telegram {
     struct TelegramMessage {
         chat: TelegramChat,
         message_id: i64,
+        date: Option<i64>,
         message_thread_id: Option<i64>,
         text: Option<String>,
         forum_topic_edited: Option<TelegramForumTopicEdited>,
@@ -666,13 +669,18 @@ pub mod telegram {
         } else {
             options.poll_timeout
         };
-        let updates = get_updates(
-            client,
-            token,
-            state.last_update_id.map(|id| id + 1),
-            poll_timeout,
-        )?;
+        let offset = state.last_update_id.map(|id| id + 1);
+        let poll_start = Instant::now();
+        let updates = get_updates(client, token, offset, poll_timeout)?;
+        if options.log_updates {
+            eprintln!(
+                "telegram timing phase=poll offset={offset:?} timeout_s={poll_timeout} updates={} elapsed_ms={}",
+                updates.len(),
+                elapsed_ms(poll_start)
+            );
+        }
         for update in updates {
+            let update_start = Instant::now();
             state.last_update_id = Some(
                 state
                     .last_update_id
@@ -701,13 +709,32 @@ pub mod telegram {
                 trusted.insert(route.clone());
                 bound_route = Some(route);
             }
+            if options.log_updates {
+                let route = TelegramRoute::from_message(&message);
+                eprintln!(
+                    "telegram timing update_id={update_id} phase=received source={} route={} message_id={} telegram_age_ms={} elapsed_ms={}",
+                    view.source.as_str(),
+                    route.display(),
+                    message.message_id,
+                    telegram_age_ms(message.date).map_or_else(|| String::from("<unknown>"), |age| age.to_string()),
+                    elapsed_ms(update_start)
+                );
+            }
             let callback_message_id = view.callback_query_id.as_ref().map(|_| message.message_id);
             let notifier = TelegramNotifier { client, token };
+            let ack_start = Instant::now();
             if let Some(callback_query_id) = view.callback_query_id.as_deref() {
                 notifier.answer_callback_query(callback_query_id, None);
             } else {
                 notifier.ack_seen(&message);
             }
+            if options.log_updates {
+                eprintln!(
+                    "telegram timing update_id={update_id} phase=ack_seen elapsed_ms={}",
+                    elapsed_ms(ack_start)
+                );
+            }
+            let handle_start = Instant::now();
             let reply = handle_message(
                 paths,
                 state,
@@ -718,15 +745,31 @@ pub mod telegram {
                     steal: options.steal,
                     authorized_by_bind: matches!(access, MessageAccess::AuthorizedByBind),
                     app_server_timeout: options.app_server_timeout,
+                    trace_timings: options.log_updates,
                     callback_data: view.callback_data.as_deref(),
                     callback_message_id,
                 },
             )?;
+            if options.log_updates {
+                eprintln!(
+                    "telegram timing update_id={update_id} phase=handle_message reply={} elapsed_ms={}",
+                    reply.is_some(),
+                    elapsed_ms(handle_start)
+                );
+            }
             write_state(paths, state)?;
             if let Some(reply) = reply {
                 let route = reply.route();
+                let deliver_start = Instant::now();
                 match deliver_reply(client, token, &reply) {
                     Ok(panel_message_id) => {
+                        if options.log_updates {
+                            eprintln!(
+                                "telegram timing update_id={update_id} phase=deliver_reply route={} message_id={panel_message_id:?} elapsed_ms={}",
+                                route.display(),
+                                elapsed_ms(deliver_start)
+                            );
+                        }
                         if reply.remember_panel_message {
                             if let Some(message_id) = panel_message_id {
                                 state.remember_panel_message(&route, message_id);
@@ -735,6 +778,13 @@ pub mod telegram {
                         }
                     }
                     Err(err) => {
+                        if options.log_updates {
+                            eprintln!(
+                                "telegram timing update_id={update_id} phase=deliver_reply route={} error=true elapsed_ms={}",
+                                route.display(),
+                                elapsed_ms(deliver_start)
+                            );
+                        }
                         eprintln!(
                             "telegram reply delivery failed for {}: {err:#}",
                             route.display()
@@ -742,9 +792,22 @@ pub mod telegram {
                     }
                 }
             }
+            if options.log_updates {
+                eprintln!(
+                    "telegram timing update_id={update_id} phase=update_complete elapsed_ms={}",
+                    elapsed_ms(update_start)
+                );
+            }
         }
         if options.app_server_timeout > 0.0 {
+            let observe_start = Instant::now();
             observe_watched_bindings(paths, client, token, state, options.app_server_timeout)?;
+            if options.log_updates && has_watched_bindings(state) {
+                eprintln!(
+                    "telegram timing phase=observe_watches elapsed_ms={}",
+                    elapsed_ms(observe_start)
+                );
+            }
         }
         write_state(paths, state)?;
         Ok(PollOutcome { bound_route })
@@ -1399,8 +1462,11 @@ pub mod telegram {
                     &route,
                     binding.alias.as_deref(),
                     text,
-                    options.app_server_timeout,
-                    options.notifier,
+                    CodexTurnOptions {
+                        timeout_secs: options.app_server_timeout,
+                        notifier: options.notifier,
+                        trace_timings: options.trace_timings,
+                    },
                 ) {
                     Ok(turn) if turn.assistant_text.trim().is_empty() => {
                         Ok(Some(reply(&route, "Codex completed without a text reply.")))
@@ -2251,8 +2317,15 @@ pub mod telegram {
         steal: bool,
         authorized_by_bind: bool,
         app_server_timeout: f32,
+        trace_timings: bool,
         callback_data: Option<&'a str>,
         callback_message_id: Option<i64>,
+    }
+
+    struct CodexTurnOptions<'a, 'b> {
+        timeout_secs: f32,
+        notifier: Option<&'a TelegramNotifier<'b>>,
+        trace_timings: bool,
     }
 
     fn run_codex_turn(
@@ -2261,13 +2334,32 @@ pub mod telegram {
         route: &TelegramRoute,
         alias: Option<&str>,
         prompt: String,
-        timeout_secs: f32,
-        notifier: Option<&TelegramNotifier<'_>>,
+        options: CodexTurnOptions<'_, '_>,
     ) -> Result<CodexTurnOutput> {
+        let timeout_secs = options.timeout_secs;
+        let notifier = options.notifier;
+        let trace_timings = options.trace_timings;
+        let route_log = route.display();
+        let ready_start = Instant::now();
         let server = serve::ready_app_server(paths)?;
+        if trace_timings {
+            eprintln!(
+                "telegram timing route={} phase=app_server_ready elapsed_ms={}",
+                route_log,
+                elapsed_ms(ready_start)
+            );
+        }
+        let connect_start = Instant::now();
         let mut client =
             AppServerClient::connect(&server.listen_url, Duration::from_secs_f32(timeout_secs))?;
         client.initialize("cx-telegram", env!("CARGO_PKG_VERSION"))?;
+        if trace_timings {
+            eprintln!(
+                "telegram timing route={} phase=app_server_connect elapsed_ms={}",
+                route_log,
+                elapsed_ms(connect_start)
+            );
+        }
 
         let binding_snapshot = state
             .binding_for_route(route, alias)
@@ -2275,28 +2367,57 @@ pub mod telegram {
             .with_context(|| format!("Telegram route {} is not bound", route.display()))?;
         let thread_id = match binding_snapshot.app_thread_id.clone() {
             Some(thread_id) => {
+                let resume_start = Instant::now();
                 if let Err(err) =
                     client.thread_resume(&thread_id, binding_snapshot.app_thread_cwd.as_deref())
                 {
                     eprintln!("app-server thread/resume before Telegram turn failed: {err:#}");
                 }
+                if trace_timings {
+                    eprintln!(
+                        "telegram timing route={} thread_id={} phase=thread_resume elapsed_ms={}",
+                        route_log,
+                        thread_id,
+                        elapsed_ms(resume_start)
+                    );
+                }
                 thread_id
             }
             None => {
+                let start_thread_start = Instant::now();
                 let thread = client.thread_start(binding_snapshot.app_thread_cwd.as_deref())?;
                 let binding = state
                     .binding_for_route_mut(route, alias)
                     .with_context(|| format!("Telegram route {} is not bound", route.display()))?;
                 binding.app_thread_id = Some(thread.upstream_thread_id.clone());
+                if trace_timings {
+                    eprintln!(
+                        "telegram timing route={} thread_id={} phase=thread_start elapsed_ms={}",
+                        route_log,
+                        thread.upstream_thread_id,
+                        elapsed_ms(start_thread_start)
+                    );
+                }
                 thread.upstream_thread_id
             }
         };
         let mut sink =
             notifier.map(|notifier| TelegramWatchSink::new_best_effort(notifier, route.clone()));
+        let turn_start = Instant::now();
+        let mut first_event_seen = false;
         let turn = client.turn_start_stream(
             &thread_id,
             prompt,
             |event| {
+                if trace_timings && !first_event_seen {
+                    first_event_seen = true;
+                    eprintln!(
+                        "telegram timing route={} thread_id={} phase=turn_first_event elapsed_ms={}",
+                        route_log,
+                        thread_id,
+                        elapsed_ms(turn_start)
+                    );
+                }
                 if let Some(sink) = sink.as_mut() {
                     sink.push_event(event)?;
                 }
@@ -2309,8 +2430,27 @@ pub mod telegram {
                 handle_app_server_approval(paths, state, notifier, route, approval, timeout_secs)
             },
         )?;
+        if trace_timings {
+            eprintln!(
+                "telegram timing route={} thread_id={} phase=turn_complete first_event={} elapsed_ms={}",
+                route_log,
+                thread_id,
+                first_event_seen,
+                elapsed_ms(turn_start)
+            );
+        }
         if let Some(sink) = sink.as_mut() {
+            let finish_start = Instant::now();
             sink.finish()?;
+            if trace_timings {
+                eprintln!(
+                    "telegram timing route={} thread_id={} phase=telegram_sink_finish sent_any={} elapsed_ms={}",
+                    route_log,
+                    thread_id,
+                    sink.sent_any,
+                    elapsed_ms(finish_start)
+                );
+            }
         }
         Ok(CodexTurnOutput {
             assistant_text: turn.assistant_text,
@@ -4448,6 +4588,19 @@ pub mod telegram {
         );
     }
 
+    fn elapsed_ms(start: Instant) -> u128 {
+        start.elapsed().as_millis()
+    }
+
+    fn telegram_age_ms(message_date_secs: Option<i64>) -> Option<i128> {
+        let message_date_secs = message_date_secs?;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_millis() as i128;
+        Some(now_ms - i128::from(message_date_secs) * 1000)
+    }
+
     fn get_updates(
         client: &Client,
         token: &str,
@@ -5272,6 +5425,7 @@ pub mod telegram {
                     is_forum: false,
                 },
                 message_id: 1,
+                date: None,
                 message_thread_id,
                 text: Some(text.to_string()),
                 forum_topic_edited: None,
@@ -5285,6 +5439,7 @@ pub mod telegram {
                 steal: false,
                 authorized_by_bind: false,
                 app_server_timeout: 600.0,
+                trace_timings: false,
                 callback_data: None,
                 callback_message_id: None,
             }
@@ -5567,6 +5722,7 @@ pub mod telegram {
                         is_forum: false,
                     },
                     message_id: 1,
+                    date: None,
                     message_thread_id: Some(7),
                     text: Some(String::from("/start")),
                     forum_topic_edited: None,
@@ -5638,6 +5794,7 @@ pub mod telegram {
                     is_forum: true,
                 },
                 message_id: 1,
+                date: None,
                 message_thread_id: None,
                 text: Some("/new Build!".to_string()),
                 forum_topic_edited: None,
@@ -5668,6 +5825,7 @@ pub mod telegram {
                     is_forum: true,
                 },
                 message_id: 1,
+                date: None,
                 message_thread_id: Some(99),
                 text: Some("/new config".to_string()),
                 forum_topic_edited: None,
@@ -5706,6 +5864,7 @@ pub mod telegram {
                         is_forum: true,
                     },
                     message_id: 1,
+                    date: None,
                     message_thread_id: Some(99),
                     text: Some("/close smoke".to_string()),
                     forum_topic_edited: None,
@@ -5740,6 +5899,7 @@ pub mod telegram {
                         is_forum: true,
                     },
                     message_id: 1,
+                    date: None,
                     message_thread_id: Some(99),
                     text: Some("/close".to_string()),
                     forum_topic_edited: None,
@@ -5774,6 +5934,7 @@ pub mod telegram {
                         is_forum: true,
                     },
                     message_id: 1,
+                    date: None,
                     message_thread_id: Some(31),
                     text: Some("/close".to_string()),
                     forum_topic_edited: None,
@@ -5812,6 +5973,7 @@ pub mod telegram {
                         is_forum: true,
                     },
                     message_id: 1,
+                    date: None,
                     message_thread_id: Some(31),
                     text: Some("/close".to_string()),
                     forum_topic_edited: None,
@@ -6875,6 +7037,7 @@ pub mod telegram {
                     is_forum: true,
                 },
                 message_id: 1,
+                date: None,
                 message_thread_id: None,
                 text: Some("show me threads".to_string()),
                 forum_topic_edited: None,
@@ -6914,6 +7077,7 @@ pub mod telegram {
                         is_forum: true,
                     },
                     message_id: 1,
+                    date: None,
                     message_thread_id: Some(99),
                     text: None,
                     forum_topic_edited: Some(TelegramForumTopicEdited {

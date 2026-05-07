@@ -129,12 +129,6 @@ pub(super) struct ThreadResumeResponse {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct ThreadArchiveParams {
-    pub thread_id: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub(super) struct ThreadReadParams {
     pub thread_id: String,
     pub include_turns: bool,

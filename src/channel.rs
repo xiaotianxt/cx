@@ -1818,7 +1818,7 @@ pub mod telegram {
     }
 
     fn close_bound_route(
-        paths: &ManagerPaths,
+        _paths: &ManagerPaths,
         state: &mut TelegramState,
         route: &TelegramRoute,
         alias: Option<&str>,
@@ -1838,11 +1838,6 @@ pub mod telegram {
             let mut close_errors = Vec::new();
             if let Some(notifier) = options.notifier {
                 if let Err(err) =
-                    archive_route_app_threads(paths, state, route, options.app_server_timeout)
-                {
-                    close_errors.push(format!("Failed to archive Codex threads: {err:#}"));
-                }
-                if let Err(err) =
                     delete_forum_topic(notifier.client, notifier.token, binding.chat_id, thread_id)
                 {
                     close_errors.push(format!("Failed to delete Telegram topic: {err:#}"));
@@ -1860,18 +1855,8 @@ pub mod telegram {
                 )));
             }
         }
-        let archive_error =
-            archive_bound_app_thread(paths, &binding, options.app_server_timeout).err();
         if state.remove_route_binding(route, alias.as_deref()) {
-            let text = match archive_error {
-                Some(err) => {
-                    format!(
-                        "Unbound session `{label}` locally, but failed to archive Codex thread.\n{err:#}"
-                    )
-                }
-                None => format!("Unbound session `{label}`."),
-            };
-            Ok(Some(reply(route, text)))
+            Ok(Some(reply(route, format!("Unbound session `{label}`."))))
         } else {
             Ok(Some(reply(
                 route,
@@ -1918,43 +1903,6 @@ pub mod telegram {
         };
         let mut client = connect_app_server(paths, timeout_secs)?;
         client.interrupt_active_turn(thread_id)
-    }
-
-    fn archive_bound_app_thread(
-        paths: &ManagerPaths,
-        binding: &TelegramBinding,
-        timeout_secs: f32,
-    ) -> Result<()> {
-        let Some(thread_id) = binding.app_thread_id.as_deref() else {
-            return Ok(());
-        };
-        let mut client = connect_app_server(paths, timeout_secs)?;
-        client.thread_archive(thread_id)
-    }
-
-    fn archive_route_app_threads(
-        paths: &ManagerPaths,
-        state: &TelegramState,
-        route: &TelegramRoute,
-        timeout_secs: f32,
-    ) -> Result<()> {
-        let thread_ids = state
-            .bindings
-            .iter()
-            .filter(|binding| {
-                binding.chat_id == route.chat_id
-                    && binding.message_thread_id == route.message_thread_id
-            })
-            .filter_map(|binding| binding.app_thread_id.clone())
-            .collect::<BTreeSet<_>>();
-        if thread_ids.is_empty() {
-            return Ok(());
-        }
-        let mut client = connect_app_server(paths, timeout_secs)?;
-        for thread_id in thread_ids {
-            client.thread_archive(&thread_id)?;
-        }
-        Ok(())
     }
 
     fn connect_app_server(paths: &ManagerPaths, timeout_secs: f32) -> Result<AppServerClient> {
@@ -2060,6 +2008,9 @@ pub mod telegram {
         let mut seen = BTreeSet::<String>::new();
         let mut merged = Vec::new();
         for entry in preferred.into_iter().chain(fallback) {
+            if is_local_watch_regression_entry(&entry) {
+                continue;
+            }
             if seen.insert(entry.thread_id.clone()) {
                 merged.push(entry);
             }
@@ -2068,6 +2019,21 @@ pub mod telegram {
             }
         }
         merged
+    }
+
+    fn is_local_watch_regression_entry(entry: &AppThreadPortalEntry) -> bool {
+        const MARKERS: [&str; 3] = [
+            "For Telegram watch E2E marker",
+            "Telegram watch regression",
+            "For a local watch integration test",
+        ];
+        MARKERS.iter().any(|marker| {
+            entry
+                .title
+                .as_deref()
+                .is_some_and(|title| title.contains(marker))
+                || entry.preview.contains(marker)
+        })
     }
 
     fn portal_text(entries: &[AppThreadPortalEntry]) -> String {
@@ -5824,8 +5790,8 @@ pub mod telegram {
         }
 
         #[test]
-        fn close_unbinds_local_route_when_archive_fails() {
-            let paths = temp_paths("close-archive-fails");
+        fn close_unbinds_local_route_without_archiving_app_thread() {
+            let paths = temp_paths("close-preserve-app-thread");
             let mut state = TelegramState::empty();
             let route = TelegramRoute {
                 chat_id: -10042,
@@ -5855,8 +5821,7 @@ pub mod telegram {
             .unwrap()
             .unwrap();
 
-            assert!(reply.text.starts_with("Unbound session `default` locally"));
-            assert!(reply.text.contains("failed to archive Codex thread"));
+            assert_eq!(reply.text, "Unbound session `default`.");
             assert!(state.binding_for_route(&route, None).is_none());
 
             let _ = fs::remove_dir_all(paths.serve_dir());
@@ -6038,6 +6003,35 @@ pub mod telegram {
             assert_eq!(merged[0].thread_id, "thread-open");
             assert_eq!(merged[0].status, "open-tui");
             assert_eq!(merged[1].thread_id, "thread-old");
+        }
+
+        #[test]
+        fn merge_portal_entries_filters_local_watch_regression_threads() {
+            let preferred = vec![
+                AppThreadPortalEntry {
+                    thread_id: "thread-test".to_string(),
+                    title: Some("For Telegram watch E2E marker CXE2E".to_string()),
+                    preview: String::new(),
+                    cwd: "/Users/yupeit/dev/cx".to_string(),
+                    active: false,
+                    watchable: true,
+                    status: "open-tui".to_string(),
+                },
+                AppThreadPortalEntry {
+                    thread_id: "thread-real".to_string(),
+                    title: Some("Fix Telegram close semantics".to_string()),
+                    preview: String::new(),
+                    cwd: "/Users/yupeit/dev/cx".to_string(),
+                    active: true,
+                    watchable: true,
+                    status: "active".to_string(),
+                },
+            ];
+
+            let merged = merge_portal_entries(preferred, Vec::new(), 10);
+
+            assert_eq!(merged.len(), 1);
+            assert_eq!(merged[0].thread_id, "thread-real");
         }
 
         #[test]

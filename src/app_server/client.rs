@@ -232,16 +232,6 @@ impl AppServerClient {
         Ok(())
     }
 
-    pub(crate) fn thread_archive(&mut self, thread_id: &str) -> Result<()> {
-        let _response = self.request(
-            "thread/archive",
-            protocol::ThreadArchiveParams {
-                thread_id: thread_id.to_string(),
-            },
-        )?;
-        Ok(())
-    }
-
     pub(crate) fn interrupt_active_turn(&mut self, thread_id: &str) -> Result<InterruptOutcome> {
         let Some(turn_id) = self.active_turn_id(thread_id)? else {
             return Ok(InterruptOutcome {

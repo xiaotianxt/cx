@@ -456,6 +456,16 @@ pub(crate) fn ready_app_server(paths: &ManagerPaths) -> Result<ReadyAppServer> {
     })
 }
 
+pub(crate) fn registered_app_server(paths: &ManagerPaths) -> Result<ReadyAppServer> {
+    let state_file = paths.serve_state_file();
+    let state = read_state_if_exists(&state_file)?
+        .with_context(|| format!("serve state not found: {}", state_file.display()))?;
+    LoopbackWsUrl::parse(&state.listen_url)?;
+    Ok(ReadyAppServer {
+        listen_url: state.listen_url,
+    })
+}
+
 fn wait_for_ready(
     readyz_url: &str,
     timeout_secs: f32,
@@ -871,6 +881,26 @@ mod tests {
         assert!(!content.contains("auth"));
         assert!(!content.contains("env"));
 
+        let _ = fs::remove_dir_all(&paths.manager_dir);
+    }
+
+    #[test]
+    fn registered_app_server_reads_recorded_listen_url_without_probe() {
+        let paths = temp_paths("registered");
+        let state = ServeStateFile {
+            schema_version: SERVE_STATE_SCHEMA_VERSION,
+            pid: u32::MAX,
+            slot: String::from("bus1"),
+            target: None,
+            listen_url: String::from("ws://127.0.0.1:9"),
+            readyz_url: String::from("http://127.0.0.1:9/readyz"),
+            started_at_unix: 1_800_000_000,
+        };
+        write_state(&paths, &state).unwrap();
+
+        let server = registered_app_server(&paths).unwrap();
+
+        assert_eq!(server.listen_url, "ws://127.0.0.1:9");
         let _ = fs::remove_dir_all(&paths.manager_dir);
     }
 

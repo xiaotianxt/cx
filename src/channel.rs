@@ -55,6 +55,7 @@ pub mod telegram {
 
     const TELEGRAM_STATE_SCHEMA_VERSION: u64 = 1;
     const PORTAL_TOPIC_TITLE: &str = "cx portal";
+    const PORTAL_APP_SERVER_TIMEOUT: Duration = Duration::from_millis(750);
     const ROLLOUT_OWNER_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
     #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -953,7 +954,7 @@ pub mod telegram {
             }
 
             let edit_message_id = state.panel_message_id_for_route(&route);
-            let reply = portal_reply(paths, &route, app_server_timeout, edit_message_id)
+            let reply = portal_reply(paths, &route, app_server_timeout, edit_message_id, false)
                 .unwrap_or_else(|err| portal_unavailable_reply(&route, err, edit_message_id));
             match deliver_reply(client, token, &reply) {
                 Ok(Some(message_id)) => {
@@ -965,7 +966,7 @@ pub mod telegram {
                         "telegram portal startup edit panel failed for {}: {err:#}",
                         route.display()
                     );
-                    let fresh_reply = portal_reply(paths, &route, app_server_timeout, None)
+                    let fresh_reply = portal_reply(paths, &route, app_server_timeout, None, false)
                         .unwrap_or_else(|err| portal_unavailable_reply(&route, err, None));
                     match deliver_reply(client, token, &fresh_reply) {
                         Ok(Some(message_id)) => {
@@ -1241,8 +1242,14 @@ pub mod telegram {
 
         match command {
             TelegramTextCommand::Portal => Ok(Some(
-                portal_reply(paths, &route, options.app_server_timeout, None)
-                    .unwrap_or_else(|err| portal_unavailable_reply(&route, err, None)),
+                portal_reply(
+                    paths,
+                    &route,
+                    options.app_server_timeout,
+                    None,
+                    options.trace_timings,
+                )
+                .unwrap_or_else(|err| portal_unavailable_reply(&route, err, None)),
             )),
             TelegramTextCommand::Attach { thread_id } => {
                 let Some(thread_id) = thread_id.as_deref() else {
@@ -1444,8 +1451,14 @@ pub mod telegram {
             TelegramTextCommand::Message => {
                 if is_portal_route(&route, chat_is_forum) {
                     return Ok(Some(
-                        portal_reply(paths, &route, options.app_server_timeout, None)
-                            .unwrap_or_else(|err| portal_unavailable_reply(&route, err, None)),
+                        portal_reply(
+                            paths,
+                            &route,
+                            options.app_server_timeout,
+                            None,
+                            options.trace_timings,
+                        )
+                        .unwrap_or_else(|err| portal_unavailable_reply(&route, err, None)),
                     ));
                 }
                 if text.trim().is_empty() {
@@ -1538,8 +1551,14 @@ pub mod telegram {
         }
         match TelegramCallbackCommand::parse(callback_data) {
             Some(TelegramCallbackCommand::RefreshPortal) => Ok(Some(
-                portal_reply(paths, route, options.app_server_timeout, edit_message_id)
-                    .unwrap_or_else(|err| portal_unavailable_reply(route, err, edit_message_id)),
+                portal_reply(
+                    paths,
+                    route,
+                    options.app_server_timeout,
+                    edit_message_id,
+                    options.trace_timings,
+                )
+                .unwrap_or_else(|err| portal_unavailable_reply(route, err, edit_message_id)),
             )),
             Some(TelegramCallbackCommand::RefreshWork) => {
                 Ok(Some(refresh_work_panel(state, route, edit_message_id)))
@@ -1568,10 +1587,21 @@ pub mod telegram {
     fn portal_reply(
         paths: &ManagerPaths,
         route: &TelegramRoute,
-        timeout_secs: f32,
+        _timeout_secs: f32,
         edit_message_id: Option<i64>,
+        trace_timings: bool,
     ) -> Result<TelegramReply> {
-        let entries = list_portal_entries(paths, timeout_secs, 8)?;
+        let portal_start = Instant::now();
+        let route_log = route.display();
+        let entries = list_portal_entries(paths, 8, trace_timings, &route_log)?;
+        if trace_timings {
+            eprintln!(
+                "telegram timing route={} phase=portal_complete entries={} elapsed_ms={}",
+                route_log,
+                entries.len(),
+                elapsed_ms(portal_start)
+            );
+        }
         if entries.is_empty() {
             return Ok(panel_reply_with_keyboard(
                 route,
@@ -1596,7 +1626,7 @@ pub mod telegram {
         thread_id: &str,
         options: &HandleOptions<'_>,
     ) -> Result<TelegramReply> {
-        let entries = list_portal_entries(paths, options.app_server_timeout, 30)?;
+        let entries = list_portal_entries(paths, 30, options.trace_timings, &route.display())?;
         let Some(entry) = entries
             .into_iter()
             .find(|entry| entry.thread_id == thread_id)
@@ -1680,7 +1710,7 @@ pub mod telegram {
         thread_id: &str,
         options: &HandleOptions<'_>,
     ) -> Result<Option<TelegramReply>> {
-        let entries = list_portal_entries(paths, options.app_server_timeout, 30)?;
+        let entries = list_portal_entries(paths, 30, options.trace_timings, &route.display())?;
         let Some(entry) = entries.iter().find(|e| e.thread_id == thread_id) else {
             return Ok(Some(reply(
                 route,
@@ -2011,47 +2041,73 @@ pub mod telegram {
     }
 
     fn connect_app_server(paths: &ManagerPaths, timeout_secs: f32) -> Result<AppServerClient> {
+        connect_app_server_with_timeout(paths, Duration::from_secs_f32(timeout_secs))
+    }
+
+    fn connect_app_server_with_timeout(
+        paths: &ManagerPaths,
+        timeout: Duration,
+    ) -> Result<AppServerClient> {
         let server = serve::ready_app_server(paths)?;
-        let mut client =
-            AppServerClient::connect(&server.listen_url, Duration::from_secs_f32(timeout_secs))?;
+        let mut client = AppServerClient::connect(&server.listen_url, timeout)?;
         client.initialize("cx-telegram", env!("CARGO_PKG_VERSION"))?;
         Ok(client)
     }
 
     fn list_portal_entries(
         paths: &ManagerPaths,
-        timeout_secs: f32,
         limit: u64,
+        trace_timings: bool,
+        route_log: &str,
     ) -> Result<Vec<AppThreadPortalEntry>> {
-        let mut client = connect_app_server(paths, timeout_secs)?;
-        let page = client.thread_list(limit)?;
-        let mut entries = page
-            .threads
-            .into_iter()
-            .map(AppThreadPortalEntry::from)
-            .collect::<Vec<_>>();
-        mark_rollout_watchable_threads(paths, &mut entries);
-        let open_tui_entries =
-            open_tui_portal_entries(paths, limit.saturating_mul(4)).unwrap_or_else(|_| Vec::new());
-        Ok(merge_portal_entries(open_tui_entries, entries, limit))
-    }
-
-    fn mark_rollout_watchable_threads(paths: &ManagerPaths, entries: &mut [AppThreadPortalEntry]) {
-        for entry in entries.iter_mut().filter(|entry| !entry.watchable) {
-            if active_rollout_turn(paths, &entry.thread_id)
-                .ok()
-                .flatten()
-                .is_some()
-            {
-                entry.watchable = true;
-                entry.status = "active-tui".to_string();
-            } else if rollout_file_is_open(paths, &entry.thread_id) {
-                entry.watchable = true;
-                entry.status = "open-tui".to_string();
-            }
+        let state_start = Instant::now();
+        let server = serve::registered_app_server(paths)?;
+        if trace_timings {
+            eprintln!(
+                "telegram timing route={} phase=portal_app_server_registry elapsed_ms={}",
+                route_log,
+                elapsed_ms(state_start)
+            );
         }
+        let connect_start = Instant::now();
+        let mut client = AppServerClient::connect(&server.listen_url, PORTAL_APP_SERVER_TIMEOUT)?;
+        client.initialize("cx-telegram", env!("CARGO_PKG_VERSION"))?;
+        if trace_timings {
+            eprintln!(
+                "telegram timing route={} phase=portal_app_server_connect timeout_ms={} elapsed_ms={}",
+                route_log,
+                PORTAL_APP_SERVER_TIMEOUT.as_millis(),
+                elapsed_ms(connect_start)
+            );
+        }
+        let list_start = Instant::now();
+        let page = client.thread_list(limit)?;
+        if trace_timings {
+            eprintln!(
+                "telegram timing route={} phase=portal_thread_list threads={} elapsed_ms={}",
+                route_log,
+                page.threads.len(),
+                elapsed_ms(list_start)
+            );
+        }
+        Ok(filter_portal_entries(
+            page.threads.into_iter().map(AppThreadPortalEntry::from),
+            limit,
+        ))
     }
 
+    fn filter_portal_entries<I>(entries: I, limit: u64) -> Vec<AppThreadPortalEntry>
+    where
+        I: IntoIterator<Item = AppThreadPortalEntry>,
+    {
+        entries
+            .into_iter()
+            .filter(|entry| !is_local_watch_regression_entry(entry))
+            .take(limit as usize)
+            .collect()
+    }
+
+    #[cfg(test)]
     fn open_tui_portal_entries(
         paths: &ManagerPaths,
         max_candidates: u64,
@@ -2103,27 +2159,6 @@ pub mod telegram {
             entries.push(entry);
         }
         Ok(entries)
-    }
-
-    fn merge_portal_entries(
-        preferred: Vec<AppThreadPortalEntry>,
-        fallback: Vec<AppThreadPortalEntry>,
-        limit: u64,
-    ) -> Vec<AppThreadPortalEntry> {
-        let mut seen = BTreeSet::<String>::new();
-        let mut merged = Vec::new();
-        for entry in preferred.into_iter().chain(fallback) {
-            if is_local_watch_regression_entry(&entry) {
-                continue;
-            }
-            if seen.insert(entry.thread_id.clone()) {
-                merged.push(entry);
-            }
-            if merged.len() >= limit as usize {
-                break;
-            }
-        }
-        merged
     }
 
     fn is_local_watch_regression_entry(entry: &AppThreadPortalEntry) -> bool {
@@ -3353,6 +3388,7 @@ pub mod telegram {
         rollout_thread_info(paths, thread_id).map(|info| info.path)
     }
 
+    #[cfg(test)]
     fn rollout_file_is_open(paths: &ManagerPaths, thread_id: &str) -> bool {
         let Some(info) = rollout_thread_info(paths, thread_id) else {
             return false;
@@ -6224,20 +6260,11 @@ pub mod telegram {
         }
 
         #[test]
-        fn merge_portal_entries_prefers_open_tui_threads() {
-            let preferred = vec![AppThreadPortalEntry {
-                thread_id: "thread-open".to_string(),
-                title: Some("Open TUI".to_string()),
-                preview: String::new(),
-                cwd: "/Users/yupeit/dev/cx".to_string(),
-                active: false,
-                watchable: true,
-                status: "open-tui".to_string(),
-            }];
-            let fallback = vec![
+        fn filter_portal_entries_keeps_registry_order_and_limits() {
+            let entries = vec![
                 AppThreadPortalEntry {
-                    thread_id: "thread-old".to_string(),
-                    title: Some("Old".to_string()),
+                    thread_id: "thread-first".to_string(),
+                    title: Some("First".to_string()),
                     preview: String::new(),
                     cwd: "/Users/yupeit/dev/cx".to_string(),
                     active: false,
@@ -6245,8 +6272,17 @@ pub mod telegram {
                     status: "notLoaded".to_string(),
                 },
                 AppThreadPortalEntry {
-                    thread_id: "thread-open".to_string(),
-                    title: Some("Duplicate".to_string()),
+                    thread_id: "thread-second".to_string(),
+                    title: Some("Second".to_string()),
+                    preview: String::new(),
+                    cwd: "/Users/yupeit/dev/cx".to_string(),
+                    active: true,
+                    watchable: true,
+                    status: "active".to_string(),
+                },
+                AppThreadPortalEntry {
+                    thread_id: "thread-third".to_string(),
+                    title: Some("Third".to_string()),
                     preview: String::new(),
                     cwd: "/Users/yupeit/dev/cx".to_string(),
                     active: false,
@@ -6255,17 +6291,16 @@ pub mod telegram {
                 },
             ];
 
-            let merged = merge_portal_entries(preferred, fallback, 2);
+            let filtered = filter_portal_entries(entries, 2);
 
-            assert_eq!(merged.len(), 2);
-            assert_eq!(merged[0].thread_id, "thread-open");
-            assert_eq!(merged[0].status, "open-tui");
-            assert_eq!(merged[1].thread_id, "thread-old");
+            assert_eq!(filtered.len(), 2);
+            assert_eq!(filtered[0].thread_id, "thread-first");
+            assert_eq!(filtered[1].thread_id, "thread-second");
         }
 
         #[test]
-        fn merge_portal_entries_filters_local_watch_regression_threads() {
-            let preferred = vec![
+        fn filter_portal_entries_filters_local_watch_regression_threads() {
+            let entries = vec![
                 AppThreadPortalEntry {
                     thread_id: "thread-test".to_string(),
                     title: Some("For Telegram watch E2E marker CXE2E".to_string()),
@@ -6286,10 +6321,10 @@ pub mod telegram {
                 },
             ];
 
-            let merged = merge_portal_entries(preferred, Vec::new(), 10);
+            let filtered = filter_portal_entries(entries, 10);
 
-            assert_eq!(merged.len(), 1);
-            assert_eq!(merged[0].thread_id, "thread-real");
+            assert_eq!(filtered.len(), 1);
+            assert_eq!(filtered[0].thread_id, "thread-real");
         }
 
         #[test]

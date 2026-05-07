@@ -20,6 +20,7 @@ mod session;
 mod slot;
 mod stats;
 mod target;
+mod transfer;
 mod usage;
 
 use std::process::ExitCode;
@@ -37,6 +38,7 @@ use cli::ServiceCommand;
 use cli::StatusSort;
 use cli::TargetCommand;
 use cli::TelegramCommand;
+use cli::TransferCommand;
 
 fn main() -> ExitCode {
     match entry() {
@@ -148,6 +150,10 @@ fn entry() -> Result<()> {
         },
         Command::Protocol(args) => match args.command {
             ProtocolCommand::Export(args) => protocol_export::export(args)?,
+        },
+        Command::Transfer(args) => match args.command {
+            TransferCommand::Export(args) => transfer::export(args)?,
+            TransferCommand::Import(args) => transfer::import(args)?,
         },
         Command::Target(args) => match args.command {
             TargetCommand::List(args) => {

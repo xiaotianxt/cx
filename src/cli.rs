@@ -49,6 +49,8 @@ pub enum Command {
     Service(ServiceArgs),
     /// Inspect and export Codex App Server protocol bindings.
     Protocol(ProtocolArgs),
+    /// Export and import portable profile-manager transfer bundles.
+    Transfer(TransferArgs),
     /// Manage target-specific slot groups and overrides.
     Target(TargetArgs),
     /// Validate the local profile-manager layout.
@@ -1169,6 +1171,53 @@ pub struct ProtocolExportArgs {
     /// Include experimental protocol methods and fields.
     #[arg(long)]
     pub experimental: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct TransferArgs {
+    #[command(subcommand)]
+    pub command: TransferCommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum TransferCommand {
+    /// Export rotation slots and login state into a portable directory bundle.
+    Export(TransferExportArgs),
+    /// Import a portable directory bundle into this machine's profile-manager.
+    Import(TransferImportArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct TransferExportArgs {
+    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
+    pub manager_dir: Option<PathBuf>,
+
+    /// Output directory. Must be outside the live ~/.codex tree.
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
+    pub out: PathBuf,
+
+    /// Replace an existing output directory.
+    #[arg(long)]
+    pub replace: bool,
+
+    /// Slot names to export. Defaults to rotation.txt.
+    pub slots: Vec<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct TransferImportArgs {
+    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
+    pub manager_dir: Option<PathBuf>,
+
+    /// Replace existing destination files.
+    #[arg(long)]
+    pub replace: bool,
+
+    /// Bundle directory created by `cx transfer export`.
+    #[arg(value_hint = clap::ValueHint::DirPath)]
+    pub bundle: PathBuf,
 }
 
 #[derive(Debug, Clone, Args)]

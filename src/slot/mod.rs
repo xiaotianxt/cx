@@ -368,7 +368,7 @@ fn copy_auth_from_current(paths: &ManagerPaths, slot: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_slot_name(slot: &str) -> Result<()> {
+pub(crate) fn validate_slot_name(slot: &str) -> Result<()> {
     if slot.is_empty()
         || !slot
             .chars()

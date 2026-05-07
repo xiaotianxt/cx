@@ -4055,9 +4055,9 @@ impl TelegramThinkingPanel {
 
 fn thinking_watch_text(panel: &TelegramThinkingPanel) -> String {
     let title = if panel.done {
-        "Working complete"
+        "Codex"
     } else {
-        "Working"
+        "Codex is working"
     };
     let body = if panel.text.trim().is_empty() {
         "Working on this turn."
@@ -4068,7 +4068,7 @@ fn thinking_watch_text(panel: &TelegramThinkingPanel) -> String {
 }
 
 fn user_watch_text(message: &str) -> String {
-    truncate_chars(&format!("User\n{}", message.trim()), 1800)
+    truncate_chars(&format!("You\n{}", message.trim()), 1800)
 }
 
 struct TelegramActivityPanel {
@@ -4157,6 +4157,7 @@ impl TelegramActivityPanel {
 }
 
 struct TelegramActivityItem {
+    verb: String,
     summary: String,
     status: CommandExecutionStatus,
     exit_code: Option<i64>,
@@ -4165,8 +4166,15 @@ struct TelegramActivityItem {
 
 impl From<CommandExecution> for TelegramActivityItem {
     fn from(command: CommandExecution) -> Self {
+        let activity = command_activity(&command);
+        let summary = format!(
+            "{} {}",
+            activity.verb,
+            truncate_chars(activity.target.trim(), 120)
+        );
         Self {
-            summary: command_activity_summary(&command),
+            verb: activity.verb,
+            summary,
             status: command.status,
             exit_code: command.exit_code,
             duration_ms: command.duration_ms,
@@ -4176,28 +4184,51 @@ impl From<CommandExecution> for TelegramActivityItem {
 
 fn activity_watch_text(panel: &TelegramActivityPanel) -> String {
     let mut lines = vec![String::from("Activity")];
+    let mut current_section = None::<&'static str>;
     for item_id in &panel.order {
         if let Some(item) = panel.items.get(item_id) {
-            lines.push(activity_item_line(item));
+            let section = activity_item_section(item);
+            if current_section != Some(section) {
+                lines.push(section.to_string());
+                current_section = Some(section);
+            }
+            lines.push(format!("  {}", activity_item_line(item)));
         }
     }
     truncate_chars(&lines.join("\n"), 1800)
 }
 
+fn activity_item_section(item: &TelegramActivityItem) -> &'static str {
+    match &item.status {
+        CommandExecutionStatus::InProgress => "Working",
+        CommandExecutionStatus::Failed
+        | CommandExecutionStatus::Declined
+        | CommandExecutionStatus::Unknown(_) => "Needs attention",
+        CommandExecutionStatus::Completed => match item.verb.as_str() {
+            "Read" | "List" | "Search" => "Explored",
+            "Write" | "Stage" | "Commit" | "Push" => "Changed",
+            "Format" | "Test" | "Build" | "Lint" => "Checked",
+            _ => "Ran",
+        },
+    }
+}
+
 fn activity_item_line(item: &TelegramActivityItem) -> String {
-    let prefix = match &item.status {
-        CommandExecutionStatus::InProgress => "Running",
-        CommandExecutionStatus::Completed => "Done",
-        CommandExecutionStatus::Failed => "Failed",
-        CommandExecutionStatus::Declined => "Declined",
-        CommandExecutionStatus::Unknown(_) => "Status",
+    let mut line = match &item.status {
+        CommandExecutionStatus::InProgress | CommandExecutionStatus::Completed => {
+            item.summary.clone()
+        }
+        CommandExecutionStatus::Failed => format!("Failed: {}", item.summary),
+        CommandExecutionStatus::Declined => format!("Declined: {}", item.summary),
+        CommandExecutionStatus::Unknown(status) => {
+            format!("{}: {}", status, item.summary)
+        }
     };
-    let mut line = format!("{prefix}: {}", truncate_chars(&item.summary, 160));
     let mut metadata = Vec::new();
     if let Some(exit_code) = item.exit_code.filter(|code| *code != 0) {
         metadata.push(format!("exit {exit_code}"));
     }
-    if let Some(duration_ms) = item.duration_ms {
+    if let Some(duration_ms) = item.duration_ms.filter(|duration| *duration > 0) {
         metadata.push(format_duration_ms(duration_ms));
     }
     if !metadata.is_empty() {
@@ -4206,21 +4237,11 @@ fn activity_item_line(item: &TelegramActivityItem) -> String {
     line
 }
 
-fn command_activity_summary(command: &CommandExecution) -> String {
+fn command_activity(command: &CommandExecution) -> CommandActivity {
     if let Some(activity) = command.activity.as_ref() {
-        return format!(
-            "{} {}",
-            activity.verb,
-            truncate_chars(activity.target.trim(), 120)
-        );
+        return activity.clone();
     }
-    let command_text = command.command.trim();
-    let activity = command_activity_from_shell(command_text);
-    format!(
-        "{} {}",
-        activity.verb,
-        truncate_chars(activity.target.trim(), 120)
-    )
+    command_activity_from_shell(command.command.trim())
 }
 
 fn command_activity_from_shell(command: &str) -> CommandActivity {
@@ -6547,7 +6568,9 @@ mod tests {
         let text = activity_watch_text(&panel);
 
         assert!(text.contains("Activity"));
-        assert!(text.contains("Running: Read channel.rs"));
+        assert!(text.contains("Working"));
+        assert!(text.contains("Read channel.rs"));
+        assert!(!text.contains("Running:"));
         assert!(!text.contains("cwd:"));
         assert!(!text.contains("output"));
         assert!(!text.contains("long command output"));
@@ -6569,9 +6592,44 @@ mod tests {
 
         let text = activity_watch_text(&panel);
 
-        assert!(text.contains("Done: Test cargo test (1.2s)"));
+        assert!(text.contains("Checked"));
+        assert!(text.contains("Test cargo test (1.2s)"));
+        assert!(!text.contains("Done:"));
         assert!(!text.contains("exit: 0"));
         assert!(!text.contains("ok"));
+    }
+
+    #[test]
+    fn activity_watch_text_groups_transcript_sections() {
+        let mut panel = TelegramActivityPanel::new();
+        panel.apply_execution(CommandExecution {
+            item_id: "read-1".to_string(),
+            command: "sed -n '1,80p' wiley.py".to_string(),
+            cwd: "/tmp/project".to_string(),
+            activity: Some(CommandActivity {
+                verb: "Read".to_string(),
+                target: "wiley.py, science.py, pnas.py".to_string(),
+            }),
+            status: CommandExecutionStatus::Completed,
+            exit_code: Some(0),
+            duration_ms: Some(0),
+            aggregated_output: None,
+        });
+        panel.apply_execution(CommandExecution {
+            item_id: "test-1".to_string(),
+            command: "cargo test".to_string(),
+            cwd: "/tmp/project".to_string(),
+            activity: None,
+            status: CommandExecutionStatus::Completed,
+            exit_code: Some(0),
+            duration_ms: Some(1240),
+            aggregated_output: None,
+        });
+
+        assert_eq!(
+            activity_watch_text(&panel),
+            "Activity\nExplored\n  Read wiley.py, science.py, pnas.py\nChecked\n  Test cargo test (1.2s)"
+        );
     }
 
     #[test]
@@ -6581,7 +6639,7 @@ mod tests {
 
         assert_eq!(
             thinking_watch_text(&panel),
-            "Working\nWorking on this turn."
+            "Codex is working\nWorking on this turn."
         );
 
         panel.push("Checking current state.");
@@ -6589,7 +6647,7 @@ mod tests {
 
         assert_eq!(
             thinking_watch_text(&panel),
-            "Working complete\nChecking current state."
+            "Codex\nChecking current state."
         );
     }
 

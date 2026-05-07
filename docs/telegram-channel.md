@@ -190,11 +190,10 @@ then capped at 32 characters. If `/new` has no name, cx creates `session-1`,
 `session-2`, and so on for that route.
 
 `/close` in a work topic archives the bound Codex app-server thread, asks
-Telegram to delete that forum topic, and removes the local binding only after
-Telegram accepts the delete request. If Telegram rejects the delete request,
-the binding stays active so the adapter can retry after the bot receives the
-right admin permissions. In private chats or non-topic routes, `/close` only
-unbinds the local route.
+Telegram to delete that forum topic, and removes the local binding. If Telegram
+rejects the delete request, cx still drops the local binding and reports the
+delete error so the stale topic does not remain active in cx state. In private
+chats or non-topic routes, `/close` only unbinds the local route.
 
 After at least one chat is trusted, `run` does not create a new bind secret. It
 listens only to trusted bindings and any explicit `--allow-chat` values:

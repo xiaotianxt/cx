@@ -1784,44 +1784,45 @@ pub mod telegram {
                 missing_session_message(state, route, alias.as_deref()),
             )));
         };
+        let label = alias.as_deref().unwrap_or("default").to_string();
         if let Some(thread_id) = binding.message_thread_id {
+            let mut close_errors = Vec::new();
             if let Some(notifier) = options.notifier {
                 if let Err(err) =
                     archive_route_app_threads(paths, state, route, options.app_server_timeout)
                 {
-                    return Ok(Some(reply(
-                        route,
-                        format!("Failed to archive Codex threads before closing.\n{err:#}"),
-                    )));
+                    close_errors.push(format!("Failed to archive Codex threads: {err:#}"));
                 }
                 if let Err(err) =
                     delete_forum_topic(notifier.client, notifier.token, binding.chat_id, thread_id)
                 {
-                    return Ok(Some(reply(
-                        route,
-                        format!(
-                            "Failed to delete Telegram topic; keeping binding active.\n{err:#}"
-                        ),
-                    )));
+                    close_errors.push(format!("Failed to delete Telegram topic: {err:#}"));
                 }
                 state.remove_all_route_bindings(route);
-                return Ok(None);
+                if close_errors.is_empty() {
+                    return Ok(None);
+                }
+                return Ok(Some(reply(
+                    route,
+                    format!(
+                        "Unbound session `{label}` locally, but some close actions failed.\n{}",
+                        close_errors.join("\n")
+                    ),
+                )));
             }
         }
-        if let Err(err) = archive_bound_app_thread(paths, &binding, options.app_server_timeout) {
-            return Ok(Some(reply(
-                route,
-                format!("Failed to archive Codex thread before closing.\n{err:#}"),
-            )));
-        }
+        let archive_error =
+            archive_bound_app_thread(paths, &binding, options.app_server_timeout).err();
         if state.remove_route_binding(route, alias.as_deref()) {
-            Ok(Some(reply(
-                route,
-                format!(
-                    "Unbound session `{}`.",
-                    alias.as_deref().unwrap_or("default")
-                ),
-            )))
+            let text = match archive_error {
+                Some(err) => {
+                    format!(
+                        "Unbound session `{label}` locally, but failed to archive Codex thread.\n{err:#}"
+                    )
+                }
+                None => format!("Unbound session `{label}`."),
+            };
+            Ok(Some(reply(route, text)))
         } else {
             Ok(Some(reply(
                 route,
@@ -1958,7 +1959,7 @@ pub mod telegram {
             .with_context(|| format!("open {}", db_path.display()))?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, title, first_user_message, cwd \
+                "SELECT id, title, first_user_message, cwd, archived \
                  FROM threads \
                  WHERE rollout_path <> '' \
                  ORDER BY updated_at DESC \
@@ -1970,29 +1971,32 @@ pub mod telegram {
             let title: String = row.get(1)?;
             let preview: String = row.get(2)?;
             let cwd: String = row.get(3)?;
-            Ok(AppThreadPortalEntry {
-                thread_id,
-                title: (!title.trim().is_empty()).then_some(title),
-                preview,
-                cwd,
-                active: false,
-                watchable: true,
-                status: String::from("open-tui"),
-            })
+            let archived = row.get::<_, i64>(4)? != 0;
+            Ok((
+                AppThreadPortalEntry {
+                    thread_id,
+                    title: (!title.trim().is_empty()).then_some(title),
+                    preview,
+                    cwd,
+                    active: false,
+                    watchable: true,
+                    status: String::from("open-tui"),
+                },
+                archived,
+            ))
         })?;
 
         let mut entries = Vec::new();
         for row in rows {
-            let mut entry = row?;
-            if !rollout_file_is_open(paths, &entry.thread_id) {
-                continue;
-            }
+            let (mut entry, archived) = row?;
             if active_rollout_turn(paths, &entry.thread_id)
                 .ok()
                 .flatten()
                 .is_some()
             {
                 entry.status = String::from("active-tui");
+            } else if archived || !rollout_file_is_open(paths, &entry.thread_id) {
+                continue;
             }
             entries.push(entry);
         }
@@ -3087,21 +3091,47 @@ pub mod telegram {
         urls
     }
 
-    fn rollout_path_for_thread(paths: &ManagerPaths, thread_id: &str) -> Option<PathBuf> {
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RolloutThreadInfo {
+        path: PathBuf,
+        archived: bool,
+    }
+
+    fn rollout_thread_info(paths: &ManagerPaths, thread_id: &str) -> Option<RolloutThreadInfo> {
         let db_path = paths.base_codex_home.join("state_5.sqlite");
         let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
         let mut stmt = conn
-            .prepare("SELECT rollout_path FROM threads WHERE id = ?1 ORDER BY archived ASC LIMIT 1")
+            .prepare(
+                "SELECT rollout_path, archived \
+                 FROM threads \
+                 WHERE id = ?1 \
+                 ORDER BY archived ASC \
+                 LIMIT 1",
+            )
             .ok()?;
-        let path: String = stmt.query_row(params![thread_id], |row| row.get(0)).ok()?;
-        Some(PathBuf::from(path))
+        stmt.query_row(params![thread_id], |row| {
+            let path: String = row.get(0)?;
+            let archived = row.get::<_, i64>(1)? != 0;
+            Ok(RolloutThreadInfo {
+                path: PathBuf::from(path),
+                archived,
+            })
+        })
+        .ok()
+    }
+
+    fn rollout_path_for_thread(paths: &ManagerPaths, thread_id: &str) -> Option<PathBuf> {
+        rollout_thread_info(paths, thread_id).map(|info| info.path)
     }
 
     fn rollout_file_is_open(paths: &ManagerPaths, thread_id: &str) -> bool {
-        rollout_path_for_thread(paths, thread_id)
-            .as_deref()
-            .and_then(pid_holding_file)
-            .is_some()
+        let Some(info) = rollout_thread_info(paths, thread_id) else {
+            return false;
+        };
+        if info.archived {
+            return false;
+        }
+        pid_holding_file(&info.path).is_some()
     }
 
     fn pid_holding_file(path: &Path) -> Option<u32> {
@@ -5485,6 +5515,45 @@ pub mod telegram {
         }
 
         #[test]
+        fn close_unbinds_local_route_when_archive_fails() {
+            let paths = temp_paths("close-archive-fails");
+            let mut state = TelegramState::empty();
+            let route = TelegramRoute {
+                chat_id: -10042,
+                message_thread_id: Some(31),
+            };
+            state.bind_route(&paths, &route, None).unwrap();
+            state
+                .binding_for_route_mut(&route, None)
+                .unwrap()
+                .app_thread_id = Some("thread-missing".to_string());
+
+            let reply = handle_message(
+                &paths,
+                &mut state,
+                TelegramMessage {
+                    chat: TelegramChat {
+                        id: -10042,
+                        is_forum: true,
+                    },
+                    message_id: 1,
+                    message_thread_id: Some(31),
+                    text: Some("/close".to_string()),
+                    forum_topic_edited: None,
+                },
+                handle_options(),
+            )
+            .unwrap()
+            .unwrap();
+
+            assert!(reply.text.starts_with("Unbound session `default` locally"));
+            assert!(reply.text.contains("failed to archive Codex thread"));
+            assert!(state.binding_for_route(&route, None).is_none());
+
+            let _ = fs::remove_dir_all(paths.serve_dir());
+        }
+
+        #[test]
         fn deleting_topic_route_removes_all_local_bindings_for_that_topic() {
             let paths = temp_paths("remove-topic-route");
             let mut state = TelegramState::empty();
@@ -5760,6 +5829,122 @@ pub mod telegram {
                 rollout_path_for_thread(&paths, "thread-archived-active"),
                 Some(rollout)
             );
+        }
+
+        #[test]
+        fn open_tui_portal_entries_ignores_archived_idle_rollouts() {
+            let paths = temp_paths("rollout-archived-idle");
+            fs::create_dir_all(&paths.base_codex_home).unwrap();
+            let rollout = paths.base_codex_home.join("archived-idle-rollout.jsonl");
+            fs::write(
+                &rollout,
+                r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"}}"#,
+            )
+            .unwrap();
+            let _held = fs::File::open(&rollout).unwrap();
+            if pid_holding_file(&rollout).is_none() {
+                let _ = fs::remove_dir_all(paths.base_codex_home);
+                return;
+            }
+            let conn = Connection::open(paths.base_codex_home.join("state_5.sqlite")).unwrap();
+            conn.execute(
+                "CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    rollout_path TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    first_user_message TEXT NOT NULL,
+                    cwd TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    archived INTEGER NOT NULL DEFAULT 0
+                )",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO threads (
+                    id,
+                    rollout_path,
+                    title,
+                    first_user_message,
+                    cwd,
+                    updated_at,
+                    archived
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    "thread-archived-idle",
+                    rollout.to_string_lossy().as_ref(),
+                    "Archived idle",
+                    "Archived idle",
+                    "/tmp",
+                    1_i64,
+                    1_i64
+                ],
+            )
+            .unwrap();
+
+            let entries = open_tui_portal_entries(&paths, 10).unwrap();
+
+            assert!(entries.is_empty());
+            let _ = fs::remove_dir_all(paths.base_codex_home);
+        }
+
+        #[test]
+        fn open_tui_portal_entries_keeps_archived_active_rollouts_visible() {
+            let paths = temp_paths("rollout-archived-active");
+            fs::create_dir_all(&paths.base_codex_home).unwrap();
+            let rollout = paths.base_codex_home.join("archived-active-rollout.jsonl");
+            fs::write(
+                &rollout,
+                r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            )
+            .unwrap();
+            let _held = fs::File::open(&rollout).unwrap();
+            if pid_holding_file(&rollout).is_none() {
+                let _ = fs::remove_dir_all(paths.base_codex_home);
+                return;
+            }
+            let conn = Connection::open(paths.base_codex_home.join("state_5.sqlite")).unwrap();
+            conn.execute(
+                "CREATE TABLE threads (
+                    id TEXT PRIMARY KEY,
+                    rollout_path TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    first_user_message TEXT NOT NULL,
+                    cwd TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    archived INTEGER NOT NULL DEFAULT 0
+                )",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO threads (
+                    id,
+                    rollout_path,
+                    title,
+                    first_user_message,
+                    cwd,
+                    updated_at,
+                    archived
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    "thread-archived-active",
+                    rollout.to_string_lossy().as_ref(),
+                    "Archived active",
+                    "Archived active",
+                    "/tmp",
+                    1_i64,
+                    1_i64
+                ],
+            )
+            .unwrap();
+
+            let entries = open_tui_portal_entries(&paths, 10).unwrap();
+
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].thread_id, "thread-archived-active");
+            assert_eq!(entries[0].status, "active-tui");
+            let _ = fs::remove_dir_all(paths.base_codex_home);
         }
 
         #[test]

@@ -41,6 +41,7 @@ use crate::cli::ServiceTokenCommand;
 use crate::cli::ServiceTokenName;
 use crate::cli::ServiceUninstallArgs;
 use crate::paths::ManagerPaths;
+use crate::rate_limit;
 use crate::run;
 use crate::selector;
 use crate::serve;
@@ -48,7 +49,6 @@ use crate::session;
 use crate::session::AppThreadBinding;
 use crate::session::BindAppThreadRequest;
 use crate::slot;
-use crate::supervisor::rate_limit;
 use crate::target;
 
 const SERVICE_STATE_SCHEMA_VERSION: u64 = 1;

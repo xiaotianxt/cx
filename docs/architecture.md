@@ -67,10 +67,16 @@ rate_limit.limit_reached == true
 
 It intentionally ignores `credits.has_credits=false` as an exhaustion signal.
 
-## Exec Model
+## Remote-First Launch And Local Fallback
 
-`cx` does not spawn a long-running child wrapper. On Unix it uses `exec`, so the
-final process is the real Codex binary with:
+For normal interactive launches, `cx` first tries to connect the real Codex TUI
+to the cx service app-server with `--remote`. The service owns slot selection,
+session restore, and app-server rotation. cx prepares the remote arguments and
+supervises short remote-client restarts for stale TUI exits.
+
+If the service app-server is missing, stale, or cannot resolve the target
+thread, cx prints a warning and falls back to a local launch. On Unix the local
+fallback uses `exec`, so the final process is the real Codex binary with:
 
 - `CODEX_HOME=<slot>/home`
 - variables from `<slot>/env.conf`
@@ -79,14 +85,10 @@ final process is the real Codex binary with:
 - repeated target `set`/`overrides` lines, appended after slot overrides
 - the user's original Codex args
 
-Before `exec`, a clean launch with no prompt, pipe, or forwarded Codex args
-passes through an auto-resume policy. `cx` reads the selected slot's shared
-`state_5.sqlite`, finds the latest unarchived `cli` or `vscode` thread for the
-process cwd, and checks the thread's rollout file with `lsof`. If the file is
-not open, `cx` appends `resume <session-id>` after slot and target overrides. If
-the file is open, missing, or the active-state probe is inconclusive, `cx`
-leaves the arguments unchanged and Codex starts a new session. Explicit Codex
-subcommands, help/version, and `--remote` launches bypass this policy.
+The remote path is used for clean TUI launches and explicit `resume` commands.
+Prompt-bearing launches fall back to the local path until the service broker can
+own turn submission directly. Other explicit Codex subcommands, help/version,
+and user-supplied `--remote` launches bypass cx's remote attach policy.
 
 Target-specific execution resolves in this order:
 

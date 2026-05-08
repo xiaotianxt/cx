@@ -11,7 +11,7 @@ Use this skill when you need to operate the local Codex multi-slot workflow.
 
 ## Commands
 
-- `cx`: run Codex through the best available slot.
+- `cx`: connect Codex TUI to the cx service app-server when ready, falling back to the best local slot.
 - `cat file | cx "prompt"`: wrap stdin as Codex prompt context.
 - `cx status`: show all configured slots and live usage.
 - `cx stats`: show local token usage totals from Codex state.
@@ -19,6 +19,7 @@ Use this skill when you need to operate the local Codex multi-slot workflow.
 - `cx select`: print the best slot name.
 - `cx add <slot> --rotate`: create a slot and add it to rotation.
 - `cx login <slot>`: log into a slot-specific `CODEX_HOME`.
+- `cx service start --no-telegram`: start the background app-server used by default TUI launches.
 - `cx doctor --online`: validate local layout and query usage.
 
 ## Safety

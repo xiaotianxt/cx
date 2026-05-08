@@ -48,7 +48,6 @@ struct RunOptions {
     codex_bin: Option<PathBuf>,
     quiet: bool,
     debug: bool,
-    managed: bool,
     codex_args: Vec<OsString>,
     first_non_option: Option<String>,
 }
@@ -94,7 +93,6 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
     if std::env::var_os("CODEX_HOME").is_some()
         && options.slot.is_none()
         && options.target.is_none()
-        && !options.managed
     {
         return exec_real_codex(&real_codex, options.codex_args);
     }
@@ -109,6 +107,31 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
         return exec_real_codex(&real_codex, options.codex_args);
     }
 
+    let clean_tui_launch = options.codex_args.is_empty();
+    let workspace = resolve_workspace_from_args(&options.codex_args)?;
+    let explicit_session_id = explicit_resume_session_id(&options.codex_args);
+    match remote_attach_spec(
+        &paths,
+        real_codex.clone(),
+        &options.codex_args,
+        &workspace,
+        explicit_session_id,
+        clean_tui_launch,
+    ) {
+        Ok(Some(spec)) => {
+            warn_remote_ignores_local_selection(&options, &spec);
+            let resumed_session_id = explicit_resume_session_id(&spec.args);
+            print_launch(&spec, resumed_session_id.as_deref(), options.quiet);
+            if let Err(err) = supervise_remote_tui(&paths, spec) {
+                warn_remote_fallback(&err);
+            } else {
+                return Ok(());
+            }
+        }
+        Ok(None) => {}
+        Err(err) => warn_remote_fallback(&err),
+    }
+
     let target = crate::target::load_optional_target(&paths, options.target.as_deref())?;
     let candidates = if let Some(target) = &target {
         target.slots_or_rotation(&paths)?
@@ -116,9 +139,6 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
         slot::load_rotation(&paths)?
     };
     if candidates.is_empty() && options.slot.is_none() {
-        if options.managed {
-            anyhow::bail!("cx --managed requires at least one configured slot or --slot");
-        }
         return exec_real_codex(&real_codex, options.codex_args);
     }
 
@@ -144,7 +164,6 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
         &real_codex,
         &selected_slot,
         target.as_ref(),
-        candidates,
         options,
     )
 }
@@ -255,66 +274,60 @@ fn exec_slot_codex(
     real_codex: &Path,
     selected_slot: &str,
     target: Option<&TargetSpec>,
-    candidates: Vec<String>,
     options: RunOptions,
 ) -> Result<()> {
-    let clean_tui_launch = options.codex_args.is_empty();
-    let original_codex_args = options.codex_args.clone();
-    let mut spec = build_slot_command_spec(
+    let spec = build_slot_command_spec(
         paths,
         real_codex.to_path_buf(),
         selected_slot,
         target,
         options.codex_args,
     )?;
-
-    let workspace = resolve_workspace_from_args(&spec.args)?;
-    let mut resumed_session_id = explicit_resume_session_id(&spec.args);
-    let mut remote_tui = false;
-    if !options.managed {
-        if let Some(remote_spec) = remote_attach_spec(
-            paths,
-            &spec,
-            &workspace,
-            resumed_session_id.clone(),
-            clean_tui_launch,
-        )? {
-            spec = remote_spec;
-            resumed_session_id = explicit_resume_session_id(&spec.args);
-            remote_tui = true;
-        }
-    }
-
-    if !options.quiet {
-        eprintln!("codex slot: {}", spec.slot());
-        if let Some(target) = spec.target_name() {
-            eprintln!("codex target: {target}");
-        }
-        if let Some(session_id) = &resumed_session_id {
-            eprintln!("codex resume: {session_id}");
-        }
-    }
-
-    if options.managed {
-        return crate::supervisor::run(crate::supervisor::SupervisorLaunch {
-            paths: paths.clone(),
-            real_codex: real_codex.to_path_buf(),
-            target: target.cloned(),
-            candidates,
-            selected_slot: selected_slot.to_string(),
-            original_codex_args,
-            initial_spec: spec,
-            session_id: resumed_session_id,
-            quiet: options.quiet,
-            debug: options.debug,
-        });
-    }
-
-    if remote_tui {
-        return supervise_remote_tui(paths, spec);
-    }
+    let resumed_session_id = explicit_resume_session_id(&spec.args);
+    print_launch(&spec, resumed_session_id.as_deref(), options.quiet);
     exec(spec.into_command())
 }
+
+fn print_launch(spec: &CodexCommandSpec, resumed_session_id: Option<&str>, quiet: bool) {
+    if quiet {
+        return;
+    }
+    eprintln!("codex slot: {}", spec.slot());
+    if let Some(target) = spec.target_name() {
+        eprintln!("codex target: {target}");
+    }
+    if let Some(session_id) = resumed_session_id {
+        eprintln!("codex resume: {session_id}");
+    }
+}
+
+fn warn_remote_fallback(err: &anyhow::Error) {
+    eprintln!("cx warning: service remote unavailable ({err:#}); falling back to local Codex");
+}
+
+fn warn_remote_ignores_local_selection(options: &RunOptions, spec: &CodexCommandSpec) {
+    if options.quiet {
+        return;
+    }
+    if let Some(slot) = options.slot.as_deref().filter(|slot| *slot != spec.slot()) {
+        eprintln!(
+            "cx warning: --slot {slot} ignored because service remote is using slot {}",
+            spec.slot()
+        );
+    }
+    if let Some(target) = options
+        .target
+        .as_deref()
+        .filter(|target| Some(*target) != spec.target_name())
+    {
+        eprintln!(
+            "cx warning: --target {target} ignored because service remote is using target {}",
+            spec.target_name().unwrap_or("<none>")
+        );
+    }
+}
+
+const MAX_REMOTE_TUI_RESTARTS: u64 = 3;
 
 fn supervise_remote_tui(paths: &ManagerPaths, spec: CodexCommandSpec) -> Result<()> {
     let mut restarts = 0_u64;
@@ -333,6 +346,13 @@ fn supervise_remote_tui(paths: &ManagerPaths, spec: CodexCommandSpec) -> Result<
             .context("remote TUI restart counter overflow")?;
         if serve::ready_app_server(paths).is_err() {
             anyhow::bail!("remote Codex TUI exited with {status} and cx service is not ready");
+        }
+        if restarts >= MAX_REMOTE_TUI_RESTARTS {
+            anyhow::bail!(
+                "remote Codex TUI exited with {status} after {restarts} attempts; \
+                 the cached session may be stale (e.g. after a codex upgrade). \
+                 Try `cx service restart`."
+            );
         }
         eprintln!(
             "cx remote tui exited with {status}; restarting on same app-server thread (attempt {restarts})"
@@ -409,7 +429,8 @@ fn remote_resume_thread_id(args: &[OsString]) -> Option<&str> {
 
 fn remote_attach_spec(
     paths: &ManagerPaths,
-    spec: &CodexCommandSpec,
+    real_codex: PathBuf,
+    base_args: &[OsString],
     workspace: &Path,
     explicit_thread_id: Option<String>,
     clean_tui_launch: bool,
@@ -417,9 +438,7 @@ fn remote_attach_spec(
     if explicit_thread_id.is_none() && !clean_tui_launch {
         return Ok(None);
     }
-    let server = serve::ready_app_server(paths).with_context(|| {
-        "cx service app-server is required for interactive resume; start it with `cx service start`"
-    })?;
+    let server = serve::ready_app_server(paths).context("cx service app-server is not ready")?;
 
     let mut client =
         AppServerClient::connect(&server.listen_url, std::time::Duration::from_secs(5))
@@ -441,14 +460,19 @@ fn remote_attach_spec(
         ThreadResolverDecision::Refuse { reason } => anyhow::bail!("{reason}"),
     };
 
-    let mut remote = spec.clone();
-    if let Some(codex_home) = server.codex_home.clone() {
-        remote.codex_home = PathBuf::from(codex_home);
-    }
-    remote.slot = server.slot.clone();
-    remote.target_name = server.target.clone();
-    remote.args = remote_tui_args(&spec.args, &server.listen_url, workspace, &thread_id);
-    Ok(Some(remote))
+    let codex_home = server
+        .codex_home
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| paths.slot_home(&server.slot));
+    Ok(Some(CodexCommandSpec {
+        program: real_codex,
+        codex_home,
+        envs: BTreeMap::new(),
+        args: remote_tui_args(base_args, &server.listen_url, workspace, &thread_id),
+        slot: server.slot,
+        target_name: server.target,
+    }))
 }
 
 fn remote_tui_args(
@@ -742,7 +766,9 @@ fn parse_run_args(args: Vec<OsString>) -> Result<RunOptions> {
                 options.debug = true;
             }
             "--managed" => {
-                options.managed = true;
+                anyhow::bail!(
+                    "`cx --managed` was removed; `cx` now connects to the cx service app-server by default. Start it with `cx service start --no-telegram`."
+                );
             }
             "-s" => {
                 if let Some(next) = iter.peek() {
@@ -841,19 +867,10 @@ mod tests {
     }
 
     #[test]
-    fn managed_flag_is_removed_from_forwarded_args() {
-        let options = parse_run_args(vec![
-            OsString::from("--managed"),
-            OsString::from("-m"),
-            OsString::from("gpt-5.5"),
-        ])
-        .unwrap();
+    fn managed_flag_is_rejected() {
+        let err = parse_run_args(vec![OsString::from("--managed")]).unwrap_err();
 
-        assert!(options.managed);
-        assert_eq!(
-            options.codex_args,
-            vec![OsString::from("-m"), OsString::from("gpt-5.5")]
-        );
+        assert!(format!("{err:#}").contains("was removed"));
     }
 
     #[test]
@@ -867,7 +884,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_launch_skips_stdin_wrapper() {
+    fn removed_managed_flag_skips_stdin_wrapper_for_error_reporting() {
         assert!(should_skip_stdin_wrapper(&[
             OsString::from("--managed"),
             OsString::from("resume"),

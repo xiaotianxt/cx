@@ -9,19 +9,16 @@ live usage.
 
 ## What It Does
 
-- `cx`: launch Codex through the slot with the most remaining usage.
+- `cx`: connect the TUI to the cx service app-server when available, otherwise
+  fall back to a local Codex launch through the best slot.
 - `cat file | cx "summarize this"`: pass stdin into Codex as prompt context.
 - `cx status`: query all configured slots concurrently.
 - `cx stats`: summarize local Codex token usage from `state_5.sqlite`.
 - `cx add` / `cx login` / `cx remove`: manage isolated Codex slots.
 - `cx select`: print the best slot name for scripts.
 - `cx desktop`: launch Codex Desktop through a selected slot.
-- `cx --target <name>`: launch through a named target-specific slot group and
-  override set.
-- `cx --managed`: launch Codex under a cx foreground supervisor that can rotate
-  slots and resume the same session after a rate limit.
-- `cx managed status` / `cx managed rotate` / `cx managed resume`: inspect or
-  control the current managed Codex supervisor.
+- `cx --target <name>`: use a named target-specific slot group for local
+  fallback; when service remote is active, the service target wins.
 - `cx serve start` / `cx serve stop`: manage a foreground loopback Codex
   app-server through a selected slot.
 - `cx service start`: run app-server and the Telegram adapter under one local
@@ -130,41 +127,26 @@ cx --slot bus1 -m gpt-5.4
 cx --target research -m gpt-5.5
 ```
 
-For a clean `cx` launch with no prompt, pipe, or forwarded Codex args, `cx`
-checks the latest unarchived Codex session for the current working directory. If
-that session is not currently open in another Codex TUI, `cx` runs
-`codex resume <session-id>` automatically. If the latest session is active, `cx`
-leaves the arguments unchanged so Codex starts a new session. Explicit Codex
-subcommands such as `resume`, `exec`, `review`, `help`, and remote app-server
-launches are never rewritten.
+For a clean `cx` launch or an explicit `cx resume <session-id>`, `cx` first
+asks the service app-server to resolve the thread for the current working
+directory. If the service is unavailable, local fallback preserves the old
+auto-resume behavior: clean launches inspect the latest unarchived local Codex
+session and run `codex resume <session-id>` when it is safe. Prompt-bearing
+launches, `exec`, `review`, `help`, and user-supplied remote app-server
+launches are not rewritten by cx.
 
-Launch Codex under a foreground cx supervisor:
+By default, `cx` tries to attach the local TUI to the cx service app-server:
 
 ```bash
-cx --managed
-cx --managed --target research
-cx --managed resume <session-id>
-cx managed status
-cx managed rotate
-cx managed rotate --slot bus2
-cx managed resume <session-id> --continue
+cx service start --no-telegram
+cx
+cx resume <session-id>
 ```
 
-Managed mode is opt-in. Normal `cx` still uses the fast `exec` path. In managed
-mode, cx starts Codex inside a PTY, forwards terminal input/output, writes a
-private supervisor state file under `<profile-manager>/serve/supervisors/`, and
-keeps enough parent state to restart Codex with another slot. If cx sees a
-rate-limit signal, it re-checks the current slot's usage endpoint before
-rotating. When the endpoint confirms exhaustion, the current slot is placed on a
-cooldown and cx restarts Codex as `codex resume <session-id>` through the next
-usable slot. For API-key or external-provider slots, obvious provider 429
-signals use a short low-confidence cooldown.
-
-When the rollout shows the interrupted turn had no tool or file side effects,
-managed mode appends a continuation prompt after resume. Otherwise it resumes
-the session without replaying the unfinished prompt. `cx managed rotate` and
-`cx managed resume` target the newest managed supervisor in the current working
-directory by default, so another terminal window is not controlled by mistake.
+The service owns slot selection, session restore, and app-server rotation. The
+foreground `cx` process starts the real Codex TUI as a remote client. If the
+service app-server is missing, stale, or cannot resolve the requested thread,
+`cx` prints a warning and falls back to a local slot launch.
 
 Pipe context into Codex:
 

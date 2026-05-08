@@ -11,6 +11,7 @@ mod install;
 mod output;
 mod paths;
 mod protocol_export;
+mod rate_limit;
 mod run;
 mod selector;
 mod serve;
@@ -18,7 +19,6 @@ mod service;
 mod session;
 mod slot;
 mod stats;
-mod supervisor;
 mod target;
 mod thread_resolver;
 mod transfer;
@@ -33,7 +33,6 @@ use clap::Parser;
 use cli::ChannelCommand;
 use cli::Cli;
 use cli::Command;
-use cli::ManagedCommand;
 use cli::ProtocolCommand;
 use cli::ServeCommand;
 use cli::ServiceCommand;
@@ -150,11 +149,11 @@ fn entry() -> Result<()> {
             ServiceCommand::Install(args) => service::install(args)?,
             ServiceCommand::Uninstall(args) => service::uninstall(args)?,
         },
-        Command::Managed(args) => match args.command {
-            ManagedCommand::Status(args) => supervisor::control::status(args)?,
-            ManagedCommand::Rotate(args) => supervisor::control::rotate(args)?,
-            ManagedCommand::Resume(args) => supervisor::control::resume(args)?,
-        },
+        Command::Managed(_) => {
+            anyhow::bail!(
+                "`cx managed` was removed; `cx` now connects to the cx service app-server by default. Start it with `cx service start --no-telegram`."
+            );
+        }
         Command::Protocol(args) => match args.command {
             ProtocolCommand::Export(args) => protocol_export::export(args)?,
         },

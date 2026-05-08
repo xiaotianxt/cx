@@ -1,14 +1,8 @@
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OutputLimitKind {
-    Usage,
-    Provider,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct OutputRateLimitSignal {
-    pub(crate) kind: OutputLimitKind,
+pub(crate) struct StreamRateLimitSignal {
+    pub(crate) safe_to_continue: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -16,38 +10,6 @@ pub(crate) struct TurnSideEffectState {
     user_message_seen: bool,
     assistant_message_seen: bool,
     side_effect_seen: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct StreamRateLimitSignal {
-    pub(crate) safe_to_continue: bool,
-}
-
-pub(crate) fn classify_output(text: &str) -> Option<OutputRateLimitSignal> {
-    let lower = text.to_ascii_lowercase();
-    if lower.contains("too many requests")
-        || lower.contains("quota exceeded")
-        || lower.contains("server overloaded")
-        || lower.contains("http 429")
-        || lower.contains(" 429")
-    {
-        return Some(OutputRateLimitSignal {
-            kind: OutputLimitKind::Provider,
-        });
-    }
-
-    if lower.contains("usage limit")
-        || lower.contains("rate limit")
-        || lower.contains("limit reached")
-        || lower.contains("you've hit your")
-        || lower.contains("you have hit your")
-    {
-        return Some(OutputRateLimitSignal {
-            kind: OutputLimitKind::Usage,
-        });
-    }
-
-    None
 }
 
 pub(crate) fn inspect_stream_fragment(
@@ -183,18 +145,6 @@ fn non_empty_json_value(value: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn output_classifier_distinguishes_usage_and_provider_limits() {
-        assert_eq!(
-            classify_output("You've hit your usage limit").map(|signal| signal.kind),
-            Some(OutputLimitKind::Usage)
-        );
-        assert_eq!(
-            classify_output("HTTP 429 too many requests").map(|signal| signal.kind),
-            Some(OutputLimitKind::Provider)
-        );
-    }
 
     #[test]
     fn app_stream_rate_limit_without_side_effect_is_safe_to_continue() {

@@ -31,7 +31,6 @@ use serde_json::json;
 use serde_json::Value;
 
 use crate::app_server::AppServerClient;
-#[cfg(test)]
 use crate::app_server::AppStreamEvent;
 use crate::app_server::AppThreadSummary;
 use crate::app_server::ApprovalRequest;
@@ -667,6 +666,10 @@ fn send_watch_events_for_binding(
     binding: &TelegramBinding,
 ) -> Result<WatchSendResult> {
     let stored = state.binding_for_route(route, binding.alias.as_deref());
+    let default_cwd = stored
+        .and_then(|stored| stored.app_thread_cwd.as_deref())
+        .or(binding.app_thread_cwd.as_deref());
+    let events = events_with_default_cwd(events, default_cwd);
     let activity_state = stored
         .and_then(|stored| stored.watch_activity.clone())
         .or_else(|| binding.watch_activity.clone());
@@ -688,6 +691,48 @@ fn send_watch_events_for_binding(
         status_state,
         last_agent_message,
     )
+}
+
+fn events_with_default_cwd(
+    events: Vec<RolloutObserveEvent>,
+    default_cwd: Option<&str>,
+) -> Vec<RolloutObserveEvent> {
+    let Some(default_cwd) = default_cwd.map(str::trim).filter(|cwd| !cwd.is_empty()) else {
+        return events;
+    };
+    events
+        .into_iter()
+        .map(|event| match event {
+            RolloutObserveEvent::Stream(event) => {
+                RolloutObserveEvent::Stream(stream_event_with_default_cwd(event, default_cwd))
+            }
+            event => event,
+        })
+        .collect()
+}
+
+fn stream_event_with_default_cwd(event: AppStreamEvent, default_cwd: &str) -> AppStreamEvent {
+    match event {
+        AppStreamEvent::CommandStarted(mut command) => {
+            fill_default_command_cwd(&mut command.cwd, default_cwd);
+            AppStreamEvent::CommandStarted(command)
+        }
+        AppStreamEvent::CommandCompleted(mut command) => {
+            fill_default_command_cwd(&mut command.cwd, default_cwd);
+            AppStreamEvent::CommandCompleted(command)
+        }
+        event => event,
+    }
+}
+
+fn fill_default_command_cwd(cwd: &mut String, default_cwd: &str) {
+    if command_cwd_is_missing(cwd) {
+        *cwd = default_cwd.to_string();
+    }
+}
+
+fn command_cwd_is_missing(cwd: &str) -> bool {
+    matches!(cwd.trim(), "" | "<unknown>")
 }
 
 fn select_watch_source(

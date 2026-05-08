@@ -1647,6 +1647,42 @@ fn activity_watch_text_renders_file_changes_like_tui() {
 }
 
 #[test]
+fn watched_file_changes_use_binding_cwd_when_event_cwd_is_missing() {
+    let events = events_with_default_cwd(
+        vec![RolloutObserveEvent::Stream(AppStreamEvent::CommandCompleted(
+            CommandExecution {
+                item_id: "patch-1".to_string(),
+                command: "apply_patch".to_string(),
+                cwd: "<unknown>".to_string(),
+                activity: Some(CommandActivity {
+                    verb: "Edited".to_string(),
+                    target: "/Users/yupeit/Develop.localized/ra/copyright/scripts/export-qualtrics-metrics.cjs (+1 -0)"
+                        .to_string(),
+                }),
+                status: CommandExecutionStatus::Completed,
+                exit_code: None,
+                duration_ms: None,
+                aggregated_output: None,
+            },
+        ))],
+        Some("/Users/yupeit/Develop.localized/ra/copyright"),
+    );
+    let RolloutObserveEvent::Stream(AppStreamEvent::CommandCompleted(command)) =
+        events.into_iter().next().unwrap()
+    else {
+        panic!("expected completed command");
+    };
+
+    let mut panel = TelegramActivityPanel::new();
+    panel.apply_execution(command);
+
+    assert_eq!(
+        activity_watch_text(&panel),
+        "• **Edited** `scripts/export-qualtrics-metrics.cjs` (+1 -0)"
+    );
+}
+
+#[test]
 fn rollout_observe_event_reads_update_plan_as_activity() {
     let event = rollout_observe_event(
         r#"{"type":"response_item","payload":{"type":"function_call","name":"update_plan","arguments":"{\"explanation\":\"Converging on the TUI transcript model.\",\"plan\":[{\"step\":\"Mirror activity cells\",\"status\":\"completed\"},{\"step\":\"Ship release\",\"status\":\"in_progress\"}]}","call_id":"plan-1"}}"#,

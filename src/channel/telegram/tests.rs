@@ -294,6 +294,25 @@ fn portal_keyboard_uses_observe_callbacks() {
 }
 
 #[test]
+fn app_thread_binding_lookup_reuses_existing_topic() {
+    let mut state = TelegramState::empty();
+    let mut portal_binding = manual_binding(-10042, None);
+    portal_binding.app_thread_id = Some("thread-1".to_string());
+    let mut topic_binding = manual_binding(-10042, Some(77));
+    topic_binding.app_thread_id = Some("thread-1".to_string());
+    topic_binding.topic_created_by_adapter = true;
+    state.bindings.push(portal_binding);
+    state.bindings.push(topic_binding);
+
+    let binding = state
+        .app_thread_binding_for_chat(-10042, "thread-1")
+        .unwrap();
+
+    assert_eq!(binding.message_thread_id, Some(77));
+    assert!(binding.topic_created_by_adapter);
+}
+
+#[test]
 fn filter_portal_entries_keeps_registry_order_and_limits() {
     let entries = vec![
         AppThreadPortalEntry {
@@ -835,7 +854,7 @@ fn forum_topic_edit_updates_title_metadata() {
 fn app_server_history_watch_establishes_cursor_without_replaying_existing_turns() {
     let turns = vec![json!({"id": "turn-1", "items": [], "status": "completed"})];
 
-    let (events, latest) = app_server_history_events_since(&turns, None);
+    let (events, latest) = app_server_history_events_since(&turns, None, false);
 
     assert!(events.is_empty());
     assert_eq!(latest.as_deref(), Some("turn-1"));
@@ -856,7 +875,7 @@ fn app_server_history_watch_replays_turns_after_last_seen_cursor() {
         }),
     ];
 
-    let (events, latest) = app_server_history_events_since(&turns, Some("turn-1"));
+    let (events, latest) = app_server_history_events_since(&turns, Some("turn-1"), false);
 
     assert_eq!(latest.as_deref(), Some("turn-2"));
     assert_eq!(
@@ -873,6 +892,41 @@ fn app_server_history_watch_replays_turns_after_last_seen_cursor() {
             },
         ]
     );
+}
+
+#[test]
+fn app_server_history_watch_closes_active_cursor_when_terminal_was_missed() {
+    let turns = vec![json!({
+        "id": "turn-1",
+        "status": "interrupted",
+        "durationMs": 42,
+        "items": [
+            {"agentMessage": {"id": "a1", "text": "stopped"}}
+        ]
+    })];
+
+    let (events, latest) = app_server_history_events_since(&turns, Some("turn-1"), true);
+
+    assert_eq!(latest.as_deref(), Some("turn-1"));
+    assert_eq!(
+        events,
+        vec![WatchEvent::Terminal {
+            turn_id: Some("turn-1".to_string()),
+            terminal: WatchTerminal::Aborted,
+            duration_ms: Some(42),
+            last_agent_message: Some("stopped".to_string()),
+        }]
+    );
+}
+
+#[test]
+fn app_server_history_watch_does_not_repeat_terminal_for_inactive_cursor() {
+    let turns = vec![json!({"id": "turn-1", "items": [], "status": "completed"})];
+
+    let (events, latest) = app_server_history_events_since(&turns, Some("turn-1"), false);
+
+    assert_eq!(latest.as_deref(), Some("turn-1"));
+    assert!(events.is_empty());
 }
 
 #[test]

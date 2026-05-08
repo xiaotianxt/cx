@@ -243,6 +243,12 @@ pub(super) struct TelegramStatusState {
     active: bool,
 }
 
+impl TelegramStatusState {
+    pub(super) fn is_active(&self) -> bool {
+        self.active
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(super) enum TelegramTurnTerminal {

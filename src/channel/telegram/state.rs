@@ -168,6 +168,26 @@ impl TelegramState {
         })
     }
 
+    pub(super) fn app_thread_binding_for_chat(
+        &self,
+        chat_id: i64,
+        thread_id: &str,
+    ) -> Option<&TelegramBinding> {
+        self.bindings
+            .iter()
+            .find(|binding| {
+                binding.chat_id == chat_id
+                    && binding.message_thread_id.is_some()
+                    && binding.app_thread_id.as_deref() == Some(thread_id)
+            })
+            .or_else(|| {
+                self.bindings.iter().find(|binding| {
+                    binding.chat_id == chat_id
+                        && binding.app_thread_id.as_deref() == Some(thread_id)
+                })
+            })
+    }
+
     pub(super) fn bind_route(
         &mut self,
         paths: &ManagerPaths,

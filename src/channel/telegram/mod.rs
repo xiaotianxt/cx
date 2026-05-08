@@ -110,6 +110,8 @@ const PORTAL_TOPIC_TITLE: &str = "cx portal";
 const PORTAL_APP_SERVER_TIMEOUT: Duration = Duration::from_millis(750);
 const WATCH_INTRO_HISTORY_MESSAGES: usize = 6;
 const WATCH_DRAIN_MAX_LINES: usize = 1000;
+const WATCH_APP_SERVER_READ_TIMEOUT: Duration = Duration::from_secs(2);
+const WATCH_ACTIVE_DRAIN_BUDGET: Duration = Duration::from_secs(30);
 
 pub fn run(args: TelegramRunArgs) -> Result<()> {
     validate_timeouts(args.poll_timeout, args.request_timeout)?;
@@ -510,7 +512,7 @@ fn drain_watched_app_server_binding(
     let cwd = binding.app_thread_cwd.as_deref().or(session_app_thread
         .as_ref()
         .map(|app_thread| app_thread.cwd.as_str()));
-    let mut client = connect_app_server_with_timeout(paths, Duration::from_millis(750))?;
+    let mut client = connect_app_server_with_timeout(paths, WATCH_APP_SERVER_READ_TIMEOUT)?;
     let server = serve::ready_app_server(paths)?;
     let resolver_cwd = cwd
         .map(PathBuf::from)
@@ -550,39 +552,61 @@ fn drain_watched_app_server_binding(
         .or(cwd);
     let _ = client.thread_resume_with_path(&live_thread_id, None, live_cwd, true)?;
     let read = client.thread_read(&live_thread_id, true)?;
-    let (mut events, mut latest_app_turn_id) =
-        app_server_history_events_since(&read.turns, binding.watch_app_last_turn_id.as_deref());
+    let needs_terminal_for_last_seen = binding
+        .watch_status
+        .as_ref()
+        .is_some_and(|status| status.is_active());
+    let (mut events, mut latest_app_turn_id) = app_server_history_events_since(
+        &read.turns,
+        binding.watch_app_last_turn_id.as_deref(),
+        needs_terminal_for_last_seen,
+    );
     if latest_app_turn_id.is_none() {
         latest_app_turn_id = binding.watch_app_last_turn_id.clone();
     }
-    client.drain_thread_events(
-        &live_thread_id,
-        None,
-        WATCH_DRAIN_MAX_LINES,
-        |event| {
-            match event {
-                ParsedServerEvent::Stream(event) => {
-                    events.push(WatchEvent::Stream(event));
+    let active_at_read = read.summary.active || read.summary.active_turn_id.is_some();
+    let drain_started = Instant::now();
+    let mut terminal_seen = events
+        .iter()
+        .any(|event| matches!(event, WatchEvent::Terminal { .. }));
+    loop {
+        let drained = client.drain_thread_events(
+            &live_thread_id,
+            None,
+            WATCH_DRAIN_MAX_LINES,
+            |event| {
+                match event {
+                    ParsedServerEvent::Stream(event) => {
+                        events.push(WatchEvent::Stream(event));
+                    }
+                    ParsedServerEvent::TurnCompleted { turn_id, .. } => {
+                        terminal_seen = true;
+                        latest_app_turn_id = Some(turn_id.clone());
+                        events.push(WatchEvent::Terminal {
+                            turn_id: Some(turn_id),
+                            terminal: WatchTerminal::Completed,
+                            duration_ms: None,
+                            last_agent_message: None,
+                        });
+                    }
+                    ParsedServerEvent::ApprovalRequest(_) => {
+                        events.push(WatchEvent::Stream(AppStreamEvent::Info(
+                            "Codex is waiting for approval in another client.".to_string(),
+                        )));
+                    }
                 }
-                ParsedServerEvent::TurnCompleted { turn_id, .. } => {
-                    latest_app_turn_id = Some(turn_id.clone());
-                    events.push(WatchEvent::Terminal {
-                        turn_id: Some(turn_id),
-                        terminal: WatchTerminal::Completed,
-                        duration_ms: None,
-                        last_agent_message: None,
-                    });
-                }
-                ParsedServerEvent::ApprovalRequest(_) => {
-                    events.push(WatchEvent::Stream(AppStreamEvent::Info(
-                        "Codex is waiting for approval in another client.".to_string(),
-                    )));
-                }
-            }
-            Ok(())
-        },
-        |_approval| Ok(None),
-    )?;
+                Ok(())
+            },
+            |_approval| Ok(None),
+        )?;
+        if terminal_seen || !active_at_read || drain_started.elapsed() >= WATCH_ACTIVE_DRAIN_BUDGET
+        {
+            break;
+        }
+        if drained == 0 {
+            continue;
+        }
+    }
     let _ = client.thread_unsubscribe(&live_thread_id);
     let send_result = if events.is_empty() {
         None
@@ -606,6 +630,7 @@ fn drain_watched_app_server_binding(
 fn app_server_history_events_since(
     turns: &[Value],
     last_seen_turn_id: Option<&str>,
+    needs_terminal_for_last_seen: bool,
 ) -> (Vec<WatchEvent>, Option<String>) {
     let latest_turn_id = turns
         .last()
@@ -623,6 +648,17 @@ fn app_server_history_events_since(
         let turn_id = history_turn_id(turn).map(str::to_string);
         if turn_id.as_deref() == Some(last_seen_turn_id) {
             seen_cursor = true;
+            if needs_terminal_for_last_seen {
+                if let Some(terminal) = history_turn_terminal(turn) {
+                    latest_emitted = turn_id.clone();
+                    events.push(WatchEvent::Terminal {
+                        turn_id,
+                        terminal,
+                        duration_ms: turn.get("durationMs").and_then(Value::as_i64),
+                        last_agent_message: history_turn_last_agent_message(turn),
+                    });
+                }
+            }
             continue;
         }
         if !seen_cursor
@@ -668,7 +704,9 @@ fn history_turn_terminal(turn: &Value) -> Option<WatchTerminal> {
     let status = turn.get("status").and_then(Value::as_str)?;
     match normalize_history_kind(status).as_str() {
         "completed" | "succeeded" | "success" => Some(WatchTerminal::Completed),
-        "failed" | "cancelled" | "canceled" | "aborted" => Some(WatchTerminal::Aborted),
+        "failed" | "cancelled" | "canceled" | "aborted" | "interrupted" => {
+            Some(WatchTerminal::Aborted)
+        }
         _ => None,
     }
 }
@@ -1596,8 +1634,18 @@ fn observe_portal_thread(
         )));
     }
 
-    let mut topic_created_by_adapter = false;
-    let effective_route = if should_create_work_topic(state, route, chat_is_forum) {
+    let existing_thread_binding = state
+        .app_thread_binding_for_chat(route.chat_id, thread_id)
+        .cloned();
+    let mut topic_created_by_adapter = existing_thread_binding
+        .as_ref()
+        .is_some_and(|binding| binding.topic_created_by_adapter);
+    let effective_route = if let Some(binding) = existing_thread_binding.as_ref() {
+        TelegramRoute {
+            chat_id: binding.chat_id,
+            message_thread_id: binding.message_thread_id,
+        }
+    } else if should_create_work_topic(state, route, chat_is_forum) {
         if let Some(notifier) = options.notifier {
             let topic_id = match create_forum_topic(
                 notifier.client,

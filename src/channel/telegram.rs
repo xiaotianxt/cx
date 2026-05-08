@@ -118,11 +118,22 @@ struct TelegramBinding {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     watch_rollout_offset: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    watch_source: Option<TelegramWatchSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    watch_last_agent_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     watch_activity: Option<TelegramActivityState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     watch_thinking: Option<TelegramThinkingState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     watch_status: Option<TelegramStatusState>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+enum TelegramWatchSource {
+    Proxy,
+    Rollout,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -400,6 +411,8 @@ impl TelegramState {
             topic_created_by_adapter: false,
             watch_proxy_offset: None,
             watch_rollout_offset: None,
+            watch_source: None,
+            watch_last_agent_message: None,
             watch_activity: None,
             watch_thinking: None,
             watch_status: None,
@@ -428,6 +441,8 @@ impl TelegramState {
             stored.topic_created_by_adapter = topic_created_by_adapter;
             stored.watch_proxy_offset = None;
             stored.watch_rollout_offset = None;
+            stored.watch_source = None;
+            stored.watch_last_agent_message = None;
             stored.watch_activity = None;
             stored.watch_thinking = None;
             stored.watch_status = None;
@@ -915,49 +930,62 @@ fn drain_watched_binding(
     let Some(thread_id) = binding.app_thread_id.as_deref() else {
         return Ok(());
     };
-    let proxy_path = proxy_event_log_path(paths);
-    if proxy_path.exists() {
-        let proxy_len = fs::metadata(&proxy_path)
-            .with_context(|| format!("stat proxy event log {}", proxy_path.display()))?
-            .len();
-        let proxy_offset = binding
-            .watch_proxy_offset
-            .filter(|offset| *offset <= proxy_len)
-            .unwrap_or(proxy_len);
-        let proxy_drain =
-            proxy_events_since(&proxy_path, proxy_offset, WATCH_DRAIN_MAX_LINES, thread_id)?;
-        let activity_state = state
-            .binding_for_route(route, binding.alias.as_deref())
-            .and_then(|stored| stored.watch_activity.clone())
-            .or_else(|| binding.watch_activity.clone());
-        let status_state = state
-            .binding_for_route(route, binding.alias.as_deref())
-            .and_then(|stored| stored.watch_status.clone())
-            .or_else(|| binding.watch_status.clone());
-        let thinking_state = state
-            .binding_for_route(route, binding.alias.as_deref())
-            .and_then(|stored| stored.watch_thinking.clone())
-            .or_else(|| binding.watch_thinking.clone());
-        let proxy_had_events = !proxy_drain.events.is_empty();
-        let send_result = send_watch_events(
-            route,
-            notifier,
-            proxy_drain.events,
-            activity_state,
-            thinking_state,
-            status_state,
-        )?;
-        if let Some(stored) = state.binding_for_route_mut(route, binding.alias.as_deref()) {
-            stored.watch_proxy_offset = Some(proxy_drain.next_offset);
-            stored.watch_activity = send_result.activity;
-            stored.watch_thinking = send_result.thinking;
-            stored.watch_status = send_result.status;
-        }
-        if send_result.sent_any && proxy_had_events {
-            return Ok(());
-        }
+    let source = select_watch_source(paths, thread_id, binding.watch_source);
+    if let Some(stored) = state.binding_for_route_mut(route, binding.alias.as_deref()) {
+        stored.watch_source = Some(source);
     }
 
+    match source {
+        TelegramWatchSource::Proxy => {
+            drain_watched_proxy_binding(paths, state, route, binding, notifier, thread_id)
+        }
+        TelegramWatchSource::Rollout => {
+            drain_watched_rollout_binding(paths, state, route, binding, notifier, thread_id)
+        }
+    }
+}
+
+fn drain_watched_proxy_binding(
+    paths: &ManagerPaths,
+    state: &mut TelegramState,
+    route: &TelegramRoute,
+    binding: &TelegramBinding,
+    notifier: &TelegramNotifier<'_>,
+    thread_id: &str,
+) -> Result<()> {
+    let proxy_path = proxy_event_log_path(paths);
+    if !proxy_path.exists() {
+        return Ok(());
+    }
+    let proxy_len = fs::metadata(&proxy_path)
+        .with_context(|| format!("stat proxy event log {}", proxy_path.display()))?
+        .len();
+    let proxy_offset = binding
+        .watch_proxy_offset
+        .filter(|offset| *offset <= proxy_len)
+        .unwrap_or(proxy_len);
+    let proxy_drain =
+        proxy_events_since(&proxy_path, proxy_offset, WATCH_DRAIN_MAX_LINES, thread_id)?;
+    let send_result =
+        send_watch_events_for_binding(route, notifier, proxy_drain.events, state, binding)?;
+    if let Some(stored) = state.binding_for_route_mut(route, binding.alias.as_deref()) {
+        stored.watch_proxy_offset = Some(proxy_drain.next_offset);
+        stored.watch_activity = send_result.activity;
+        stored.watch_thinking = send_result.thinking;
+        stored.watch_status = send_result.status;
+        stored.watch_last_agent_message = send_result.last_agent_message;
+    }
+    Ok(())
+}
+
+fn drain_watched_rollout_binding(
+    paths: &ManagerPaths,
+    state: &mut TelegramState,
+    route: &TelegramRoute,
+    binding: &TelegramBinding,
+    notifier: &TelegramNotifier<'_>,
+    thread_id: &str,
+) -> Result<()> {
     let Some(path) = rollout_path_for_thread(paths, thread_id) else {
         return Ok(());
     };
@@ -975,41 +1003,53 @@ fn drain_watched_binding(
     let start_offset =
         watch_rollout_start_offset(binding.watch_rollout_offset, file_len, active_turn_offset);
     let drain = rollout_events_since(&path, start_offset, WATCH_DRAIN_MAX_LINES)?;
-
-    let activity_state = state
-        .binding_for_route(route, binding.alias.as_deref())
-        .and_then(|stored| stored.watch_activity.clone())
-        .or_else(|| binding.watch_activity.clone());
-    let status_state = state
-        .binding_for_route(route, binding.alias.as_deref())
-        .and_then(|stored| stored.watch_status.clone())
-        .or_else(|| binding.watch_status.clone());
-    let thinking_state = state
-        .binding_for_route(route, binding.alias.as_deref())
-        .and_then(|stored| stored.watch_thinking.clone())
-        .or_else(|| binding.watch_thinking.clone());
-    let send_result = send_watch_events(
-        route,
-        notifier,
-        drain.events,
-        activity_state,
-        thinking_state,
-        status_state,
-    )?;
+    let send_result = send_watch_events_for_binding(route, notifier, drain.events, state, binding)?;
     if let Some(stored) = state.binding_for_route_mut(route, binding.alias.as_deref()) {
         stored.watch_rollout_offset = Some(drain.next_offset);
         stored.watch_activity = send_result.activity;
         stored.watch_thinking = send_result.thinking;
         stored.watch_status = send_result.status;
+        stored.watch_last_agent_message = send_result.last_agent_message;
     }
     Ok(())
 }
 
+fn send_watch_events_for_binding(
+    route: &TelegramRoute,
+    notifier: &TelegramNotifier<'_>,
+    events: Vec<RolloutObserveEvent>,
+    state: &TelegramState,
+    binding: &TelegramBinding,
+) -> Result<WatchSendResult> {
+    let stored = state.binding_for_route(route, binding.alias.as_deref());
+    let activity_state = stored
+        .and_then(|stored| stored.watch_activity.clone())
+        .or_else(|| binding.watch_activity.clone());
+    let status_state = stored
+        .and_then(|stored| stored.watch_status.clone())
+        .or_else(|| binding.watch_status.clone());
+    let thinking_state = stored
+        .and_then(|stored| stored.watch_thinking.clone())
+        .or_else(|| binding.watch_thinking.clone());
+    let last_agent_message = stored
+        .and_then(|stored| stored.watch_last_agent_message.clone())
+        .or_else(|| binding.watch_last_agent_message.clone());
+    send_watch_events(
+        route,
+        notifier,
+        events,
+        activity_state,
+        thinking_state,
+        status_state,
+        last_agent_message,
+    )
+}
+
 struct WatchSendResult {
-    sent_any: bool,
     activity: Option<TelegramActivityState>,
     thinking: Option<TelegramThinkingState>,
     status: Option<TelegramStatusState>,
+    last_agent_message: Option<String>,
 }
 
 fn send_watch_events(
@@ -1019,12 +1059,17 @@ fn send_watch_events(
     activity: Option<TelegramActivityState>,
     thinking: Option<TelegramThinkingState>,
     status: Option<TelegramStatusState>,
+    last_agent_message: Option<String>,
 ) -> Result<WatchSendResult> {
     let mut sink =
         TelegramWatchSink::new_best_effort(notifier, route.clone(), activity, thinking, status);
-    let mut last_sent_agent_message = None::<String>;
+    let mut last_sent_agent_message = last_agent_message;
     for event in events {
         match event {
+            RolloutObserveEvent::Stream(AppStreamEvent::TurnStarted) => {
+                last_sent_agent_message = None;
+                sink.push_event(AppStreamEvent::TurnStarted)?;
+            }
             RolloutObserveEvent::Stream(AppStreamEvent::AgentDelta(message)) => {
                 send_rollout_agent_message(&message, &mut last_sent_agent_message, &mut |event| {
                     sink.push_event(event)
@@ -1032,9 +1077,10 @@ fn send_watch_events(
             }
             RolloutObserveEvent::Stream(event) => sink.push_event(event)?,
             RolloutObserveEvent::Terminal {
-                last_agent_message, ..
+                duration_ms,
+                last_agent_message,
+                ..
             } => {
-                sink.turn_completed()?;
                 if let Some(message) = last_agent_message {
                     send_rollout_agent_message(
                         &message,
@@ -1042,16 +1088,31 @@ fn send_watch_events(
                         &mut |event| sink.push_event(event),
                     )?;
                 }
+                sink.turn_completed(duration_ms)?;
             }
         }
     }
     sink.flush_pending()?;
     Ok(WatchSendResult {
-        sent_any: sink.sent_any(),
         activity: sink.activity_state(),
         thinking: sink.thinking_state(),
         status: sink.status_state(),
+        last_agent_message: last_sent_agent_message,
     })
+}
+
+fn select_watch_source(
+    paths: &ManagerPaths,
+    thread_id: &str,
+    stored_source: Option<TelegramWatchSource>,
+) -> TelegramWatchSource {
+    if rollout_path_for_thread(paths, thread_id).is_some() {
+        return TelegramWatchSource::Rollout;
+    }
+    match stored_source {
+        Some(TelegramWatchSource::Rollout) => TelegramWatchSource::Rollout,
+        Some(TelegramWatchSource::Proxy) | None => TelegramWatchSource::Proxy,
+    }
 }
 
 fn watch_rollout_start_offset(
@@ -1992,6 +2053,8 @@ fn initialize_watch_cursor(paths: &ManagerPaths, binding: &mut TelegramBinding) 
     binding.watch_activity = None;
     binding.watch_thinking = None;
     binding.watch_status = None;
+    binding.watch_source = None;
+    binding.watch_last_agent_message = None;
     if binding.watch_proxy_offset.is_none() {
         if let Ok(metadata) = fs::metadata(proxy_event_log_path(paths)) {
             binding.watch_proxy_offset = Some(metadata.len());
@@ -2699,7 +2762,7 @@ fn run_codex_turn(
             );
     }
     if let Some(sink) = sink.as_mut() {
-        sink.turn_completed()?;
+        sink.turn_completed(None)?;
         let finish_start = Instant::now();
         sink.flush_pending()?;
         if trace_timings {
@@ -2758,6 +2821,7 @@ enum RolloutObserveEvent {
     Terminal {
         turn_id: Option<String>,
         terminal: ObserveTerminal,
+        duration_ms: Option<i64>,
         last_agent_message: Option<String>,
     },
 }
@@ -2908,6 +2972,7 @@ where
             Some(RolloutObserveEvent::Terminal {
                 turn_id,
                 terminal,
+                duration_ms: _,
                 last_agent_message,
             }) if turn_id.as_deref().is_none_or(|id| id == active_turn_id) => {
                 if let Some(message) = last_agent_message {
@@ -3036,6 +3101,7 @@ fn proxy_log_observe_event(line: &str, thread_id: &str) -> Option<RolloutObserve
         ParsedServerEvent::TurnCompleted { turn_id } => Some(RolloutObserveEvent::Terminal {
             turn_id: Some(turn_id),
             terminal: ObserveTerminal::Completed,
+            duration_ms: None,
             last_agent_message: None,
         }),
     }
@@ -3167,6 +3233,7 @@ fn rollout_observe_event(line: &str) -> Option<RolloutObserveEvent> {
                 .and_then(Value::as_str)
                 .map(str::to_string),
             terminal: ObserveTerminal::Completed,
+            duration_ms: rollout_duration_ms(value),
             last_agent_message: value
                 .get("last_agent_message")
                 .and_then(Value::as_str)
@@ -3178,6 +3245,7 @@ fn rollout_observe_event(line: &str) -> Option<RolloutObserveEvent> {
                 .and_then(Value::as_str)
                 .map(str::to_string),
             terminal: ObserveTerminal::Aborted,
+            duration_ms: rollout_duration_ms(value),
             last_agent_message: None,
         }),
         _ => None,
@@ -4752,8 +4820,8 @@ impl<'a> TelegramWatchSink<'a> {
         Ok(())
     }
 
-    fn turn_completed(&mut self) -> Result<()> {
-        self.status.finish();
+    fn turn_completed(&mut self, duration_ms: Option<i64>) -> Result<()> {
+        self.status.finish_with_duration(duration_ms);
         self.thinking.finish();
         let had_thinking = self.thinking.message_id().is_some();
         if flush_thinking_panel(
@@ -6291,6 +6359,8 @@ mod tests {
             topic_created_by_adapter: false,
             watch_proxy_offset: None,
             watch_rollout_offset: None,
+            watch_source: None,
+            watch_last_agent_message: None,
             watch_activity: None,
             watch_thinking: None,
             watch_status: None,
@@ -6440,6 +6510,8 @@ mod tests {
             topic_created_by_adapter: false,
             watch_proxy_offset: None,
             watch_rollout_offset: None,
+            watch_source: None,
+            watch_last_agent_message: None,
             watch_activity: None,
             watch_thinking: None,
             watch_status: None,
@@ -6470,6 +6542,8 @@ mod tests {
             topic_created_by_adapter: false,
             watch_proxy_offset: None,
             watch_rollout_offset: None,
+            watch_source: None,
+            watch_last_agent_message: None,
             watch_activity: None,
             watch_thinking: None,
             watch_status: None,
@@ -7255,6 +7329,72 @@ mod tests {
     }
 
     #[test]
+    fn watch_source_prefers_registered_rollout_thread() {
+        let paths = temp_paths("watch-source-rollout");
+        fs::create_dir_all(&paths.base_codex_home).unwrap();
+        let rollout = paths.base_codex_home.join("rollout.jsonl");
+        let conn = Connection::open(paths.base_codex_home.join("state_5.sqlite")).unwrap();
+        conn.execute(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, archived INTEGER NOT NULL DEFAULT 0)",
+                [],
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO threads (id, rollout_path, archived) VALUES (?1, ?2, 0)",
+            params!["thread-rollout", rollout.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            select_watch_source(&paths, "thread-rollout", None),
+            TelegramWatchSource::Rollout
+        );
+    }
+
+    #[test]
+    fn watch_source_upgrades_proxy_when_rollout_registration_appears() {
+        let paths = temp_paths("watch-source-upgrade");
+        fs::create_dir_all(&paths.base_codex_home).unwrap();
+        let rollout = paths.base_codex_home.join("rollout.jsonl");
+        let conn = Connection::open(paths.base_codex_home.join("state_5.sqlite")).unwrap();
+        conn.execute(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL, archived INTEGER NOT NULL DEFAULT 0)",
+                [],
+            )
+            .unwrap();
+        conn.execute(
+            "INSERT INTO threads (id, rollout_path, archived) VALUES (?1, ?2, 0)",
+            params!["thread-upgrade", rollout.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            select_watch_source(&paths, "thread-upgrade", Some(TelegramWatchSource::Proxy)),
+            TelegramWatchSource::Rollout
+        );
+    }
+
+    #[test]
+    fn watch_source_uses_proxy_without_rollout_transcript() {
+        let paths = temp_paths("watch-source-proxy");
+
+        assert_eq!(
+            select_watch_source(&paths, "thread-proxy", None),
+            TelegramWatchSource::Proxy
+        );
+    }
+
+    #[test]
+    fn watch_source_keeps_persisted_rollout_when_registration_is_temporarily_missing() {
+        let paths = temp_paths("watch-source-sticky-rollout");
+
+        assert_eq!(
+            select_watch_source(&paths, "thread-rollout", Some(TelegramWatchSource::Rollout)),
+            TelegramWatchSource::Rollout
+        );
+    }
+
+    #[test]
     fn open_tui_portal_entries_ignores_archived_idle_rollouts() {
         let paths = temp_paths("rollout-archived-idle");
         fs::create_dir_all(&paths.base_codex_home).unwrap();
@@ -7797,14 +7937,30 @@ mod tests {
         );
         assert_eq!(
             rollout_observe_event(
-                r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","last_agent_message":"done"}}"#,
+                r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","duration":{"secs":2,"nanos":500000000},"last_agent_message":"done"}}"#,
             ),
             Some(RolloutObserveEvent::Terminal {
                 turn_id: Some("turn-1".to_string()),
                 terminal: ObserveTerminal::Completed,
+                duration_ms: Some(2500),
                 last_agent_message: Some("done".to_string()),
             })
         );
+    }
+
+    #[test]
+    fn rollout_agent_message_dedupes_last_message_across_drains() {
+        let mut last_sent_agent_message = Some("done".to_string());
+        let mut events = Vec::<AppStreamEvent>::new();
+
+        send_rollout_agent_message("done", &mut last_sent_agent_message, &mut |event| {
+            events.push(event);
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(events.is_empty());
+        assert_eq!(last_sent_agent_message, Some("done".to_string()));
     }
 
     #[test]

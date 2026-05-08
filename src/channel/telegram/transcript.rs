@@ -98,12 +98,20 @@ impl TelegramStatusPanel {
         self.start_new_turn();
     }
 
-    pub(super) fn finish(&mut self) {
+    pub(super) fn finish_with_duration(&mut self, duration_ms: Option<i64>) {
         if !self.active {
             return;
         }
         self.active = false;
-        self.turn_finished_at_ms = Some(unix_millis());
+        self.turn_finished_at_ms = Some(
+            duration_ms
+                .filter(|duration| *duration >= 0)
+                .and_then(|duration| {
+                    self.turn_started_at_ms
+                        .map(|started| started.saturating_add(duration as u128))
+                })
+                .unwrap_or_else(unix_millis),
+        );
         self.dirty = true;
     }
 
@@ -1166,6 +1174,18 @@ mod tests {
         panel.ensure_active();
 
         assert_eq!(panel.turn_started_at_ms, Some(1000));
+    }
+
+    #[test]
+    fn status_finish_with_duration_uses_turn_elapsed_time() {
+        let mut panel = TelegramStatusPanel::new();
+        panel.turn_started_at_ms = Some(1000);
+        panel.active = true;
+
+        panel.finish_with_duration(Some(2500));
+
+        assert!(!panel.active);
+        assert_eq!(panel.turn_finished_at_ms, Some(3500));
     }
 
     #[test]

@@ -154,6 +154,7 @@ use self::transcript::TelegramStatusPanel;
 use self::transcript::TelegramThinkingPanel;
 #[cfg(test)]
 use self::transcript::TelegramTranscriptTarget;
+use self::transcript::TelegramTurnTerminal;
 use self::watch::send_watch_events;
 #[cfg(test)]
 use self::watch::telegram_retry_after_delay;
@@ -2367,7 +2368,7 @@ fn run_codex_turn(
             );
     }
     if let Some(sink) = sink.as_mut() {
-        sink.turn_completed(None)?;
+        sink.turn_completed(None, TelegramTurnTerminal::Done)?;
         let finish_start = Instant::now();
         sink.flush_pending()?;
         if trace_timings {
@@ -2382,7 +2383,7 @@ fn run_codex_turn(
     }
     Ok(CodexTurnOutput {
         assistant_text: turn.assistant_text,
-        streamed_to_telegram: sink.is_some_and(|sink| sink.assistant_sent_any()),
+        streamed_to_telegram: sink.is_some_and(|sink| sink.assistant_completed_text_sent()),
     })
 }
 

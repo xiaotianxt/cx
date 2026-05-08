@@ -1586,7 +1586,7 @@ fn watch_sink_does_not_move_persisted_status_without_new_tail_content() {
     let sink = TelegramWatchSink::new_best_effort(&notifier, route, None, None, status.to_state());
 
     assert!(!sink.status_needs_tail);
-    assert!(!sink.assistant_sent_any());
+    assert!(!sink.assistant_completed_text_sent());
 }
 
 #[test]
@@ -1643,6 +1643,48 @@ fn activity_watch_text_renders_file_changes_like_tui() {
     assert_eq!(
         activity_watch_text(&panel),
         "• **Edited** `src/channel/telegram.rs` (+12 -3)"
+    );
+}
+
+#[test]
+fn activity_watch_text_renders_move_path_like_tui() {
+    let event = rollout_observe_event(
+        r#"{"type":"event_msg","payload":{"type":"patch_apply_end","call_id":"patch-1","turn_id":"turn-1","cwd":"/tmp/project","changes":{"/tmp/project/src/old.rs":{"type":"update","unified_diff":"@@\n-old\n+new\n","move_path":"/tmp/project/src/new.rs"}},"status":"completed"}}"#,
+    );
+    let Some(RolloutObserveEvent::Stream(AppStreamEvent::CommandCompleted(command))) = event else {
+        panic!("expected completed command");
+    };
+
+    let mut panel = TelegramActivityPanel::new();
+    panel.apply_execution(command);
+
+    assert_eq!(
+        activity_watch_text(&panel),
+        "• **Edited** `src/old.rs -> src/new.rs` (+1 -1)"
+    );
+}
+
+#[test]
+fn activity_watch_text_keeps_output_head_and_tail() {
+    let mut panel = TelegramActivityPanel::new();
+    let output = (1..=14)
+        .map(|index| format!("line {index}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    panel.apply_execution(CommandExecution {
+        item_id: "test-1".to_string(),
+        command: "cargo test".to_string(),
+        cwd: "/tmp/project".to_string(),
+        activity: None,
+        status: CommandExecutionStatus::Completed,
+        exit_code: Some(0),
+        duration_ms: None,
+        aggregated_output: Some(output),
+    });
+
+    assert_eq!(
+        activity_watch_text(&panel),
+        "• **Ran** `cargo test`\n  └ `line 1`\n    `line 2`\n    `line 3`\n    `line 4`\n    `line 5`\n    `line 6`\n    `... +2 lines`\n    `line 9`\n    `line 10`\n    `line 11`\n    `line 12`\n    `line 13`\n    `line 14`"
     );
 }
 

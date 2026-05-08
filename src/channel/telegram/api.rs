@@ -64,7 +64,16 @@ fn telegram_rate_limit_state() -> &'static Mutex<Option<Instant>> {
     TELEGRAM_NEXT_REQUEST_AT.get_or_init(|| Mutex::new(None))
 }
 
-fn telegram_rate_limit_delay() -> Duration {
+#[cfg(test)]
+fn reset_telegram_rate_limit_for_test() {
+    let mut next_request_at = telegram_rate_limit_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *next_request_at = None;
+}
+
+#[cfg(test)]
+fn telegram_rate_limit_delay_for_test() -> Duration {
     let next_request_at = telegram_rate_limit_state()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -73,12 +82,21 @@ fn telegram_rate_limit_delay() -> Duration {
         .unwrap_or_default()
 }
 
-fn wait_for_telegram_rate_limit(method: &str, mode: TelegramRequestMode) -> Result<()> {
+fn reserve_telegram_request_slot(method: &str, mode: TelegramRequestMode) -> Result<()> {
     loop {
-        let sleep_for = telegram_rate_limit_delay();
-        if sleep_for.is_zero() {
-            return Ok(());
-        }
+        let sleep_for = {
+            let mut next_request_at = telegram_rate_limit_state()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let now = Instant::now();
+            match *next_request_at {
+                Some(next) if next > now => next.saturating_duration_since(now),
+                _ => {
+                    *next_request_at = Some(now + TELEGRAM_MIN_REQUEST_INTERVAL);
+                    return Ok(());
+                }
+            }
+        };
         if mode == TelegramRequestMode::BestEffort {
             anyhow::bail!(
                 "Telegram {method} skipped: global rate limit active for {}ms",
@@ -93,15 +111,6 @@ fn wait_for_telegram_rate_limit(method: &str, mode: TelegramRequestMode) -> Resu
         }
         thread::sleep(sleep_for);
     }
-}
-
-fn record_telegram_request_spacing() {
-    let next_allowed = Instant::now() + TELEGRAM_MIN_REQUEST_INTERVAL;
-    let mut next_request_at = telegram_rate_limit_state()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *next_request_at =
-        Some(next_request_at.map_or(next_allowed, |existing| existing.max(next_allowed)));
 }
 
 fn record_telegram_retry_after(method: &str, seconds: u64) {
@@ -180,7 +189,7 @@ where
 {
     let url = telegram_method_url(token, method);
     for attempt in 0..=TELEGRAM_MAX_RATE_LIMIT_RETRIES {
-        wait_for_telegram_rate_limit(method, mode)?;
+        reserve_telegram_request_slot(method, mode)?;
         let response = client
             .post(url.as_str())
             .form(payload)
@@ -194,7 +203,6 @@ where
                 err.without_url()
             )
         })?;
-        record_telegram_request_spacing();
         if !response.ok {
             if let Some(seconds) = response.retry_after_seconds() {
                 record_telegram_retry_after(method, seconds);
@@ -991,4 +999,23 @@ pub(super) fn telegram_text_chunks(text: &str) -> Vec<String> {
 
 fn telegram_method_url(token: &str, method: &str) -> String {
     format!("https://api.telegram.org/bot{token}/{method}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rate_limiter_reserves_slot_before_http_send() {
+        reset_telegram_rate_limit_for_test();
+
+        reserve_telegram_request_slot("sendMessage", TelegramRequestMode::Reliable).unwrap();
+
+        assert!(!telegram_rate_limit_delay_for_test().is_zero());
+        let err = reserve_telegram_request_slot("sendChatAction", TelegramRequestMode::BestEffort)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("global rate limit active"));
+
+        reset_telegram_rate_limit_for_test();
+    }
 }

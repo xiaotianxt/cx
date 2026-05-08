@@ -638,6 +638,7 @@ fn app_server_user_message(message: &Value, thread_id: &str) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("\n"))
 }
 
+#[cfg(test)]
 pub(super) fn send_rollout_agent_message<F>(
     message: &str,
     last_sent_agent_message: &mut Option<String>,
@@ -942,13 +943,17 @@ fn patch_changes_activity(changes: &Value) -> CommandActivity {
         let (change_added, change_removed) = patch_change_line_counts(change, kind);
         added += change_added;
         removed += change_removed;
-        details.push(format!("{path} (+{change_added} -{change_removed})"));
+        details.push(format!(
+            "{} (+{change_added} -{change_removed})",
+            patch_change_display_path(path, change)
+        ));
     }
 
     let verb = if kinds.len() == 1 {
         match kinds[0] {
             "add" | "create" => "Added",
             "delete" | "remove" => "Deleted",
+            "move" | "rename" => "Moved",
             _ => "Edited",
         }
     } else {
@@ -957,8 +962,7 @@ fn patch_changes_activity(changes: &Value) -> CommandActivity {
     let target = if details.len() == 1 {
         details.pop().unwrap_or_else(|| "file".to_string())
     } else {
-        let noun = if details.len() == 1 { "file" } else { "files" };
-        let mut target = format!("{} {noun} (+{added} -{removed})", details.len());
+        let mut target = format!("{} files (+{added} -{removed})", details.len());
         for detail in details {
             target.push('\n');
             target.push_str(&detail);
@@ -970,6 +974,20 @@ fn patch_changes_activity(changes: &Value) -> CommandActivity {
         verb: verb.to_string(),
         target,
     }
+}
+
+fn patch_change_display_path(path: &str, change: &Value) -> String {
+    let Some(move_path) = change
+        .get("move_path")
+        .or_else(|| change.get("movePath"))
+        .or_else(|| change.get("new_path"))
+        .or_else(|| change.get("newPath"))
+        .and_then(Value::as_str)
+        .filter(|move_path| !move_path.trim().is_empty())
+    else {
+        return path.to_string();
+    };
+    format!("{} -> {}", path.trim(), move_path.trim())
 }
 
 fn patch_change_line_counts(change: &Value, kind: &str) -> (usize, usize) {
@@ -1065,14 +1083,15 @@ fn update_plan_activity_target(arguments: &str) -> String {
     }
 }
 
-fn patch_activity_target(patch: &str) -> String {
-    #[derive(Default)]
-    struct FilePatchSummary {
-        path: String,
-        added: usize,
-        removed: usize,
-    }
+#[derive(Default)]
+struct FilePatchSummary {
+    path: String,
+    move_path: Option<String>,
+    added: usize,
+    removed: usize,
+}
 
+fn patch_activity_target(patch: &str) -> String {
     let mut files = Vec::<FilePatchSummary>::new();
     let mut current = None::<usize>;
     for line in patch.lines() {
@@ -1086,6 +1105,12 @@ fn patch_activity_target(patch: &str) -> String {
                 ..Default::default()
             });
             current = Some(files.len() - 1);
+            continue;
+        }
+        if let Some(move_path) = line.strip_prefix("*** Move to: ") {
+            if let Some(index) = current {
+                files[index].move_path = Some(move_path.trim().to_string());
+            }
             continue;
         }
         let Some(index) = current else {
@@ -1106,7 +1131,12 @@ fn patch_activity_target(patch: &str) -> String {
     }
     if files.len() == 1 {
         let file = &files[0];
-        return format!("{} (+{} -{})", file.path, file.added, file.removed);
+        return format!(
+            "{} (+{} -{})",
+            file_patch_display_path(file),
+            file.added,
+            file.removed
+        );
     }
     let added = files.iter().map(|file| file.added).sum::<usize>();
     let removed = files.iter().map(|file| file.removed).sum::<usize>();
@@ -1115,10 +1145,21 @@ fn patch_activity_target(patch: &str) -> String {
         target.push('\n');
         target.push_str(&format!(
             "{} (+{} -{})",
-            file.path, file.added, file.removed
+            file_patch_display_path(&file),
+            file.added,
+            file.removed
         ));
     }
     target
+}
+
+fn file_patch_display_path(file: &FilePatchSummary) -> String {
+    match file.move_path.as_deref() {
+        Some(move_path) if !move_path.trim().is_empty() => {
+            format!("{} -> {}", file.path, move_path.trim())
+        }
+        _ => file.path.clone(),
+    }
 }
 
 fn rollout_reasoning_delta(value: &Value) -> Option<String> {
@@ -1228,7 +1269,7 @@ fn command_activity_verb(command_type: &str) -> &'static str {
         "list" | "list_files" => "List",
         "add" | "create" => "Added",
         "delete" | "remove" => "Deleted",
-        "move" | "rename" => "Move",
+        "move" | "rename" => "Moved",
         "copy" => "Copy",
         "format" => "Format",
         "test" => "Test",

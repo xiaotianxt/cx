@@ -13,7 +13,6 @@ use crate::app_server::AppStreamEvent;
 
 use super::api::is_telegram_missing_thread_error;
 use super::api::telegram_text_chunks;
-use super::rollout::send_rollout_agent_message;
 use super::rollout::RolloutObserveEvent;
 use super::state::TelegramRoute;
 use super::transcript::info_watch_text;
@@ -25,6 +24,7 @@ use super::transcript::TelegramStatusState;
 use super::transcript::TelegramThinkingPanel;
 use super::transcript::TelegramThinkingState;
 use super::transcript::TelegramTranscriptTarget;
+use super::transcript::TelegramTurnTerminal;
 use super::TelegramNotifier;
 
 pub(super) struct WatchSendResult {
@@ -46,41 +46,77 @@ pub(super) fn send_watch_events(
     let mut sink =
         TelegramWatchSink::new_best_effort(notifier, route.clone(), activity, thinking, status);
     let mut last_sent_agent_message = last_agent_message;
+    let mut pending_agent_message = None::<String>;
     for event in events {
         match event {
             RolloutObserveEvent::Stream(AppStreamEvent::TurnStarted) => {
                 last_sent_agent_message = None;
+                pending_agent_message = None;
                 sink.push_event(AppStreamEvent::TurnStarted)?;
             }
             RolloutObserveEvent::Stream(AppStreamEvent::AgentDelta(message)) => {
-                send_rollout_agent_message(&message, &mut last_sent_agent_message, &mut |event| {
-                    sink.push_event(event)
-                })?;
+                push_rollout_agent_message_if_new(
+                    &mut sink,
+                    &message,
+                    last_sent_agent_message.as_deref(),
+                    &mut pending_agent_message,
+                )?;
             }
             RolloutObserveEvent::Stream(event) => sink.push_event(event)?,
             RolloutObserveEvent::Terminal {
                 duration_ms,
+                terminal,
                 last_agent_message,
                 ..
             } => {
                 if let Some(message) = last_agent_message {
-                    send_rollout_agent_message(
+                    push_rollout_agent_message_if_new(
+                        &mut sink,
                         &message,
-                        &mut last_sent_agent_message,
-                        &mut |event| sink.push_event(event),
+                        last_sent_agent_message.as_deref(),
+                        &mut pending_agent_message,
                     )?;
                 }
-                sink.turn_completed(duration_ms)?;
+                sink.turn_completed(duration_ms, telegram_turn_terminal(terminal))?;
             }
         }
     }
     sink.flush_pending()?;
+    if sink.assistant_completed_text_sent() {
+        if let Some(message) = pending_agent_message {
+            last_sent_agent_message = Some(message);
+        }
+    }
     Ok(WatchSendResult {
         activity: sink.activity_state(),
         thinking: sink.thinking_state(),
         status: sink.status_state(),
         last_agent_message: last_sent_agent_message,
     })
+}
+
+fn push_rollout_agent_message_if_new(
+    sink: &mut TelegramWatchSink<'_>,
+    message: &str,
+    last_sent_agent_message: Option<&str>,
+    pending_agent_message: &mut Option<String>,
+) -> Result<()> {
+    if message.trim().is_empty()
+        || last_sent_agent_message == Some(message)
+        || pending_agent_message.as_deref() == Some(message)
+    {
+        return Ok(());
+    }
+    sink.push_event(AppStreamEvent::AgentDelta(message.to_string()))?;
+    *pending_agent_message = Some(message.to_string());
+    Ok(())
+}
+
+fn telegram_turn_terminal(terminal: super::rollout::ObserveTerminal) -> TelegramTurnTerminal {
+    match terminal {
+        super::rollout::ObserveTerminal::Completed => TelegramTurnTerminal::Done,
+        super::rollout::ObserveTerminal::Aborted => TelegramTurnTerminal::Interrupted,
+    }
 }
 
 pub(super) struct TelegramWatchSink<'a> {
@@ -427,8 +463,12 @@ impl<'a> TelegramWatchSink<'a> {
         Ok(())
     }
 
-    pub(super) fn turn_completed(&mut self, duration_ms: Option<i64>) -> Result<()> {
-        self.status.finish_with_duration(duration_ms);
+    pub(super) fn turn_completed(
+        &mut self,
+        duration_ms: Option<i64>,
+        terminal: TelegramTurnTerminal,
+    ) -> Result<()> {
+        self.status.finish_with_terminal(duration_ms, terminal);
         self.thinking.finish();
         let had_thinking = self.thinking.message_id().is_some();
         if flush_thinking_panel(
@@ -533,8 +573,8 @@ impl<'a> TelegramWatchSink<'a> {
             || self.activity.sent_any()
     }
 
-    pub(super) fn assistant_sent_any(&self) -> bool {
-        self.agent.sent_any()
+    pub(super) fn assistant_completed_text_sent(&self) -> bool {
+        self.agent.completed_text_sent()
     }
 
     pub(super) fn activity_state(&self) -> Option<TelegramActivityState> {
@@ -665,6 +705,7 @@ struct TelegramDeltaSink<'a> {
     last_sent_chars: usize,
     last_flush: Instant,
     sent_any: bool,
+    completed_text_sent: bool,
 }
 
 impl<'a> TelegramDeltaSink<'a> {
@@ -680,11 +721,13 @@ impl<'a> TelegramDeltaSink<'a> {
             last_sent_chars: 0,
             last_flush: Instant::now() - Self::MIN_EDIT_INTERVAL,
             sent_any: false,
+            completed_text_sent: false,
         }
     }
 
     fn push(&mut self, delta: &str) -> Result<()> {
         self.text.push_str(delta);
+        self.completed_text_sent = false;
         let current_chars = self.text.chars().count();
         if self.message_id.is_none()
             || current_chars.saturating_sub(self.last_sent_chars) >= Self::MIN_DELTA_CHARS
@@ -702,6 +745,10 @@ impl<'a> TelegramDeltaSink<'a> {
 
     fn sent_any(&self) -> bool {
         self.sent_any
+    }
+
+    fn completed_text_sent(&self) -> bool {
+        self.completed_text_sent
     }
 
     fn mark_delivery_attempted(&mut self) {
@@ -737,6 +784,7 @@ impl<'a> TelegramDeltaSink<'a> {
         self.last_sent_chars = self.text.chars().count();
         self.last_flush = Instant::now();
         self.sent_any = true;
+        self.completed_text_sent = final_flush;
         Ok(())
     }
 }

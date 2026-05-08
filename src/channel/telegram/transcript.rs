@@ -29,6 +29,7 @@ pub(super) struct TelegramStatusPanel {
     message_id: Option<i64>,
     turn_started_at_ms: Option<u128>,
     turn_finished_at_ms: Option<u128>,
+    terminal: TelegramTurnTerminal,
     last_flush: Instant,
     last_flush_at_ms: Option<u128>,
     retry_after_ms: Option<u128>,
@@ -46,6 +47,7 @@ impl TelegramStatusPanel {
             message_id: None,
             turn_started_at_ms: None,
             turn_finished_at_ms: None,
+            terminal: TelegramTurnTerminal::Done,
             last_flush: Instant::now() - Self::MIN_EDIT_INTERVAL,
             last_flush_at_ms: None,
             retry_after_ms: None,
@@ -64,6 +66,7 @@ impl TelegramStatusPanel {
             message_id: state.message_id,
             turn_started_at_ms: state.turn_started_at_ms,
             turn_finished_at_ms: state.turn_finished_at_ms,
+            terminal: state.terminal,
             last_flush: instant_from_unix_millis(state.last_flush_at_ms, Self::MIN_EDIT_INTERVAL),
             last_flush_at_ms: state.last_flush_at_ms,
             retry_after_ms: state.retry_after_ms,
@@ -82,6 +85,7 @@ impl TelegramStatusPanel {
             message_id: self.message_id,
             turn_started_at_ms: self.turn_started_at_ms,
             turn_finished_at_ms: self.turn_finished_at_ms,
+            terminal: self.terminal,
             last_flush_at_ms: self.last_flush_at_ms,
             retry_after_ms: self.retry_after_ms,
             last_sent_text: self.last_sent_text.clone(),
@@ -93,6 +97,7 @@ impl TelegramStatusPanel {
         self.active = true;
         self.turn_started_at_ms = Some(unix_millis());
         self.turn_finished_at_ms = None;
+        self.terminal = TelegramTurnTerminal::Done;
         self.dirty = true;
     }
 
@@ -103,11 +108,21 @@ impl TelegramStatusPanel {
         self.start_new_turn();
     }
 
+    #[cfg(test)]
     pub(super) fn finish_with_duration(&mut self, duration_ms: Option<i64>) {
+        self.finish_with_terminal(duration_ms, TelegramTurnTerminal::Done);
+    }
+
+    pub(super) fn finish_with_terminal(
+        &mut self,
+        duration_ms: Option<i64>,
+        terminal: TelegramTurnTerminal,
+    ) {
         if !self.active {
             return;
         }
         self.active = false;
+        self.terminal = terminal;
         self.turn_finished_at_ms = Some(
             duration_ms
                 .filter(|duration| *duration >= 0)
@@ -205,6 +220,8 @@ pub(super) struct TelegramStatusState {
     turn_started_at_ms: Option<u128>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     turn_finished_at_ms: Option<u128>,
+    #[serde(default, skip_serializing_if = "TelegramTurnTerminal::is_done")]
+    terminal: TelegramTurnTerminal,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_flush_at_ms: Option<u128>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -213,6 +230,20 @@ pub(super) struct TelegramStatusState {
     last_sent_text: Option<String>,
     #[serde(default)]
     active: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(super) enum TelegramTurnTerminal {
+    #[default]
+    Done,
+    Interrupted,
+}
+
+impl TelegramTurnTerminal {
+    fn is_done(&self) -> bool {
+        matches!(self, Self::Done)
+    }
 }
 
 pub(super) fn status_watch_text(panel: &TelegramStatusPanel) -> String {
@@ -225,7 +256,11 @@ pub(super) fn status_watch_text(panel: &TelegramStatusPanel) -> String {
             format_elapsed_compact_ms(elapsed)
         )
     } else {
-        format!("• **Done** ({})", format_elapsed_compact_ms(elapsed))
+        let title = match panel.terminal {
+            TelegramTurnTerminal::Done => "Done",
+            TelegramTurnTerminal::Interrupted => "Interrupted",
+        };
+        format!("• **{title}** ({})", format_elapsed_compact_ms(elapsed))
     }
 }
 
@@ -757,7 +792,7 @@ fn activity_item_is_file_change(item: &TelegramActivityItem) -> bool {
 }
 
 fn activity_verb_is_file_change(verb: &str) -> bool {
-    matches!(verb, "Added" | "Edited" | "Deleted")
+    matches!(verb, "Added" | "Edited" | "Deleted" | "Moved")
 }
 
 fn activity_explore_group_lines(items: &[&TelegramActivityItem]) -> Vec<String> {
@@ -958,13 +993,31 @@ fn activity_code_search_target(target: &str) -> String {
 }
 
 fn activity_output_text(output: &str) -> String {
+    const OUTPUT_LINE_LIMIT: usize = 12;
+    const OUTPUT_HEAD_LINES: usize = 6;
+    const OUTPUT_TAIL_LINES: usize = 6;
+
     let lines = output
         .lines()
         .map(str::trim_end)
         .filter(|line| !line.trim().is_empty())
-        .take(12)
         .collect::<Vec<_>>();
-    truncate_chars(&lines.join("\n"), 700)
+    if lines.len() <= OUTPUT_LINE_LIMIT {
+        return truncate_chars(&lines.join("\n"), 700);
+    }
+
+    let omitted = lines
+        .len()
+        .saturating_sub(OUTPUT_HEAD_LINES + OUTPUT_TAIL_LINES);
+    let mut selected = lines
+        .iter()
+        .take(OUTPUT_HEAD_LINES)
+        .map(|line| (*line).to_string())
+        .collect::<Vec<_>>();
+    selected.push(format!("... +{omitted} lines"));
+    let tail_start = lines.len().saturating_sub(OUTPUT_TAIL_LINES);
+    selected.extend(lines[tail_start..].iter().map(|line| (*line).to_string()));
+    truncate_chars(&selected.join("\n"), 700)
 }
 
 fn activity_output_lines(output: &str) -> Vec<String> {
@@ -1012,7 +1065,22 @@ fn relativize_file_change_line(line: &str, cwd: &str) -> String {
     let Some((path, counts)) = split_diff_count_suffix(trimmed) else {
         return trimmed.to_string();
     };
-    format!("{} {}", relativize_path_for_cwd(path, cwd), counts)
+    format!(
+        "{} {}",
+        relativize_file_change_path_label(path, cwd),
+        counts
+    )
+}
+
+fn relativize_file_change_path_label(path: &str, cwd: &str) -> String {
+    let Some((from, to)) = path.split_once(" -> ") else {
+        return relativize_path_for_cwd(path, cwd);
+    };
+    format!(
+        "{} -> {}",
+        relativize_path_for_cwd(from, cwd),
+        relativize_path_for_cwd(to, cwd)
+    )
 }
 
 fn relativize_path_for_cwd(path: &str, cwd: &str) -> String {
@@ -1211,6 +1279,21 @@ mod tests {
         assert!(!panel.active);
         assert_eq!(panel.turn_finished_at_ms, Some(3500));
         assert_eq!(status_watch_text(&panel), "• **Done** (2s)");
+    }
+
+    #[test]
+    fn status_finish_with_terminal_renders_interrupted_turn() {
+        let mut panel = TelegramStatusPanel::new();
+        panel.turn_started_at_ms = Some(1000);
+        panel.active = true;
+
+        panel.finish_with_terminal(Some(2500), TelegramTurnTerminal::Interrupted);
+
+        assert_eq!(status_watch_text(&panel), "• **Interrupted** (2s)");
+        assert_eq!(
+            panel.to_state().unwrap().terminal,
+            TelegramTurnTerminal::Interrupted
+        );
     }
 
     #[test]

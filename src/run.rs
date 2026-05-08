@@ -156,6 +156,13 @@ pub(crate) fn should_skip_stdin_wrapper(args: &[OsString]) -> bool {
     if args.iter().any(|arg| arg == "--managed") {
         return true;
     }
+    if first_forwarded_non_option(args).is_none()
+        && args
+            .iter()
+            .any(|arg| matches!(arg.to_str(), Some("-V" | "--version")))
+    {
+        return true;
+    }
     first_forwarded_non_option(args).is_some_and(|arg| BYPASS_SUBCOMMANDS.contains(&arg.as_str()))
 }
 
@@ -745,6 +752,12 @@ mod tests {
             OsString::from("resume"),
             OsString::from("sid"),
         ]));
+    }
+
+    #[test]
+    fn version_flag_skips_stdin_wrapper() {
+        assert!(should_skip_stdin_wrapper(&[OsString::from("--version")]));
+        assert!(should_skip_stdin_wrapper(&[OsString::from("-V")]));
     }
 
     #[test]

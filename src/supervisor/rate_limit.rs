@@ -100,8 +100,8 @@ fn inspect_stream_line(
 
     let reached = parsed
         .as_ref()
-        .is_some_and(json_contains_rate_limit_reached)
-        || fallback_line_mentions_rate_limit(&line_lower);
+        .map(json_contains_rate_limit_reached)
+        .unwrap_or_else(|| fallback_line_mentions_rate_limit(&line_lower));
     if reached {
         *signal = Some(StreamRateLimitSignal {
             safe_to_continue: state.user_message_seen
@@ -222,5 +222,15 @@ mod tests {
         let signal = inspect_stream_fragment(&fragment, &mut state).unwrap();
 
         assert!(!signal.safe_to_continue);
+    }
+
+    #[test]
+    fn app_stream_ignores_rate_limit_words_inside_history_text() {
+        let mut state = TurnSideEffectState::default();
+        let fragment = r#"{"message":{"id":2,"result":{"data":[{"preview":"rate-limit handling plan mentions limit_reached=true and 429 in prose"}]}}}"#;
+
+        let signal = inspect_stream_fragment(fragment, &mut state);
+
+        assert!(signal.is_none());
     }
 }

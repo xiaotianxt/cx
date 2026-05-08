@@ -594,6 +594,7 @@ impl AppServerSupervisor {
                 "app-server rotation pending from unsafe limit signal; rotating at idle boundary",
             )?;
             self.rotate_after_limit(spec, paths)?;
+            return Ok(());
         }
 
         let Some(signal) = self.scan_rate_limit_signal(paths)? else {
@@ -653,10 +654,6 @@ impl AppServerSupervisor {
                 rate_limit::inspect_stream_fragment(&line, &mut self.rotation_turn_state)
             {
                 signal = Some(observed);
-            } else if rate_limit::classify_output(&line).is_some() {
-                signal = Some(rate_limit::StreamRateLimitSignal {
-                    safe_to_continue: false,
-                });
             }
             line.clear();
         }
@@ -711,8 +708,14 @@ impl AppServerSupervisor {
             return Ok(());
         };
         self.rotate_to_slot(spec, paths, &slot)?;
+        self.mark_rotation_log_consumed(paths);
         self.rotation_pending = false;
         Ok(())
+    }
+
+    fn mark_rotation_log_consumed(&mut self, paths: &ManagerPaths) {
+        self.rotation_scan_offset = proxy_event_log_len(paths).unwrap_or(self.rotation_scan_offset);
+        self.rotation_turn_state = rate_limit::TurnSideEffectState::default();
     }
 
     fn next_rotation_slot(
@@ -918,19 +921,22 @@ fn restore_sessions_on_generation(
         let Some(path) = app_thread.path.as_deref() else {
             continue;
         };
-        let read = client
-            .thread_resume_with_path(
-                &app_thread.thread_id,
-                Some(path),
-                Some(&app_thread.cwd),
-                true,
-            )
-            .with_context(|| {
-                format!(
-                    "resume app-server thread {} from path {} on slot {}",
-                    app_thread.thread_id, path, generation.slot
+        let read = match client.thread_read(&app_thread.thread_id, false) {
+            Ok(read) => read,
+            Err(_) => client
+                .thread_resume_with_path(
+                    &app_thread.thread_id,
+                    Some(path),
+                    Some(&app_thread.cwd),
+                    true,
                 )
-            })?;
+                .with_context(|| {
+                    format!(
+                        "resume app-server thread {} from path {} on slot {}",
+                        app_thread.thread_id, path, generation.slot
+                    )
+                })?,
+        };
         session::bind_app_thread(
             paths,
             BindAppThreadRequest {

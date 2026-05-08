@@ -522,4 +522,76 @@ mod tests {
         assert_eq!(app_thread.generation, 2);
         assert_eq!(app_thread.path.as_deref(), Some("/tmp/threads/old.jsonl"));
     }
+
+    #[test]
+    fn explicit_readable_thread_rebinds_current_path_without_path_resume() {
+        let paths = temp_paths("explicit-readable-rebind");
+        let channel_id = ChannelId::parse("terminal").unwrap();
+        let session = session::create_session(
+            &paths,
+            CreateSessionRequest {
+                session_id: None,
+                channel_id: channel_id.clone(),
+            },
+        )
+        .unwrap()
+        .session;
+        session::bind_app_thread(
+            &paths,
+            BindAppThreadRequest {
+                session_id: session.session_id.clone(),
+                app_thread: AppThreadBinding {
+                    thread_id: "thread-1".to_string(),
+                    cwd: "/tmp/project".to_string(),
+                    title: Some("old".to_string()),
+                    slot: Some("slot-a".to_string()),
+                    generation: 1,
+                    path: Some("/tmp/stale.jsonl".to_string()),
+                    updated_at_unix: 10,
+                },
+            },
+        )
+        .unwrap();
+        let mut readable = BTreeMap::new();
+        readable.insert(
+            "thread-1".to_string(),
+            summary_with_path(
+                "thread-1",
+                "/tmp/project",
+                "idle",
+                50,
+                Some("/tmp/current.jsonl"),
+            ),
+        );
+        let mut client = FakeResolverClient {
+            readable,
+            ..FakeResolverClient::default()
+        };
+
+        let outcome = resolve_app_thread(
+            &paths,
+            &mut client,
+            ThreadResolverScope {
+                cwd: PathBuf::from("/tmp/project"),
+                channel_id: Some(channel_id),
+                explicit_thread_id: Some("thread-1".to_string()),
+                slot: Some("slot-b".to_string()),
+                generation: 2,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.decision,
+            ThreadResolverDecision::AttachExisting {
+                thread_id: "thread-1".to_string()
+            }
+        );
+        assert!(client.resume_calls.is_empty());
+        let rebound = session::show_session(&paths, &session.session_id).unwrap();
+        let app_thread = rebound.app_thread.unwrap();
+        assert_eq!(app_thread.path.as_deref(), Some("/tmp/current.jsonl"));
+        assert_eq!(app_thread.slot.as_deref(), Some("slot-b"));
+        assert_eq!(app_thread.generation, 2);
+    }
 }

@@ -509,9 +509,6 @@ fn drain_watched_app_server_binding(
     let cwd = binding.app_thread_cwd.as_deref().or(session_app_thread
         .as_ref()
         .map(|app_thread| app_thread.cwd.as_str()));
-    let path = session_app_thread
-        .as_ref()
-        .and_then(|app_thread| app_thread.path.as_deref());
     let mut client = connect_app_server_with_timeout(paths, Duration::from_millis(750))?;
     let server = serve::ready_app_server(paths)?;
     let resolver_cwd = cwd
@@ -550,11 +547,7 @@ fn drain_watched_app_server_binding(
         .as_ref()
         .map(|app_thread| app_thread.cwd.as_str())
         .or(cwd);
-    let live_path = updated_app_thread
-        .as_ref()
-        .and_then(|app_thread| app_thread.path.as_deref())
-        .or(path);
-    let _ = client.thread_resume_with_path(&live_thread_id, live_path, live_cwd, true)?;
+    let _ = client.thread_resume_with_path(&live_thread_id, None, live_cwd, true)?;
     let read = client.thread_read(&live_thread_id, true)?;
     let (mut events, mut latest_app_turn_id) =
         app_server_history_events_since(&read.turns, binding.watch_app_last_turn_id.as_deref());

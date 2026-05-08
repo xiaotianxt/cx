@@ -478,4 +478,6 @@ scripts/release.sh
 
 The script runs tests, pushes a tag, waits for GitHub Actions to publish the
 `darwin-arm64` release artifact, updates `Formula/cx.rb` in
-`xiaotianxt/homebrew-tap`, and verifies the Homebrew install.
+`xiaotianxt/homebrew-tap`, verifies the Homebrew install, and refreshes a local
+`cx service` if one is installed or already running. Use
+`--skip-service-restart` to leave the local service untouched.

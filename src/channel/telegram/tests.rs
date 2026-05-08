@@ -874,3 +874,29 @@ fn app_server_history_watch_replays_turns_after_last_seen_cursor() {
         ]
     );
 }
+
+#[test]
+fn recent_history_text_reads_user_and_agent_messages_from_app_server_turns() {
+    let turns = vec![
+        json!({
+            "id": "turn-1",
+            "items": [
+                {"userMessage": {"content": [{"type": "text", "text": "old"}]}},
+                {"agentMessage": {"text": "older"}}
+            ]
+        }),
+        json!({
+            "id": "turn-2",
+            "items": [
+                {"userMessage": {"content": [{"type": "text", "text": "why can I not see this chat?"}]}},
+                {"agentMessage": {"text": "because the watcher was not replaying app-server history"}}
+            ]
+        }),
+    ];
+
+    let text = recent_history_text_from_turns(&turns, 2).unwrap();
+
+    assert!(!text.contains("old"));
+    assert!(text.contains("You: why can I not see this chat?"));
+    assert!(text.contains("Codex: because the watcher was not replaying app-server history"));
+}

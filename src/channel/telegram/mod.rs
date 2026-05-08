@@ -108,6 +108,7 @@ use self::watch::WatchTerminal;
 
 const PORTAL_TOPIC_TITLE: &str = "cx portal";
 const PORTAL_APP_SERVER_TIMEOUT: Duration = Duration::from_millis(750);
+const WATCH_INTRO_HISTORY_MESSAGES: usize = 6;
 const WATCH_DRAIN_MAX_LINES: usize = 1000;
 
 pub fn run(args: TelegramRunArgs) -> Result<()> {
@@ -1641,7 +1642,7 @@ fn observe_portal_thread(
     write_state(paths, state)?;
 
     if let Some(notifier) = options.notifier {
-        send_watch_intro(state, notifier, &effective_route, &binding, entry)?;
+        send_watch_intro(paths, state, notifier, &effective_route, &binding, entry)?;
         write_state(paths, state)?;
     }
 
@@ -2048,6 +2049,7 @@ fn work_topic_title(entry: &AppThreadPortalEntry) -> String {
 }
 
 fn send_watch_intro(
+    paths: &ManagerPaths,
     state: &mut TelegramState,
     notifier: &TelegramNotifier<'_>,
     route: &TelegramRoute,
@@ -2065,7 +2067,71 @@ fn send_watch_intro(
             return Ok(());
         }
     }
+    match app_server_recent_history_text(paths, &entry.thread_id, WATCH_INTRO_HISTORY_MESSAGES) {
+        Ok(Some(history)) => {
+            if let Err(err) = notifier.send_chunks(route, &history) {
+                eprintln!(
+                    "telegram watch history delivery failed for {}: {err:#}",
+                    route.display()
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(err) => {
+            eprintln!(
+                "telegram watch history read failed for {}: {err:#}",
+                route.display()
+            );
+        }
+    }
     Ok(())
+}
+
+fn app_server_recent_history_text(
+    paths: &ManagerPaths,
+    thread_id: &str,
+    limit: usize,
+) -> Result<Option<String>> {
+    if limit == 0 {
+        return Ok(None);
+    }
+    let mut client = connect_app_server_with_timeout(paths, PORTAL_APP_SERVER_TIMEOUT)?;
+    let read = client.thread_read(thread_id, true)?;
+    Ok(recent_history_text_from_turns(&read.turns, limit))
+}
+
+fn recent_history_text_from_turns(turns: &[Value], limit: usize) -> Option<String> {
+    let mut messages = Vec::<(String, String)>::new();
+    for turn in turns {
+        let Some(items) = turn.get("items").and_then(Value::as_array) else {
+            continue;
+        };
+        for item in items {
+            if let Some(payload) = history_item_payload(item, "userMessage") {
+                if let Some(text) = history_user_message_text(payload) {
+                    messages.push(("You".to_string(), text));
+                }
+                continue;
+            }
+            if let Some(payload) = history_item_payload(item, "agentMessage") {
+                if let Some(text) = payload.get("text").and_then(Value::as_str) {
+                    let text = text.trim();
+                    if !text.is_empty() {
+                        messages.push(("Codex".to_string(), text.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    if messages.is_empty() {
+        return None;
+    }
+    let start = messages.len().saturating_sub(limit);
+    let mut lines = vec![String::from("Recent thread history")];
+    for (role, text) in &messages[start..] {
+        lines.push(format!("{role}: {}", truncate_chars(text, 1200)));
+    }
+    Some(lines.join("\n\n"))
 }
 
 fn watch_started_text(entry: &AppThreadPortalEntry) -> String {

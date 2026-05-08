@@ -968,19 +968,12 @@ fn drain_watched_binding(
     let file_len = fs::metadata(&path)
         .with_context(|| format!("stat rollout {}", path.display()))?
         .len();
-    let missing_activity_state = binding.watch_activity.is_none();
     let active_turn_offset = latest_active_rollout_turn(&path)
         .ok()
         .flatten()
         .map(|(_, offset)| offset);
-    let start_offset = match (binding.watch_rollout_offset, active_turn_offset) {
-        (Some(offset), Some(active_offset)) if missing_activity_state && active_offset < offset => {
-            active_offset
-        }
-        (Some(offset), _) if offset <= file_len => offset,
-        (_, Some(active_offset)) => active_offset,
-        _ => file_len,
-    };
+    let start_offset =
+        watch_rollout_start_offset(binding.watch_rollout_offset, file_len, active_turn_offset);
     let drain = rollout_events_since(&path, start_offset, WATCH_DRAIN_MAX_LINES)?;
 
     let activity_state = state
@@ -1059,6 +1052,17 @@ fn send_watch_events(
         thinking: sink.thinking_state(),
         status: sink.status_state(),
     })
+}
+
+fn watch_rollout_start_offset(
+    stored_offset: Option<u64>,
+    file_len: u64,
+    active_turn_offset: Option<u64>,
+) -> u64 {
+    match stored_offset {
+        Some(offset) if offset <= file_len => offset,
+        Some(_) | None => active_turn_offset.unwrap_or(file_len),
+    }
 }
 
 fn watched_bindings(state: &TelegramState) -> Vec<TelegramBinding> {
@@ -4528,8 +4532,8 @@ impl<'a> TelegramWatchSink<'a> {
             }
             AppStreamEvent::TurnStarted => {
                 self.seal_activity_cell()?;
-                self.ensure_status_started(false)?;
-                self.thinking.start();
+                self.start_status_turn(true)?;
+                self.thinking.start_new_turn();
                 let had_thinking = self.thinking.message_id().is_some();
                 if flush_thinking_panel(
                     &mut self.thinking,
@@ -4587,7 +4591,7 @@ impl<'a> TelegramWatchSink<'a> {
             AppStreamEvent::ReasoningStarted => {
                 self.seal_activity_cell()?;
                 self.ensure_status_started(false)?;
-                self.thinking.start();
+                self.thinking.ensure_active();
                 let had_thinking = self.thinking.message_id().is_some();
                 if flush_thinking_panel(
                     &mut self.thinking,
@@ -4721,7 +4725,21 @@ impl<'a> TelegramWatchSink<'a> {
     }
 
     fn ensure_status_started(&mut self, force: bool) -> Result<()> {
-        self.status.start();
+        self.status.ensure_active();
+        if flush_status_panel(
+            &mut self.status,
+            self.agent.notifier,
+            &self.agent.route,
+            self.best_effort_delivery,
+            force,
+        )? {
+            self.sent_any = true;
+        }
+        Ok(())
+    }
+
+    fn start_status_turn(&mut self, force: bool) -> Result<()> {
+        self.status.start_new_turn();
         if flush_status_panel(
             &mut self.status,
             self.agent.notifier,
@@ -7605,7 +7623,7 @@ mod tests {
     fn watch_sink_does_not_move_persisted_status_without_new_tail_content() {
         let target = CapturingTranscriptTarget::default();
         let mut status = TelegramStatusPanel::from_state(None);
-        status.start();
+        status.start_new_turn();
         assert!(status.flush(&target, true).unwrap());
 
         let client = Client::new();
@@ -7624,10 +7642,20 @@ mod tests {
     }
 
     #[test]
+    fn rollout_start_offset_does_not_rewind_after_cursor_exists() {
+        assert_eq!(watch_rollout_start_offset(Some(100), 200, Some(10)), 100);
+    }
+
+    #[test]
+    fn rollout_start_offset_uses_active_turn_without_cursor() {
+        assert_eq!(watch_rollout_start_offset(None, 200, Some(10)), 10);
+    }
+
+    #[test]
     fn status_panel_state_throttles_active_edit_across_drains() {
         let target = CapturingTranscriptTarget::default();
         let mut panel = TelegramStatusPanel::from_state(None);
-        panel.start();
+        panel.start_new_turn();
 
         assert!(panel.flush(&target, false).unwrap());
         let mut restored = TelegramStatusPanel::from_state(panel.to_state());
@@ -7700,7 +7728,7 @@ mod tests {
     #[test]
     fn thinking_watch_text_marks_active_and_done_states() {
         let mut panel = TelegramThinkingPanel::new();
-        panel.start();
+        panel.ensure_active();
 
         assert_eq!(thinking_watch_text(&panel), "Codex is working\n");
 
@@ -7717,7 +7745,7 @@ mod tests {
     fn thinking_panel_does_not_send_empty_working_placeholder() {
         let target = CapturingTranscriptTarget::default();
         let mut panel = TelegramThinkingPanel::new();
-        panel.start();
+        panel.ensure_active();
         panel.finish();
 
         assert!(!panel.flush(&target, true).unwrap());

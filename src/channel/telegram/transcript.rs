@@ -84,14 +84,18 @@ impl TelegramStatusPanel {
         })
     }
 
-    pub(super) fn start(&mut self) {
-        if self.active {
-            return;
-        }
+    pub(super) fn start_new_turn(&mut self) {
         self.active = true;
         self.turn_started_at_ms = Some(unix_millis());
         self.turn_finished_at_ms = None;
         self.dirty = true;
+    }
+
+    pub(super) fn ensure_active(&mut self) {
+        if self.active {
+            return;
+        }
+        self.start_new_turn();
     }
 
     pub(super) fn finish(&mut self) {
@@ -284,7 +288,14 @@ impl TelegramThinkingPanel {
         })
     }
 
-    pub(super) fn start(&mut self) {
+    pub(super) fn start_new_turn(&mut self) {
+        *self = Self::new();
+        self.active = true;
+        self.done = false;
+        self.dirty = true;
+    }
+
+    pub(super) fn ensure_active(&mut self) {
         if self.done {
             *self = Self::new();
         }
@@ -1134,12 +1145,12 @@ mod tests {
     }
 
     #[test]
-    fn status_start_resets_elapsed_time_for_new_turn() {
+    fn status_start_new_turn_resets_elapsed_time() {
         let mut panel = TelegramStatusPanel::new();
         panel.turn_started_at_ms = Some(1000);
         panel.turn_finished_at_ms = Some(2000);
 
-        panel.start();
+        panel.start_new_turn();
 
         assert!(panel.active);
         assert_ne!(panel.turn_started_at_ms, Some(1000));
@@ -1147,12 +1158,12 @@ mod tests {
     }
 
     #[test]
-    fn status_start_preserves_elapsed_time_for_active_turn_resume() {
+    fn status_ensure_active_preserves_elapsed_time_for_active_turn_resume() {
         let mut panel = TelegramStatusPanel::new();
         panel.active = true;
         panel.turn_started_at_ms = Some(1000);
 
-        panel.start();
+        panel.ensure_active();
 
         assert_eq!(panel.turn_started_at_ms, Some(1000));
     }
@@ -1161,7 +1172,7 @@ mod tests {
     fn thinking_state_preserves_edit_target_across_drains() {
         let target = CapturingTarget::default();
         let mut panel = TelegramThinkingPanel::new();
-        panel.start();
+        panel.start_new_turn();
         panel.push("first thought");
         assert!(panel.flush(&target, true).unwrap());
 

@@ -1,3 +1,8 @@
+//! Telegram rendering for Codex transcript cells.
+//!
+//! The code here mirrors Codex TUI history-cell semantics while targeting
+//! Telegram text, edit, and message chunk constraints.
+
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
@@ -11,7 +16,7 @@ use crate::app_server::CommandActivity;
 use crate::app_server::CommandExecution;
 use crate::app_server::CommandExecutionStatus;
 
-use super::command_path_label;
+use super::rollout::command_path_label;
 use super::truncate_chars;
 use super::unix_millis;
 

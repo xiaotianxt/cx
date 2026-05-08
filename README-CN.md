@@ -13,6 +13,10 @@ cx 是一个本地 Codex 入口：负责启动 Codex、处理 stdin pipe、管�
 - `cx add` / `cx login` / `cx remove`：管理独立 slot。
 - `cx desktop`：通过选中的 slot 启动 Codex Desktop。
 - `cx --target <name>`：使用命名 target 的 slot 组和覆盖策略启动 Codex。
+- `cx --managed`：用 cx 前台 supervisor 启动 Codex，遇到 rate limit 时可轮转 slot 并
+  resume 同一个 session。
+- `cx managed status` / `cx managed rotate` / `cx managed resume`：查看或控制当前
+  managed Codex supervisor。
 - `cx serve start` / `cx serve stop`：通过选中的 slot 管理前台 loopback Codex
   app-server。
 - `cx service start`：用一个本地后台 supervisor 同时运行 app-server 和 Telegram adapter。
@@ -112,6 +116,31 @@ cx --target research -m gpt-5.5
 如果这个 session 仍然活跃，就保持原参数，让 Codex 新开一个 session。显式的
 Codex 子命令，比如 `resume`、`exec`、`review`、`help`，以及 remote
 app-server 启动，不会被改写。
+
+用前台 cx supervisor 启动 Codex：
+
+```bash
+cx --managed
+cx --managed --target research
+cx --managed resume <session-id>
+cx managed status
+cx managed rotate
+cx managed rotate --slot bus2
+cx managed resume <session-id> --continue
+```
+
+Managed 模式是 opt-in；普通 `cx` 仍然走最快的 `exec` 路径。Managed 模式下，cx 会在
+PTY 里启动 Codex、透明转发终端输入输出、在 `<profile-manager>/serve/supervisors/`
+写私有 supervisor state，并保留足够的父进程状态来用另一个 slot 重启 Codex。cx 看到
+rate-limit 信号后，会先重新查询当前 slot 的 usage endpoint；确认耗尽后，把当前 slot
+放入 cooldown，然后用下一个可用 slot 执行 `codex resume <session-id>`。API key 或外部
+provider slot 没有 usage endpoint 可确认时，明显的 provider 429 会使用短的
+low-confidence cooldown。
+
+如果 rollout 显示被中断的 turn 没有工具或文件副作用，managed 模式会在 resume 后追加
+“继续”提示；否则只 resume session，不重放未完成 prompt。`cx managed rotate` 和
+`cx managed resume` 默认只控制当前工作目录里最新的 managed supervisor，避免误操作其他
+终端窗口。
 
 stdin pipe：
 

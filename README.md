@@ -18,6 +18,10 @@ live usage.
 - `cx desktop`: launch Codex Desktop through a selected slot.
 - `cx --target <name>`: launch through a named target-specific slot group and
   override set.
+- `cx --managed`: launch Codex under a cx foreground supervisor that can rotate
+  slots and resume the same session after a rate limit.
+- `cx managed status` / `cx managed rotate` / `cx managed resume`: inspect or
+  control the current managed Codex supervisor.
 - `cx serve start` / `cx serve stop`: manage a foreground loopback Codex
   app-server through a selected slot.
 - `cx service start`: run app-server and the Telegram adapter under one local
@@ -133,6 +137,34 @@ that session is not currently open in another Codex TUI, `cx` runs
 leaves the arguments unchanged so Codex starts a new session. Explicit Codex
 subcommands such as `resume`, `exec`, `review`, `help`, and remote app-server
 launches are never rewritten.
+
+Launch Codex under a foreground cx supervisor:
+
+```bash
+cx --managed
+cx --managed --target research
+cx --managed resume <session-id>
+cx managed status
+cx managed rotate
+cx managed rotate --slot bus2
+cx managed resume <session-id> --continue
+```
+
+Managed mode is opt-in. Normal `cx` still uses the fast `exec` path. In managed
+mode, cx starts Codex inside a PTY, forwards terminal input/output, writes a
+private supervisor state file under `<profile-manager>/serve/supervisors/`, and
+keeps enough parent state to restart Codex with another slot. If cx sees a
+rate-limit signal, it re-checks the current slot's usage endpoint before
+rotating. When the endpoint confirms exhaustion, the current slot is placed on a
+cooldown and cx restarts Codex as `codex resume <session-id>` through the next
+usable slot. For API-key or external-provider slots, obvious provider 429
+signals use a short low-confidence cooldown.
+
+When the rollout shows the interrupted turn had no tool or file side effects,
+managed mode appends a continuation prompt after resume. Otherwise it resumes
+the session without replaying the unfinished prompt. `cx managed rotate` and
+`cx managed resume` target the newest managed supervisor in the current working
+directory by default, so another terminal window is not controlled by mistake.
 
 Pipe context into Codex:
 

@@ -47,6 +47,8 @@ pub enum Command {
     Serve(ServeArgs),
     /// Start and manage a background cx service supervisor.
     Service(ServiceArgs),
+    /// Control foreground Codex sessions launched with `cx --managed`.
+    Managed(ManagedArgs),
     /// Inspect and export Codex App Server protocol bindings.
     Protocol(ProtocolArgs),
     /// Export and import portable profile-manager transfer bundles.
@@ -498,6 +500,65 @@ mod tests {
     }
 
     #[test]
+    fn managed_status_accepts_json_and_all() {
+        let cli = Cli::parse_from(["cx", "managed", "status", "--json", "--all"]);
+
+        let Command::Managed(args) = cli.command else {
+            panic!("expected managed command");
+        };
+        let ManagedCommand::Status(args) = args.command else {
+            panic!("expected managed status command");
+        };
+        assert!(args.json);
+        assert!(args.all);
+    }
+
+    #[test]
+    fn managed_rotate_accepts_slot_and_continue() {
+        let cli = Cli::parse_from([
+            "cx",
+            "managed",
+            "rotate",
+            "--slot",
+            "bus2",
+            "--continue",
+            "--timeout",
+            "0.5",
+        ]);
+
+        let Command::Managed(args) = cli.command else {
+            panic!("expected managed command");
+        };
+        let ManagedCommand::Rotate(args) = args.command else {
+            panic!("expected managed rotate command");
+        };
+        assert_eq!(args.slot, Some(String::from("bus2")));
+        assert!(args.continue_after);
+        assert_eq!(args.timeout, 0.5);
+    }
+
+    #[test]
+    fn managed_resume_accepts_session_and_slot() {
+        let cli = Cli::parse_from([
+            "cx",
+            "managed",
+            "resume",
+            "019dfdd3-debc-7da2-88fc-b15b73f5e138",
+            "--slot",
+            "bus3",
+        ]);
+
+        let Command::Managed(args) = cli.command else {
+            panic!("expected managed command");
+        };
+        let ManagedCommand::Resume(args) = args.command else {
+            panic!("expected managed resume command");
+        };
+        assert_eq!(args.session_id, "019dfdd3-debc-7da2-88fc-b15b73f5e138");
+        assert_eq!(args.slot, Some(String::from("bus3")));
+    }
+
+    #[test]
     fn serve_ping_accepts_timeout_and_json() {
         let cli = Cli::parse_from(["cx", "serve", "ping", "--timeout", "0.5", "--json"]);
 
@@ -712,6 +773,86 @@ pub struct DesktopArgs {
     /// Extra args forwarded to the Codex Desktop executable.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ManagedArgs {
+    #[command(subcommand)]
+    pub command: ManagedCommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum ManagedCommand {
+    /// Show foreground managed Codex supervisors.
+    Status(ManagedStatusArgs),
+    /// Rotate the current managed supervisor to another slot.
+    Rotate(ManagedRotateArgs),
+    /// Restart the current managed supervisor on a recorded Codex session.
+    Resume(ManagedResumeArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ManagedStatusArgs {
+    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
+    pub manager_dir: Option<PathBuf>,
+
+    /// Include supervisors from all working directories.
+    #[arg(long)]
+    pub all: bool,
+
+    /// Print JSON instead of human-readable output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ManagedRotateArgs {
+    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
+    pub manager_dir: Option<PathBuf>,
+
+    /// Rotate to this specific slot instead of selecting the next usable slot.
+    #[arg(long)]
+    pub slot: Option<String>,
+
+    /// Send a continuation prompt after resuming the session.
+    #[arg(long = "continue")]
+    pub continue_after: bool,
+
+    /// Control socket request timeout in seconds.
+    #[arg(long, default_value_t = 5.0)]
+    pub timeout: f32,
+
+    /// Print JSON instead of human-readable output.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ManagedResumeArgs {
+    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
+    pub manager_dir: Option<PathBuf>,
+
+    /// Session id to resume.
+    pub session_id: String,
+
+    /// Restart on this specific slot.
+    #[arg(long)]
+    pub slot: Option<String>,
+
+    /// Send a continuation prompt after resuming the session.
+    #[arg(long = "continue")]
+    pub continue_after: bool,
+
+    /// Control socket request timeout in seconds.
+    #[arg(long, default_value_t = 5.0)]
+    pub timeout: f32,
+
+    /// Print JSON instead of human-readable output.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Clone, Args)]

@@ -41,6 +41,7 @@ struct RunOptions {
     codex_bin: Option<PathBuf>,
     quiet: bool,
     debug: bool,
+    managed: bool,
     codex_args: Vec<OsString>,
     first_non_option: Option<String>,
 }
@@ -50,13 +51,14 @@ pub(crate) struct RuntimeSelection {
     pub target: Option<TargetSpec>,
 }
 
+#[derive(Debug, Clone)]
 pub(crate) struct CodexCommandSpec {
-    program: PathBuf,
-    codex_home: PathBuf,
-    envs: BTreeMap<String, String>,
-    args: Vec<OsString>,
-    slot: String,
-    target_name: Option<String>,
+    pub(crate) program: PathBuf,
+    pub(crate) codex_home: PathBuf,
+    pub(crate) envs: BTreeMap<String, String>,
+    pub(crate) args: Vec<OsString>,
+    pub(crate) slot: String,
+    pub(crate) target_name: Option<String>,
 }
 
 impl CodexCommandSpec {
@@ -85,6 +87,7 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
     if std::env::var_os("CODEX_HOME").is_some()
         && options.slot.is_none()
         && options.target.is_none()
+        && !options.managed
     {
         return exec_real_codex(&real_codex, options.codex_args);
     }
@@ -106,6 +109,9 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
         slot::load_rotation(&paths)?
     };
     if candidates.is_empty() && options.slot.is_none() {
+        if options.managed {
+            anyhow::bail!("cx --managed requires at least one configured slot or --slot");
+        }
         return exec_real_codex(&real_codex, options.codex_args);
     }
 
@@ -131,6 +137,7 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
         &real_codex,
         &selected_slot,
         target.as_ref(),
+        candidates,
         options,
     )
 }
@@ -146,6 +153,9 @@ pub fn exec_slot_login(paths: &ManagerPaths, args: LoginArgs) -> Result<()> {
 }
 
 pub(crate) fn should_skip_stdin_wrapper(args: &[OsString]) -> bool {
+    if args.iter().any(|arg| arg == "--managed") {
+        return true;
+    }
     first_forwarded_non_option(args).is_some_and(|arg| BYPASS_SUBCOMMANDS.contains(&arg.as_str()))
 }
 
@@ -231,9 +241,11 @@ fn exec_slot_codex(
     real_codex: &Path,
     selected_slot: &str,
     target: Option<&TargetSpec>,
+    candidates: Vec<String>,
     options: RunOptions,
 ) -> Result<()> {
     let should_consider_auto_resume = options.codex_args.is_empty();
+    let original_codex_args = options.codex_args.clone();
     let mut spec = build_slot_command_spec(
         paths,
         real_codex.to_path_buf(),
@@ -242,7 +254,8 @@ fn exec_slot_codex(
         options.codex_args,
     )?;
 
-    let mut resumed_session_id = None;
+    let workspace = resolve_workspace_from_args(&spec.args)?;
+    let mut resumed_session_id = explicit_resume_session_id(&spec.args);
     if should_consider_auto_resume {
         if let Some(plan) = auto_resume_plan(&spec.args)? {
             if let Some(session_id) =
@@ -259,9 +272,25 @@ fn exec_slot_codex(
         if let Some(target) = spec.target_name() {
             eprintln!("codex target: {target}");
         }
-        if let Some(session_id) = resumed_session_id {
+        if let Some(session_id) = &resumed_session_id {
             eprintln!("codex resume: {session_id}");
         }
+    }
+
+    if options.managed {
+        return crate::supervisor::run(crate::supervisor::SupervisorLaunch {
+            paths: paths.clone(),
+            real_codex: real_codex.to_path_buf(),
+            target: target.cloned(),
+            candidates,
+            selected_slot: selected_slot.to_string(),
+            original_codex_args,
+            initial_spec: spec,
+            session_id: resumed_session_id,
+            workspace,
+            quiet: options.quiet,
+            debug: options.debug,
+        });
     }
 
     exec(spec.into_command())
@@ -317,7 +346,7 @@ fn first_forwarded_non_option(args: &[OsString]) -> Option<String> {
             "--slot" | "--target" | "--manager-dir" | "--codex-bin" | "-s" => {
                 let _ = iter.next();
             }
-            "--cx-quiet" | "--cx-debug" => {}
+            "--managed" | "--cx-quiet" | "--cx-debug" => {}
             _ if arg_text.starts_with("--slot=")
                 || arg_text.starts_with("--target=")
                 || arg_text.starts_with("--manager-dir=")
@@ -393,13 +422,13 @@ fn auto_resume_plan(args: &[OsString]) -> Result<Option<AutoResumePlan>> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CodexOptionKind {
+pub(crate) enum CodexOptionKind {
     Flag,
     Value,
     Unknown,
 }
 
-fn codex_option_kind(arg: &str) -> CodexOptionKind {
+pub(crate) fn codex_option_kind(arg: &str) -> CodexOptionKind {
     if arg.contains('=') {
         let name = arg.split_once('=').map(|(name, _)| name).unwrap_or(arg);
         return match name {
@@ -444,7 +473,7 @@ fn codex_option_kind(arg: &str) -> CodexOptionKind {
     }
 }
 
-fn is_codex_subcommand(arg: &str) -> bool {
+pub(crate) fn is_codex_subcommand(arg: &str) -> bool {
     matches!(
         arg,
         "exec"
@@ -485,12 +514,67 @@ fn resolve_workspace(workspace: Option<PathBuf>) -> Result<PathBuf> {
     }
 }
 
+pub(crate) fn resolve_workspace_from_args(args: &[OsString]) -> Result<PathBuf> {
+    let mut workspace = None;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        let arg_text = arg.to_string_lossy();
+        if matches!(arg_text.as_ref(), "-C" | "--cd") {
+            index += 1;
+            let value = args
+                .get(index)
+                .with_context(|| format!("{arg_text} requires a value"))?;
+            workspace = Some(PathBuf::from(value));
+            index += 1;
+            continue;
+        }
+        if let Some(value) = arg_text.strip_prefix("--cd=") {
+            workspace = Some(PathBuf::from(value));
+            index += 1;
+            continue;
+        }
+        index += 1;
+    }
+    resolve_workspace(workspace)
+}
+
+pub(crate) fn explicit_resume_session_id(args: &[OsString]) -> Option<String> {
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        let arg_text = arg.to_string_lossy();
+        if arg_text.starts_with('-') {
+            match codex_option_kind(arg_text.as_ref()) {
+                CodexOptionKind::Flag => {
+                    index += 1;
+                }
+                CodexOptionKind::Value => {
+                    index += 2;
+                }
+                CodexOptionKind::Unknown => {
+                    index += 1;
+                }
+            }
+            continue;
+        }
+        if arg_text == "resume" {
+            return args
+                .get(index + 1)
+                .filter(|value| !value.to_string_lossy().starts_with('-'))
+                .map(|value| value.to_string_lossy().to_string());
+        }
+        return None;
+    }
+    None
+}
+
 fn insert_resume_args(args: &mut Vec<OsString>, insert_index: usize, session_id: &str) {
     args.insert(insert_index, OsString::from("resume"));
     args.insert(insert_index + 1, OsString::from(session_id));
 }
 
-fn usage_timeout() -> f32 {
+pub(crate) fn usage_timeout() -> f32 {
     std::env::var("CX_SLOT_USAGE_TIMEOUT")
         .ok()
         .and_then(|value| value.parse::<f32>().ok())
@@ -528,6 +612,9 @@ fn parse_run_args(args: Vec<OsString>) -> Result<RunOptions> {
             }
             "--cx-debug" => {
                 options.debug = true;
+            }
+            "--managed" => {
+                options.managed = true;
             }
             "-s" => {
                 if let Some(next) = iter.peek() {
@@ -626,12 +713,37 @@ mod tests {
     }
 
     #[test]
+    fn managed_flag_is_removed_from_forwarded_args() {
+        let options = parse_run_args(vec![
+            OsString::from("--managed"),
+            OsString::from("-m"),
+            OsString::from("gpt-5.5"),
+        ])
+        .unwrap();
+
+        assert!(options.managed);
+        assert_eq!(
+            options.codex_args,
+            vec![OsString::from("-m"), OsString::from("gpt-5.5")]
+        );
+    }
+
+    #[test]
     fn app_server_subcommand_skips_stdin_wrapper() {
         assert!(should_skip_stdin_wrapper(&[
             OsString::from("--slot"),
             OsString::from("bus1"),
             OsString::from("app-server"),
             OsString::from("--help"),
+        ]));
+    }
+
+    #[test]
+    fn managed_launch_skips_stdin_wrapper() {
+        assert!(should_skip_stdin_wrapper(&[
+            OsString::from("--managed"),
+            OsString::from("resume"),
+            OsString::from("sid"),
         ]));
     }
 
@@ -666,6 +778,21 @@ mod tests {
         let plan = auto_resume_plan(&args).unwrap();
 
         assert_eq!(plan, None);
+    }
+
+    #[test]
+    fn explicit_resume_session_id_skips_root_overrides() {
+        let args = vec![
+            OsString::from("-c"),
+            OsString::from("model=\"gpt-5.5\""),
+            OsString::from("resume"),
+            OsString::from("019dfdd3-debc-7da2-88fc-b15b73f5e138"),
+        ];
+
+        assert_eq!(
+            explicit_resume_session_id(&args),
+            Some(String::from("019dfdd3-debc-7da2-88fc-b15b73f5e138"))
+        );
     }
 
     #[test]

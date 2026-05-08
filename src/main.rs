@@ -19,6 +19,7 @@ mod service;
 mod session;
 mod slot;
 mod stats;
+mod supervisor;
 mod target;
 mod transfer;
 mod usage;
@@ -32,6 +33,7 @@ use clap::Parser;
 use cli::ChannelCommand;
 use cli::Cli;
 use cli::Command;
+use cli::ManagedCommand;
 use cli::ProtocolCommand;
 use cli::ServeCommand;
 use cli::ServiceCommand;
@@ -147,6 +149,11 @@ fn entry() -> Result<()> {
             ServiceCommand::Token(args) => service::token(args)?,
             ServiceCommand::Install(args) => service::install(args)?,
             ServiceCommand::Uninstall(args) => service::uninstall(args)?,
+        },
+        Command::Managed(args) => match args.command {
+            ManagedCommand::Status(args) => supervisor::control::status(args)?,
+            ManagedCommand::Rotate(args) => supervisor::control::rotate(args)?,
+            ManagedCommand::Resume(args) => supervisor::control::resume(args)?,
         },
         Command::Protocol(args) => match args.command {
             ProtocolCommand::Export(args) => protocol_export::export(args)?,

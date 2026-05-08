@@ -70,6 +70,18 @@ impl ManagerPaths {
         self.serve_dir().join("sessions")
     }
 
+    pub fn managed_supervisors_dir(&self) -> PathBuf {
+        self.serve_dir().join("supervisors")
+    }
+
+    pub fn managed_state_file(&self, pid: u32) -> PathBuf {
+        self.managed_supervisors_dir().join(format!("{pid}.json"))
+    }
+
+    pub fn managed_control_socket(&self, pid: u32) -> PathBuf {
+        self.managed_supervisors_dir().join(format!("{pid}.sock"))
+    }
+
     pub fn serve_session_file(&self, session_id: &str) -> PathBuf {
         self.serve_sessions_dir().join(format!("{session_id}.json"))
     }

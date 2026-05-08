@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use anyhow::Result;
 
 use crate::paths::ManagerPaths;
@@ -35,8 +37,16 @@ pub fn query_slots(
 }
 
 pub fn choose_result(results: &[SlotResult]) -> Option<&SlotResult> {
+    choose_result_excluding(results, &BTreeSet::new())
+}
+
+pub fn choose_result_excluding<'a>(
+    results: &'a [SlotResult],
+    excluded_slots: &BTreeSet<String>,
+) -> Option<&'a SlotResult> {
     let mut available = results
         .iter()
+        .filter(|result| !excluded_slots.contains(&result.slot))
         .filter(|result| result.is_available())
         .collect::<Vec<_>>();
     if !available.is_empty() {
@@ -46,6 +56,7 @@ pub fn choose_result(results: &[SlotResult]) -> Option<&SlotResult> {
 
     let mut transient = results
         .iter()
+        .filter(|result| !excluded_slots.contains(&result.slot))
         .filter(|result| result.is_transient())
         .collect::<Vec<_>>();
     transient.sort_by_key(|result| result.index);
@@ -81,6 +92,35 @@ mod tests {
 
         assert_eq!(
             choose_result(&results).map(|result| result.slot.as_str()),
+            Some("network")
+        );
+    }
+
+    #[test]
+    fn excludes_current_and_cooldown_slots() {
+        let results = vec![
+            SlotResult::new("current", 0, SlotStatus::Available, 100.0, "current"),
+            SlotResult::new("cooldown", 1, SlotStatus::Available, 90.0, "cooldown"),
+            SlotResult::new("next", 2, SlotStatus::Available, 80.0, "next"),
+        ];
+        let excluded = BTreeSet::from([String::from("current"), String::from("cooldown")]);
+
+        assert_eq!(
+            choose_result_excluding(&results, &excluded).map(|result| result.slot.as_str()),
+            Some("next")
+        );
+    }
+
+    #[test]
+    fn excludes_transient_slots_too() {
+        let results = vec![
+            SlotResult::new("current", 0, SlotStatus::Error, -1.0, "offline"),
+            SlotResult::new("network", 1, SlotStatus::Error, -1.0, "offline"),
+        ];
+        let excluded = BTreeSet::from([String::from("current")]);
+
+        assert_eq!(
+            choose_result_excluding(&results, &excluded).map(|result| result.slot.as_str()),
             Some("network")
         );
     }

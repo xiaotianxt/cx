@@ -20,13 +20,29 @@ enum ActiveState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ResumeCandidate {
-    session_id: String,
-    rollout_path: PathBuf,
+pub(crate) struct ResumeCandidate {
+    pub(crate) session_id: String,
+    pub(crate) rollout_path: PathBuf,
 }
 
 pub(crate) fn inactive_latest_session_id(slot_home: &Path, workspace: &Path) -> Option<String> {
     inactive_latest_session_id_with_probe(slot_home, workspace, lsof_active_state)
+        .ok()
+        .flatten()
+}
+
+pub(crate) fn latest_session_candidate(
+    slot_home: &Path,
+    workspace: &Path,
+) -> Option<ResumeCandidate> {
+    latest_resume_candidate(slot_home, workspace).ok().flatten()
+}
+
+pub(crate) fn session_candidate_by_id(
+    slot_home: &Path,
+    session_id: &str,
+) -> Option<ResumeCandidate> {
+    session_candidate_by_id_inner(slot_home, session_id)
         .ok()
         .flatten()
 }
@@ -84,6 +100,46 @@ fn latest_resume_candidate(slot_home: &Path, workspace: &Path) -> Result<Option<
         .prepare(&sql)
         .with_context(|| format!("prepare latest session query for {}", db_path.display()))?;
     let mut rows = statement.query(params![workspace.display().to_string()])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+
+    Ok(Some(ResumeCandidate {
+        session_id: row.get(0)?,
+        rollout_path: PathBuf::from(row.get::<_, String>(1)?),
+    }))
+}
+
+fn session_candidate_by_id_inner(
+    slot_home: &Path,
+    session_id: &str,
+) -> Result<Option<ResumeCandidate>> {
+    let db_path = slot_home.join(STATE_DB);
+    if !db_path.exists() {
+        return Ok(None);
+    }
+
+    let conn = Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("open {}", db_path.display()))?;
+    let columns = thread_columns(&conn)?;
+    for required in ["id", "rollout_path", "source", "archived"] {
+        if !columns.contains(required) {
+            return Ok(None);
+        }
+    }
+
+    let mut statement = conn
+        .prepare(
+            "SELECT id, rollout_path \
+             FROM threads \
+             WHERE id = ?1 \
+               AND archived = 0 \
+               AND rollout_path <> '' \
+               AND source IN ('cli','vscode') \
+             LIMIT 1",
+        )
+        .with_context(|| format!("prepare session query for {}", db_path.display()))?;
+    let mut rows = statement.query(params![session_id])?;
     let Some(row) = rows.next()? else {
         return Ok(None);
     };
@@ -247,5 +303,43 @@ mod tests {
         .unwrap();
 
         assert_eq!(session_id, None);
+    }
+
+    #[test]
+    fn latest_session_candidate_does_not_check_active_state() {
+        let root = temp_dir("latest-without-active");
+        let slot_home = root.join("slot-home");
+        let workspace = root.join("workspace");
+        let rollout = root.join("active.jsonl");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(&rollout, "").unwrap();
+        seed_threads(
+            &slot_home,
+            &[("active", &rollout, &workspace, 10, "cli", 0)],
+        );
+
+        let candidate = latest_session_candidate(&slot_home, &workspace).unwrap();
+
+        assert_eq!(candidate.session_id, "active");
+        assert_eq!(candidate.rollout_path, rollout);
+    }
+
+    #[test]
+    fn session_candidate_by_id_finds_specific_session() {
+        let root = temp_dir("by-id");
+        let slot_home = root.join("slot-home");
+        let workspace = root.join("workspace");
+        let rollout = root.join("chosen.jsonl");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(&rollout, "").unwrap();
+        seed_threads(
+            &slot_home,
+            &[("chosen", &rollout, &workspace, 10, "cli", 0)],
+        );
+
+        let candidate = session_candidate_by_id(&slot_home, "chosen").unwrap();
+
+        assert_eq!(candidate.session_id, "chosen");
+        assert_eq!(candidate.rollout_path, rollout);
     }
 }

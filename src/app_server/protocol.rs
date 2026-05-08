@@ -72,8 +72,31 @@ pub(super) struct InitializeResponse {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct ThreadListParams {
-    pub limit: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort_direction: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_providers: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_kinds: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archived: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<ThreadListCwdFilter>,
     pub use_state_db_only: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_term: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub(super) enum ThreadListCwdFilter {
+    One(String),
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -91,6 +114,10 @@ pub(super) struct ThreadListResponse {
 pub(super) struct ThreadSummary {
     pub id: String,
     #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
     pub name: Option<String>,
     pub preview: String,
     pub cwd: String,
@@ -98,6 +125,8 @@ pub(super) struct ThreadSummary {
     pub status: Value,
     pub created_at: i64,
     pub updated_at: i64,
+    #[serde(default)]
+    pub turns: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -111,7 +140,7 @@ pub(super) struct ThreadStartParams {
 
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct ThreadStartResponse {
-    pub thread: ThreadIdOnly,
+    pub thread: ThreadSummary,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -119,12 +148,16 @@ pub(super) struct ThreadStartResponse {
 pub(super) struct ThreadResumeParams {
     pub thread_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub exclude_turns: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct ThreadResumeResponse {
-    pub thread: ThreadIdOnly,
+    pub thread: ThreadSummary,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -134,16 +167,22 @@ pub(super) struct ThreadReadParams {
     pub include_turns: bool,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub(super) struct ThreadReadResponse {
+    pub thread: ThreadSummary,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ThreadUnsubscribeParams {
+    pub thread_id: String,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct TurnInterruptParams {
     pub thread_id: String,
     pub turn_id: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub(super) struct ThreadIdOnly {
-    pub id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -153,6 +192,20 @@ pub(super) struct TurnStartParams {
     pub input: Vec<UserInput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct TurnSteerParams {
+    pub thread_id: String,
+    pub input: Vec<UserInput>,
+    pub expected_turn_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct TurnSteerResponse {
+    pub turn_id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -36,28 +36,53 @@ pub(crate) struct ThreadListPage {
     pub backwards_cursor: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ThreadListFilter<'a> {
+    pub limit: u64,
+    pub cwd: Option<&'a str>,
+    pub archived: Option<bool>,
+    pub source_kinds: Option<&'a [&'a str]>,
+    pub use_state_db_only: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AppThreadSummary {
     pub upstream_thread_id: String,
+    pub session_id: Option<String>,
     pub title: Option<String>,
     pub preview: String,
     pub cwd: String,
+    pub path: Option<String>,
     pub source: String,
     pub status: String,
+    pub active_turn_id: Option<String>,
     pub active: bool,
     pub created_at_unix: i64,
     pub updated_at_unix: i64,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct AppThreadRead {
+    pub summary: AppThreadSummary,
+    pub turns: Vec<Value>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StartedThread {
     pub upstream_thread_id: String,
+    pub path: Option<String>,
+    pub cwd: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StartedTurn {
     pub turn_id: String,
     pub assistant_text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SteeredTurn {
+    pub turn_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,9 +138,10 @@ pub(crate) struct ApprovalRequest {
     pub params: Value,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ParsedServerEvent {
     Stream(AppStreamEvent),
+    ApprovalRequest(ApprovalRequest),
     TurnCompleted { turn_id: String },
 }
 
@@ -180,19 +206,52 @@ impl AppServerClient {
         let response = self.request(
             "thread/list",
             protocol::ThreadListParams {
-                limit: 1,
+                cursor: None,
+                limit: Some(1),
+                sort_key: Some(String::from("updated_at")),
+                sort_direction: Some(String::from("desc")),
+                model_providers: None,
+                source_kinds: None,
+                archived: Some(false),
+                cwd: None,
                 use_state_db_only: true,
+                search_term: None,
             },
         )?;
         Ok(ThreadListInfo::from_response(&response))
     }
 
     pub(crate) fn thread_list(&mut self, limit: u64) -> Result<ThreadListPage> {
+        self.thread_list_filtered(ThreadListFilter {
+            limit,
+            cwd: None,
+            archived: Some(false),
+            source_kinds: None,
+            use_state_db_only: true,
+        })
+    }
+
+    pub(crate) fn thread_list_filtered(
+        &mut self,
+        filter: ThreadListFilter<'_>,
+    ) -> Result<ThreadListPage> {
         let response = self.request(
             "thread/list",
             protocol::ThreadListParams {
-                limit,
-                use_state_db_only: true,
+                cursor: None,
+                limit: Some(filter.limit.min(u64::from(u32::MAX)) as u32),
+                sort_key: Some(String::from("updated_at")),
+                sort_direction: Some(String::from("desc")),
+                model_providers: None,
+                source_kinds: filter
+                    .source_kinds
+                    .map(|kinds| kinds.iter().map(|kind| (*kind).to_string()).collect()),
+                archived: filter.archived,
+                cwd: filter
+                    .cwd
+                    .map(|cwd| protocol::ThreadListCwdFilter::One(cwd.to_string())),
+                use_state_db_only: filter.use_state_db_only,
+                search_term: None,
             },
         )?;
         let response = serde_json::from_value::<protocol::ThreadListResponse>(response)
@@ -219,21 +278,70 @@ impl AppServerClient {
         let response = serde_json::from_value::<protocol::ThreadStartResponse>(response)
             .context("decode thread/start response")?;
         Ok(StartedThread {
-            upstream_thread_id: response.thread.id,
+            upstream_thread_id: response.thread.id.clone(),
+            path: response.thread.path,
+            cwd: response.thread.cwd,
         })
     }
 
     pub(crate) fn thread_resume(&mut self, thread_id: &str, cwd: Option<&str>) -> Result<()> {
+        self.thread_resume_with_path(thread_id, None, cwd, false)
+            .map(|_| ())
+    }
+
+    pub(crate) fn thread_resume_with_path(
+        &mut self,
+        thread_id: &str,
+        path: Option<&str>,
+        cwd: Option<&str>,
+        exclude_turns: bool,
+    ) -> Result<AppThreadRead> {
         let response = self.request(
             "thread/resume",
             protocol::ThreadResumeParams {
                 thread_id: thread_id.to_string(),
+                path: path.map(str::to_string),
                 cwd: cwd.map(str::to_string),
+                exclude_turns,
             },
         )?;
         let response = serde_json::from_value::<protocol::ThreadResumeResponse>(response)
             .context("decode thread/resume response")?;
-        let _thread_id = response.thread.id;
+        let turns = response.thread.turns.clone();
+        Ok(AppThreadRead {
+            summary: AppThreadSummary::from(response.thread),
+            turns,
+        })
+    }
+
+    pub(crate) fn thread_read(
+        &mut self,
+        thread_id: &str,
+        include_turns: bool,
+    ) -> Result<AppThreadRead> {
+        let response = self.request(
+            "thread/read",
+            protocol::ThreadReadParams {
+                thread_id: thread_id.to_string(),
+                include_turns,
+            },
+        )?;
+        let response = serde_json::from_value::<protocol::ThreadReadResponse>(response)
+            .context("decode thread/read response")?;
+        let turns = response.thread.turns.clone();
+        Ok(AppThreadRead {
+            summary: AppThreadSummary::from(response.thread),
+            turns,
+        })
+    }
+
+    pub(crate) fn thread_unsubscribe(&mut self, thread_id: &str) -> Result<()> {
+        let _response = self.request(
+            "thread/unsubscribe",
+            protocol::ThreadUnsubscribeParams {
+                thread_id: thread_id.to_string(),
+            },
+        )?;
         Ok(())
     }
 
@@ -279,15 +387,73 @@ impl AppServerClient {
         self.collect_turn_start(request_id, thread_id, &mut on_event, &mut on_approval)
     }
 
-    pub(crate) fn active_turn_id(&mut self, thread_id: &str) -> Result<Option<String>> {
+    pub(crate) fn turn_steer(
+        &mut self,
+        thread_id: &str,
+        turn_id: &str,
+        prompt: String,
+    ) -> Result<SteeredTurn> {
         let response = self.request(
-            "thread/read",
-            protocol::ThreadReadParams {
+            "turn/steer",
+            protocol::TurnSteerParams {
                 thread_id: thread_id.to_string(),
-                include_turns: true,
+                input: vec![protocol::UserInput::Text {
+                    text: prompt,
+                    text_elements: Vec::new(),
+                }],
+                expected_turn_id: turn_id.to_string(),
             },
         )?;
-        Ok(latest_in_progress_turn_id(&response))
+        let response = serde_json::from_value::<protocol::TurnSteerResponse>(response)
+            .context("decode turn/steer response")?;
+        Ok(SteeredTurn {
+            turn_id: response.turn_id,
+        })
+    }
+
+    pub(crate) fn drain_thread_events<F>(
+        &mut self,
+        thread_id: &str,
+        turn_id: Option<&str>,
+        max_events: usize,
+        mut on_event: F,
+        mut on_approval: impl FnMut(ApprovalRequest) -> Result<Option<Value>>,
+    ) -> Result<usize>
+    where
+        F: FnMut(ParsedServerEvent) -> Result<()>,
+    {
+        let mut count = 0usize;
+        while count < max_events {
+            let Some(frame) = self.websocket.read_text_optional()? else {
+                return Ok(count);
+            };
+            let value =
+                serde_json::from_str::<Value>(&frame).context("decode app-server event frame")?;
+            if let Some(event) = parse_server_event(&value, thread_id, turn_id) {
+                if let ParsedServerEvent::ApprovalRequest(approval) = &event {
+                    if let Some(result) = on_approval(approval.clone())? {
+                        self.send_success_response(approval.id.clone(), result)?;
+                    }
+                }
+                on_event(event)?;
+                count += 1;
+                continue;
+            }
+            let message = serde_json::from_value::<ServerMessage>(value)
+                .context("decode app-server drain message")?;
+            if let ServerMessage::Request(request) = message {
+                self.send_error_response(
+                    request.id,
+                    -32601,
+                    format!("unsupported app-server request: {}", request.method),
+                )?;
+            }
+        }
+        Ok(count)
+    }
+
+    pub(crate) fn active_turn_id(&mut self, thread_id: &str) -> Result<Option<String>> {
+        Ok(self.thread_read(thread_id, true)?.summary.active_turn_id)
     }
 
     fn request<P>(&mut self, method: &'static str, params: P) -> Result<Value>
@@ -532,19 +698,6 @@ fn is_approval_request_method(method: &str) -> bool {
     )
 }
 
-fn latest_in_progress_turn_id(response: &Value) -> Option<String> {
-    response
-        .get("thread")?
-        .get("turns")?
-        .as_array()?
-        .iter()
-        .rev()
-        .find(|turn| turn.get("status").and_then(Value::as_str) == Some("inProgress"))?
-        .get("id")?
-        .as_str()
-        .map(str::to_string)
-}
-
 pub(crate) fn parse_server_event(
     message: &Value,
     thread_id: &str,
@@ -552,6 +705,16 @@ pub(crate) fn parse_server_event(
 ) -> Option<ParsedServerEvent> {
     let message = serde_json::from_value::<ServerMessage>(message.clone()).ok()?;
     match message {
+        ServerMessage::Request(request)
+            if is_approval_request_method(&request.method)
+                && request_params_match_thread(&request.params, thread_id, turn_id) =>
+        {
+            Some(ParsedServerEvent::ApprovalRequest(ApprovalRequest {
+                id: request.id,
+                method: request.method,
+                params: request.params.unwrap_or(Value::Null),
+            }))
+        }
         ServerMessage::Notification { method, params }
             if method == "turn/started" || method == "task/started" =>
         {
@@ -612,6 +775,20 @@ pub(crate) fn parse_server_event(
         }
         _ => None,
     }
+}
+
+fn request_params_match_thread(
+    params: &Option<Value>,
+    thread_id: &str,
+    turn_id: Option<&str>,
+) -> bool {
+    let Some(params) = params else {
+        return false;
+    };
+    if params.get("threadId").and_then(Value::as_str) != Some(thread_id) {
+        return false;
+    }
+    turn_id.is_none_or(|turn_id| params.get("turnId").and_then(Value::as_str) == Some(turn_id))
 }
 
 fn notification_delta<'a>(
@@ -1088,18 +1265,32 @@ fn started_turn_id<'a>(params: &'a Option<Value>, thread_id: &str) -> Option<&'a
 impl From<protocol::ThreadSummary> for AppThreadSummary {
     fn from(thread: protocol::ThreadSummary) -> Self {
         let status = status_type(&thread.status);
+        let active_turn_id = latest_in_progress_turn_id_from_turns(&thread.turns);
         Self {
             upstream_thread_id: thread.id,
+            session_id: thread.session_id,
             title: thread.name,
             preview: thread.preview,
             cwd: thread.cwd,
+            path: thread.path,
             source: source_kind(&thread.source),
+            active_turn_id,
             active: status == "active",
             status,
             created_at_unix: thread.created_at,
             updated_at_unix: thread.updated_at,
         }
     }
+}
+
+fn latest_in_progress_turn_id_from_turns(turns: &[Value]) -> Option<String> {
+    turns
+        .iter()
+        .rev()
+        .find(|turn| turn.get("status").and_then(Value::as_str) == Some("inProgress"))?
+        .get("id")?
+        .as_str()
+        .map(str::to_string)
 }
 
 fn status_type(status: &Value) -> String {
@@ -1151,6 +1342,8 @@ mod tests {
     fn thread_summary_maps_private_protocol_to_stable_fields() {
         let thread = protocol::ThreadSummary {
             id: String::from("thread-1"),
+            session_id: Some(String::from("thread-1")),
+            path: Some(String::from("/tmp/thread.jsonl")),
             name: Some(String::from("Fix build")),
             preview: String::from("please fix"),
             cwd: String::from("/tmp/project"),
@@ -1158,6 +1351,7 @@ mod tests {
             status: serde_json::json!({ "type": "active", "activeFlags": [] }),
             created_at: 10,
             updated_at: 20,
+            turns: Vec::new(),
         };
 
         let summary = AppThreadSummary::from(thread);

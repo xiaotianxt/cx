@@ -61,6 +61,22 @@ pub struct ChannelLease {
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+pub struct AppThreadBinding {
+    pub thread_id: String,
+    pub cwd: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot: Option<String>,
+    #[serde(default)]
+    pub generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    pub updated_at_unix: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct SessionRecord {
     pub schema_version: u64,
     pub session_id: SessionId,
@@ -70,6 +86,8 @@ pub struct SessionRecord {
     pub lease_epoch: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_lease: Option<ChannelLease>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_thread: Option<AppThreadBinding>,
     pub created_at_unix: u64,
     pub updated_at_unix: u64,
 }
@@ -115,6 +133,12 @@ pub struct ReleaseLeaseRequest {
 pub struct RecordChannelMessageRequest {
     pub session_id: SessionId,
     pub channel_id: ChannelId,
+}
+
+#[derive(Debug, Clone)]
+pub struct BindAppThreadRequest {
+    pub session_id: SessionId,
+    pub app_thread: AppThreadBinding,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -296,6 +320,7 @@ pub fn create_session(
         status: SessionStatus::Active,
         lease_epoch: 0,
         active_lease: None,
+        app_thread: None,
         created_at_unix: now,
         updated_at_unix: now,
     };
@@ -391,6 +416,72 @@ pub fn record_channel_message(
     };
     append_event(paths, &event)?;
     Ok(event)
+}
+
+pub fn bind_app_thread(
+    paths: &ManagerPaths,
+    request: BindAppThreadRequest,
+) -> Result<SessionRecord> {
+    let now = unix_now_secs()?;
+    let mut session = show_session(paths, &request.session_id)?;
+    session.app_thread = Some(request.app_thread);
+    session.updated_at_unix = now;
+    write_session_replace(paths, &session)?;
+    Ok(session)
+}
+
+pub fn find_session_by_channel(
+    paths: &ManagerPaths,
+    channel_id: &ChannelId,
+) -> Result<Option<SessionRecord>> {
+    Ok(list_sessions(paths)?
+        .into_iter()
+        .filter(|session| {
+            &session.primary_channel_id == channel_id || &session.current_channel_id == channel_id
+        })
+        .max_by(|left, right| {
+            left.updated_at_unix
+                .cmp(&right.updated_at_unix)
+                .then_with(|| left.session_id.cmp(&right.session_id))
+        }))
+}
+
+pub fn find_session_by_app_thread_cwd(
+    paths: &ManagerPaths,
+    cwd: &str,
+) -> Result<Option<SessionRecord>> {
+    Ok(list_sessions(paths)?
+        .into_iter()
+        .filter(|session| {
+            session
+                .app_thread
+                .as_ref()
+                .is_some_and(|app_thread| app_thread.cwd == cwd)
+        })
+        .max_by(|left, right| {
+            left.updated_at_unix
+                .cmp(&right.updated_at_unix)
+                .then_with(|| left.session_id.cmp(&right.session_id))
+        }))
+}
+
+pub fn find_session_by_app_thread_id(
+    paths: &ManagerPaths,
+    thread_id: &str,
+) -> Result<Option<SessionRecord>> {
+    Ok(list_sessions(paths)?
+        .into_iter()
+        .filter(|session| {
+            session
+                .app_thread
+                .as_ref()
+                .is_some_and(|app_thread| app_thread.thread_id == thread_id)
+        })
+        .max_by(|left, right| {
+            left.updated_at_unix
+                .cmp(&right.updated_at_unix)
+                .then_with(|| left.session_id.cmp(&right.session_id))
+        }))
 }
 
 pub fn list_sessions(paths: &ManagerPaths) -> Result<Vec<SessionRecord>> {

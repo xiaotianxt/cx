@@ -16,13 +16,24 @@ use crate::app_server::CommandActivity;
 use crate::app_server::CommandExecution;
 use crate::app_server::CommandExecutionStatus;
 
-use super::rollout::command_path_label;
 use super::truncate_chars;
 use super::unix_millis;
 
 pub(super) trait TelegramTranscriptTarget {
     fn send_one(&self, text: &str) -> Result<i64>;
     fn edit_one(&self, message_id: i64, text: &str) -> Result<()>;
+}
+
+fn command_path_label(path: &str) -> Option<&str> {
+    let path = path.trim();
+    if path.is_empty() {
+        return None;
+    }
+    Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .or(Some(path))
 }
 
 pub(super) struct TelegramStatusPanel {

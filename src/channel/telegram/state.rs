@@ -15,6 +15,8 @@ use serde::Serialize;
 
 use crate::paths::ManagerPaths;
 use crate::session;
+use crate::session::AppThreadBinding;
+use crate::session::BindAppThreadRequest;
 use crate::session::ChannelId;
 use crate::session::CreateSessionRequest;
 use crate::session::SessionId;
@@ -66,11 +68,7 @@ pub(super) struct TelegramBinding {
     #[serde(default)]
     pub(super) topic_created_by_adapter: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) watch_proxy_offset: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) watch_rollout_offset: Option<u64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(super) watch_source: Option<TelegramWatchSource>,
+    pub(super) watch_app_last_turn_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) watch_last_agent_message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -81,13 +79,6 @@ pub(super) struct TelegramBinding {
     pub(super) watch_status: Option<TelegramStatusState>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) watch_pending_approvals: Vec<TelegramPendingApproval>,
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub(super) enum TelegramWatchSource {
-    Proxy,
-    Rollout,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -207,9 +198,7 @@ impl TelegramState {
             panel_message_id: None,
             telegram_paused: false,
             topic_created_by_adapter: false,
-            watch_proxy_offset: None,
-            watch_rollout_offset: None,
-            watch_source: None,
+            watch_app_last_turn_id: None,
             watch_last_agent_message: None,
             watch_activity: None,
             watch_thinking: None,
@@ -238,9 +227,7 @@ impl TelegramState {
             stored.panel_message_id = None;
             stored.telegram_paused = false;
             stored.topic_created_by_adapter = topic_created_by_adapter;
-            stored.watch_proxy_offset = None;
-            stored.watch_rollout_offset = None;
-            stored.watch_source = None;
+            stored.watch_app_last_turn_id = None;
             stored.watch_last_agent_message = None;
             stored.watch_activity = None;
             stored.watch_thinking = None;
@@ -248,6 +235,21 @@ impl TelegramState {
             stored.watch_pending_approvals.clear();
             binding = stored.clone();
         }
+        session::bind_app_thread(
+            paths,
+            BindAppThreadRequest {
+                session_id: binding.session_id.clone(),
+                app_thread: AppThreadBinding {
+                    thread_id: app_thread.thread_id.clone(),
+                    cwd: app_thread.cwd.clone(),
+                    title: app_thread.title.clone(),
+                    slot: None,
+                    generation: 0,
+                    path: None,
+                    updated_at_unix: super::unix_millis().saturating_div(1000) as u64,
+                },
+            },
+        )?;
         debug_assert_eq!(binding.session_id, existing_session_id);
         Ok(binding)
     }

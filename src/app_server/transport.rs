@@ -1,4 +1,5 @@
 use std::fs::File;
+use std::io::ErrorKind;
 use std::io::Read;
 use std::io::Write;
 use std::net::TcpStream;
@@ -100,7 +101,7 @@ impl WebSocket {
 
     pub(super) fn read_text(&mut self) -> Result<String> {
         loop {
-            let frame = self.read_frame()?;
+            let frame = self.read_frame()?.context("app-server websocket closed")?;
             match frame.opcode {
                 0x1 => {
                     if !frame.fin {
@@ -110,6 +111,28 @@ impl WebSocket {
                         .context("decode app-server text frame");
                 }
                 0x8 => anyhow::bail!("app-server websocket closed"),
+                0x9 => self.send_frame(0xA, &frame.payload)?,
+                0xA => {}
+                opcode => anyhow::bail!("unsupported app-server websocket opcode: {opcode}"),
+            }
+        }
+    }
+
+    pub(super) fn read_text_optional(&mut self) -> Result<Option<String>> {
+        loop {
+            let Some(frame) = self.read_frame()? else {
+                return Ok(None);
+            };
+            match frame.opcode {
+                0x1 => {
+                    if !frame.fin {
+                        anyhow::bail!("fragmented app-server websocket messages are unsupported");
+                    }
+                    return String::from_utf8(frame.payload)
+                        .map(Some)
+                        .context("decode app-server text frame");
+                }
+                0x8 => return Ok(None),
                 0x9 => self.send_frame(0xA, &frame.payload)?,
                 0xA => {}
                 opcode => anyhow::bail!("unsupported app-server websocket opcode: {opcode}"),
@@ -143,11 +166,20 @@ impl WebSocket {
             .context("write app-server websocket frame")
     }
 
-    fn read_frame(&mut self) -> Result<Frame> {
+    fn read_frame(&mut self) -> Result<Option<Frame>> {
         let mut header = [0_u8; 2];
-        self.stream
-            .read_exact(&mut header)
-            .context("read app-server websocket frame header")?;
+        match self.stream.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    ErrorKind::UnexpectedEof | ErrorKind::TimedOut | ErrorKind::WouldBlock
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(err) => return Err(err).context("read app-server websocket frame header"),
+        }
         let fin = header[0] & 0x80 != 0;
         let opcode = header[0] & 0x0f;
         let masked = header[1] & 0x80 != 0;
@@ -185,11 +217,11 @@ impl WebSocket {
                 *byte ^= mask[index % mask.len()];
             }
         }
-        Ok(Frame {
+        Ok(Some(Frame {
             fin,
             opcode,
             payload,
-        })
+        }))
     }
 
     fn next_mask(&mut self) -> [u8; 4] {

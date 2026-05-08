@@ -3,18 +3,24 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 
 use anyhow::Context;
 use anyhow::Result;
 
-use crate::autoresume;
+use crate::app_server::AppServerClient;
 use crate::cli::LoginArgs;
 use crate::envfile;
 use crate::paths;
 use crate::paths::ManagerPaths;
 use crate::selector;
+use crate::serve;
 use crate::slot;
 use crate::target::TargetSpec;
+use crate::thread_resolver;
+use crate::thread_resolver::ThreadResolverDecision;
+use crate::thread_resolver::ThreadResolverScope;
 
 const BYPASS_SUBCOMMANDS: &[&str] = &[
     "login",
@@ -251,7 +257,7 @@ fn exec_slot_codex(
     candidates: Vec<String>,
     options: RunOptions,
 ) -> Result<()> {
-    let should_consider_auto_resume = options.codex_args.is_empty();
+    let clean_tui_launch = options.codex_args.is_empty();
     let original_codex_args = options.codex_args.clone();
     let mut spec = build_slot_command_spec(
         paths,
@@ -263,14 +269,18 @@ fn exec_slot_codex(
 
     let workspace = resolve_workspace_from_args(&spec.args)?;
     let mut resumed_session_id = explicit_resume_session_id(&spec.args);
-    if should_consider_auto_resume {
-        if let Some(plan) = auto_resume_plan(&spec.args)? {
-            if let Some(session_id) =
-                autoresume::inactive_latest_session_id(&spec.codex_home, &plan.workspace)
-            {
-                insert_resume_args(&mut spec.args, plan.insert_index, &session_id);
-                resumed_session_id = Some(session_id);
-            }
+    let mut remote_tui = false;
+    if !options.managed {
+        if let Some(remote_spec) = remote_attach_spec(
+            paths,
+            &spec,
+            &workspace,
+            resumed_session_id.clone(),
+            clean_tui_launch,
+        )? {
+            spec = remote_spec;
+            resumed_session_id = explicit_resume_session_id(&spec.args);
+            remote_tui = true;
         }
     }
 
@@ -294,13 +304,202 @@ fn exec_slot_codex(
             original_codex_args,
             initial_spec: spec,
             session_id: resumed_session_id,
-            workspace,
             quiet: options.quiet,
             debug: options.debug,
         });
     }
 
+    if remote_tui {
+        return supervise_remote_tui(paths, spec);
+    }
     exec(spec.into_command())
+}
+
+fn supervise_remote_tui(paths: &ManagerPaths, spec: CodexCommandSpec) -> Result<()> {
+    let mut restarts = 0_u64;
+    loop {
+        preload_remote_thread(paths, &spec)?;
+        let status = spec
+            .clone()
+            .into_command()
+            .status()
+            .context("run remote Codex TUI")?;
+        if status.success() {
+            return Ok(());
+        }
+        restarts = restarts
+            .checked_add(1)
+            .context("remote TUI restart counter overflow")?;
+        if serve::ready_app_server(paths).is_err() {
+            anyhow::bail!("remote Codex TUI exited with {status} and cx service is not ready");
+        }
+        eprintln!(
+            "cx remote tui exited with {status}; restarting on same app-server thread (attempt {restarts})"
+        );
+        thread::sleep(Duration::from_millis(500));
+    }
+}
+
+fn preload_remote_thread(paths: &ManagerPaths, spec: &CodexCommandSpec) -> Result<()> {
+    let Some(app_server_url) = remote_arg_value(&spec.args, "--remote") else {
+        return Ok(());
+    };
+    let Some(thread_id) = remote_resume_thread_id(&spec.args) else {
+        return Ok(());
+    };
+    let workspace = resolve_workspace_from_args(&spec.args)?;
+    let server = serve::ready_app_server(paths).context("service app-server is not ready")?;
+    let mut client = AppServerClient::connect(app_server_url, Duration::from_secs(5))
+        .context("connect app-server before remote TUI resume")?;
+    client.initialize("cx-tui", env!("CARGO_PKG_VERSION"))?;
+    let outcome = thread_resolver::resolve_app_thread(
+        paths,
+        &mut client,
+        ThreadResolverScope {
+            cwd: workspace,
+            channel_id: None,
+            explicit_thread_id: Some(thread_id.to_string()),
+            slot: Some(server.slot),
+            generation: 0,
+        },
+    )?;
+    if let ThreadResolverDecision::Refuse { reason } = outcome.decision {
+        anyhow::bail!("{reason}");
+    }
+    Ok(())
+}
+
+fn remote_arg_value<'a>(args: &'a [OsString], name: &str) -> Option<&'a str> {
+    let mut index = 0;
+    while index < args.len() {
+        let Some(arg) = args[index].to_str() else {
+            index += 1;
+            continue;
+        };
+        if arg == name {
+            return args.get(index + 1).and_then(|value| value.to_str());
+        }
+        if let Some(value) = arg.strip_prefix(&format!("{name}=")) {
+            return Some(value);
+        }
+        index += 1;
+    }
+    None
+}
+
+fn remote_resume_thread_id(args: &[OsString]) -> Option<&str> {
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].to_string_lossy();
+        if arg.starts_with('-') {
+            match codex_option_kind(arg.as_ref()) {
+                CodexOptionKind::Value if !arg.contains('=') => index += 2,
+                _ => index += 1,
+            }
+            continue;
+        }
+        if arg == "resume" {
+            return args.get(index + 1).and_then(|value| value.to_str());
+        }
+        index += 1;
+    }
+    None
+}
+
+fn remote_attach_spec(
+    paths: &ManagerPaths,
+    spec: &CodexCommandSpec,
+    workspace: &Path,
+    explicit_thread_id: Option<String>,
+    clean_tui_launch: bool,
+) -> Result<Option<CodexCommandSpec>> {
+    if explicit_thread_id.is_none() && !clean_tui_launch {
+        return Ok(None);
+    }
+    let server = serve::ready_app_server(paths).with_context(|| {
+        "cx service app-server is required for interactive resume; start it with `cx service start`"
+    })?;
+
+    let mut client =
+        AppServerClient::connect(&server.listen_url, std::time::Duration::from_secs(5))
+            .context("connect ready app-server for remote attach")?;
+    client.initialize("cx-tui", env!("CARGO_PKG_VERSION"))?;
+    let scope = ThreadResolverScope {
+        cwd: workspace.to_path_buf(),
+        channel_id: None,
+        explicit_thread_id,
+        slot: Some(server.slot.clone()),
+        generation: 0,
+    };
+    let outcome = thread_resolver::resolve_app_thread(paths, &mut client, scope)?;
+    let thread_id = match outcome.decision {
+        ThreadResolverDecision::AttachExisting { thread_id } => thread_id,
+        ThreadResolverDecision::StartNew { .. } => outcome
+            .thread_id
+            .context("thread resolver started a thread without returning its id")?,
+        ThreadResolverDecision::Refuse { reason } => anyhow::bail!("{reason}"),
+    };
+
+    let mut remote = spec.clone();
+    if let Some(codex_home) = server.codex_home.clone() {
+        remote.codex_home = PathBuf::from(codex_home);
+    }
+    remote.slot = server.slot.clone();
+    remote.target_name = server.target.clone();
+    remote.args = remote_tui_args(&spec.args, &server.listen_url, workspace, &thread_id);
+    Ok(Some(remote))
+}
+
+fn remote_tui_args(
+    base_args: &[OsString],
+    app_server_url: &str,
+    workspace: &Path,
+    thread_id: &str,
+) -> Vec<OsString> {
+    let mut args = strip_resume_subcommand(base_args);
+    args.push(OsString::from("--remote"));
+    args.push(OsString::from(app_server_url));
+    args.push(OsString::from("-C"));
+    args.push(OsString::from(workspace.as_os_str()));
+    args.push(OsString::from("resume"));
+    args.push(OsString::from(thread_id));
+    args
+}
+
+fn strip_resume_subcommand(base_args: &[OsString]) -> Vec<OsString> {
+    let mut args = Vec::new();
+    let mut index = 0;
+    while index < base_args.len() {
+        let arg = &base_args[index];
+        let arg_text = arg.to_string_lossy();
+        if arg_text.starts_with('-') {
+            args.push(arg.clone());
+            match codex_option_kind(arg_text.as_ref()) {
+                CodexOptionKind::Value if !arg_text.contains('=') => {
+                    if let Some(value) = base_args.get(index + 1) {
+                        args.push(value.clone());
+                    }
+                    index += 2;
+                }
+                _ => index += 1,
+            }
+            continue;
+        }
+        if arg_text == "resume" {
+            index += if base_args
+                .get(index + 1)
+                .is_some_and(|value| !value.to_string_lossy().starts_with('-'))
+            {
+                2
+            } else {
+                1
+            };
+            continue;
+        }
+        args.push(arg.clone());
+        index += 1;
+    }
+    args
 }
 
 fn exec_real_codex(real_codex: &Path, args: Vec<OsString>) -> Result<()> {
@@ -365,69 +564,6 @@ fn first_forwarded_non_option(args: &[OsString]) -> Option<String> {
     None
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct AutoResumePlan {
-    insert_index: usize,
-    workspace: PathBuf,
-}
-
-fn auto_resume_plan(args: &[OsString]) -> Result<Option<AutoResumePlan>> {
-    let mut workspace = None;
-    let mut index = 0;
-    while index < args.len() {
-        let arg = &args[index];
-        let arg_text = arg.to_string_lossy();
-        if matches!(arg_text.as_ref(), "-h" | "--help" | "-V" | "--version") {
-            return Ok(None);
-        }
-        if arg_text == "--remote" {
-            return Ok(None);
-        }
-        if arg_text.starts_with("--remote=") {
-            return Ok(None);
-        }
-        if matches!(arg_text.as_ref(), "-C" | "--cd") {
-            index += 1;
-            let value = args
-                .get(index)
-                .with_context(|| format!("{arg_text} requires a value"))?;
-            workspace = Some(PathBuf::from(value));
-            index += 1;
-            continue;
-        }
-        if let Some(value) = arg_text.strip_prefix("--cd=") {
-            workspace = Some(PathBuf::from(value));
-            index += 1;
-            continue;
-        }
-        if arg_text.starts_with('-') {
-            match codex_option_kind(arg_text.as_ref()) {
-                CodexOptionKind::Flag => {
-                    index += 1;
-                    continue;
-                }
-                CodexOptionKind::Value => {
-                    if args.get(index + 1).is_none() {
-                        return Ok(None);
-                    }
-                    index += 2;
-                    continue;
-                }
-                CodexOptionKind::Unknown => return Ok(None),
-            }
-        }
-        if is_codex_subcommand(arg_text.as_ref()) {
-            return Ok(None);
-        }
-        return Ok(None);
-    }
-
-    Ok(Some(AutoResumePlan {
-        insert_index: args.len(),
-        workspace: resolve_workspace(workspace)?,
-    }))
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CodexOptionKind {
     Flag,
@@ -478,34 +614,6 @@ pub(crate) fn codex_option_kind(arg: &str) -> CodexOptionKind {
         | "--ask-for-approval" => CodexOptionKind::Value,
         _ => CodexOptionKind::Unknown,
     }
-}
-
-pub(crate) fn is_codex_subcommand(arg: &str) -> bool {
-    matches!(
-        arg,
-        "exec"
-            | "e"
-            | "review"
-            | "login"
-            | "logout"
-            | "mcp"
-            | "plugin"
-            | "mcp-server"
-            | "app-server"
-            | "app"
-            | "completion"
-            | "update"
-            | "sandbox"
-            | "debug"
-            | "apply"
-            | "a"
-            | "resume"
-            | "fork"
-            | "cloud"
-            | "exec-server"
-            | "features"
-            | "help"
-    )
 }
 
 fn resolve_workspace(workspace: Option<PathBuf>) -> Result<PathBuf> {
@@ -574,11 +682,6 @@ pub(crate) fn explicit_resume_session_id(args: &[OsString]) -> Option<String> {
         return None;
     }
     None
-}
-
-fn insert_resume_args(args: &mut Vec<OsString>, insert_index: usize, session_id: &str) {
-    args.insert(insert_index, OsString::from("resume"));
-    args.insert(insert_index + 1, OsString::from(session_id));
 }
 
 pub(crate) fn usage_timeout() -> f32 {
@@ -781,19 +884,6 @@ mod tests {
     }
 
     #[test]
-    fn auto_resume_plan_skips_prompt() {
-        let args = vec![
-            OsString::from("-m"),
-            OsString::from("gpt-5.5"),
-            OsString::from("continue"),
-        ];
-
-        let plan = auto_resume_plan(&args).unwrap();
-
-        assert_eq!(plan, None);
-    }
-
-    #[test]
     fn explicit_resume_session_id_skips_root_overrides() {
         let args = vec![
             OsString::from("-c"),
@@ -809,52 +899,66 @@ mod tests {
     }
 
     #[test]
-    fn auto_resume_plan_uses_current_workspace_for_clean_launch() {
-        let cwd = std::env::current_dir().unwrap();
-        let args = Vec::new();
-
-        let plan = auto_resume_plan(&args).unwrap().unwrap();
-
-        assert_eq!(plan.insert_index, 0);
-        assert_eq!(plan.workspace, cwd);
-    }
-
-    #[test]
-    fn auto_resume_plan_skips_explicit_subcommands() {
-        let args = vec![OsString::from("resume"), OsString::from("--last")];
-
-        let plan = auto_resume_plan(&args).unwrap();
-
-        assert_eq!(plan, None);
-    }
-
-    #[test]
-    fn auto_resume_plan_skips_remote_and_help() {
-        assert_eq!(
-            auto_resume_plan(&[
-                OsString::from("--remote"),
-                OsString::from("ws://127.0.0.1:1")
-            ])
-            .unwrap(),
-            None
+    fn remote_tui_args_injects_remote_cd_and_resume() {
+        let args = remote_tui_args(
+            &[OsString::from("-c"), OsString::from("model=\"gpt-5.5\"")],
+            "ws://127.0.0.1:17654",
+            Path::new("/tmp/project"),
+            "thread-1",
         );
-        assert_eq!(auto_resume_plan(&[OsString::from("-h")]).unwrap(), None);
-    }
-
-    #[test]
-    fn insert_resume_args_appends_after_overrides() {
-        let mut args = vec![OsString::from("-c"), OsString::from("model=\"gpt-5.5\"")];
-
-        insert_resume_args(&mut args, 2, "019dfdd3-debc-7da2-88fc-b15b73f5e138");
 
         assert_eq!(
             args,
             vec![
                 OsString::from("-c"),
                 OsString::from("model=\"gpt-5.5\""),
+                OsString::from("--remote"),
+                OsString::from("ws://127.0.0.1:17654"),
+                OsString::from("-C"),
+                OsString::from("/tmp/project"),
                 OsString::from("resume"),
-                OsString::from("019dfdd3-debc-7da2-88fc-b15b73f5e138"),
+                OsString::from("thread-1"),
             ]
         );
+    }
+
+    #[test]
+    fn remote_tui_args_replaces_explicit_resume() {
+        let args = remote_tui_args(
+            &[OsString::from("resume"), OsString::from("old-thread")],
+            "ws://127.0.0.1:17654",
+            Path::new("/tmp/project"),
+            "new-thread",
+        );
+
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("--remote"),
+                OsString::from("ws://127.0.0.1:17654"),
+                OsString::from("-C"),
+                OsString::from("/tmp/project"),
+                OsString::from("resume"),
+                OsString::from("new-thread"),
+            ]
+        );
+    }
+
+    #[test]
+    fn remote_resume_thread_id_skips_root_options() {
+        let args = vec![
+            OsString::from("--remote"),
+            OsString::from("ws://127.0.0.1:17654"),
+            OsString::from("-C"),
+            OsString::from("/tmp/project"),
+            OsString::from("resume"),
+            OsString::from("thread-1"),
+        ];
+
+        assert_eq!(
+            remote_arg_value(&args, "--remote"),
+            Some("ws://127.0.0.1:17654")
+        );
+        assert_eq!(remote_resume_thread_id(&args), Some("thread-1"));
     }
 }

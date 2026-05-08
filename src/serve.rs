@@ -45,6 +45,8 @@ struct ServeStateFile {
     schema_version: u64,
     pid: u32,
     slot: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    codex_home: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     target: Option<String>,
     listen_url: String,
@@ -55,6 +57,19 @@ struct ServeStateFile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReadyAppServer {
     pub(crate) listen_url: String,
+    pub(crate) slot: String,
+    pub(crate) codex_home: Option<String>,
+    pub(crate) target: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ServeRegistration {
+    pub(crate) pid: u32,
+    pub(crate) slot: String,
+    pub(crate) codex_home: Option<String>,
+    pub(crate) target: Option<String>,
+    pub(crate) listen_url: String,
+    pub(crate) readyz_url: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -229,6 +244,7 @@ pub fn start(args: ServeStartArgs) -> Result<()> {
     eprintln!("cx serve upstream: {upstream_listen_url}");
 
     let slot = spec.slot().to_string();
+    let codex_home = Some(spec.codex_home.display().to_string());
     let target = spec.target_name().map(str::to_string);
     let mut command = spec.into_command();
     command
@@ -261,6 +277,7 @@ pub fn start(args: ServeStartArgs) -> Result<()> {
         schema_version: SERVE_STATE_SCHEMA_VERSION,
         pid: child.id(),
         slot,
+        codex_home,
         target,
         listen_url: proxy_listen_url,
         readyz_url: listen.readyz_url(),
@@ -475,6 +492,9 @@ pub(crate) fn ready_app_server(paths: &ManagerPaths) -> Result<ReadyAppServer> {
     }
     Ok(ReadyAppServer {
         listen_url: state.listen_url,
+        slot: state.slot,
+        codex_home: state.codex_home,
+        target: state.target,
     })
 }
 
@@ -485,7 +505,33 @@ pub(crate) fn registered_app_server(paths: &ManagerPaths) -> Result<ReadyAppServ
     LoopbackWsUrl::parse(&state.listen_url)?;
     Ok(ReadyAppServer {
         listen_url: state.listen_url,
+        slot: state.slot,
+        codex_home: state.codex_home,
+        target: state.target,
     })
+}
+
+pub(crate) fn register_app_server(
+    paths: &ManagerPaths,
+    registration: ServeRegistration,
+) -> Result<()> {
+    write_state(
+        paths,
+        &ServeStateFile {
+            schema_version: SERVE_STATE_SCHEMA_VERSION,
+            pid: registration.pid,
+            slot: registration.slot,
+            codex_home: registration.codex_home,
+            target: registration.target,
+            listen_url: registration.listen_url,
+            readyz_url: registration.readyz_url,
+            started_at_unix: unix_now()?,
+        },
+    )
+}
+
+pub(crate) fn unregister_app_server(paths: &ManagerPaths, pid: u32) -> Result<bool> {
+    remove_state_if_current(paths, pid)
 }
 
 fn wait_for_ready(
@@ -889,6 +935,7 @@ mod tests {
             schema_version: SERVE_STATE_SCHEMA_VERSION,
             pid: 123,
             slot: String::from("bus1"),
+            codex_home: Some(String::from("/tmp/codex-home")),
             target: Some(String::from("research")),
             listen_url: String::from("ws://127.0.0.1:17654"),
             readyz_url: String::from("http://127.0.0.1:17654/readyz"),
@@ -913,6 +960,7 @@ mod tests {
             schema_version: SERVE_STATE_SCHEMA_VERSION,
             pid: u32::MAX,
             slot: String::from("bus1"),
+            codex_home: None,
             target: None,
             listen_url: String::from("ws://127.0.0.1:9"),
             readyz_url: String::from("http://127.0.0.1:9/readyz"),
@@ -936,6 +984,7 @@ mod tests {
             schema_version: SERVE_STATE_SCHEMA_VERSION,
             pid: 123,
             slot: String::from("bus1"),
+            codex_home: None,
             target: None,
             listen_url: String::from("ws://127.0.0.1:17654"),
             readyz_url: String::from("http://127.0.0.1:17654/readyz"),
@@ -967,6 +1016,7 @@ mod tests {
             schema_version: SERVE_STATE_SCHEMA_VERSION,
             pid: u32::MAX,
             slot: String::from("bus1"),
+            codex_home: None,
             target: None,
             listen_url: String::from("ws://127.0.0.1:9"),
             readyz_url: String::from("http://127.0.0.1:9/readyz"),

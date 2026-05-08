@@ -1,19 +1,14 @@
 //! Telegram channel driver.
 //!
 //! This file coordinates polling, routing, sessions, and high-level commands.
-//! Protocol calls, persistent state, rollout observation, transcript rendering,
-//! and watch delivery live in sibling modules.
+//! Protocol calls, persistent state, transcript rendering, and watch delivery
+//! live in sibling modules.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs;
-#[cfg(test)]
-use std::fs::OpenOptions;
 use std::io::Read;
-use std::path::Path;
 use std::path::PathBuf;
-#[cfg(test)]
-use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
@@ -24,9 +19,6 @@ use anyhow::Result;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use reqwest::blocking::Client;
-use rusqlite::params;
-use rusqlite::Connection;
-use rusqlite::OpenFlags;
 use serde_json::json;
 use serde_json::Value;
 
@@ -36,10 +28,9 @@ use crate::app_server::AppThreadSummary;
 use crate::app_server::ApprovalRequest;
 #[cfg(test)]
 use crate::app_server::CommandActivity;
-#[cfg(test)]
 use crate::app_server::CommandExecution;
-#[cfg(test)]
 use crate::app_server::CommandExecutionStatus;
+use crate::app_server::ParsedServerEvent;
 use crate::cli::TelegramBindArgs;
 use crate::cli::TelegramMenuArgs;
 use crate::cli::TelegramRunArgs;
@@ -53,10 +44,12 @@ use crate::session::ChannelId;
 use crate::session::RecordChannelMessageRequest;
 #[cfg(test)]
 use crate::session::SessionId;
+use crate::thread_resolver;
+use crate::thread_resolver::ThreadResolverDecision;
+use crate::thread_resolver::ThreadResolverScope;
 
 mod api;
 mod delivery;
-mod rollout;
 mod state;
 #[cfg(test)]
 mod tests;
@@ -81,77 +74,27 @@ use self::api::unhide_general_forum_topic;
 #[cfg(test)]
 use self::api::TelegramChat;
 #[cfg(test)]
-use self::api::TelegramChatMemberUpdated;
-#[cfg(test)]
 use self::api::TelegramForumTopicEdited;
 use self::api::TelegramInlineKeyboardButton;
 use self::api::TelegramInlineKeyboardMarkup;
 use self::api::TelegramMessage;
-#[cfg(test)]
-use self::api::TelegramUpdate;
-#[cfg(test)]
-use self::api::TelegramUpdateSource;
 use self::api::TelegramUpdateView;
 use self::delivery::deliver_reply;
 use self::delivery::panel_reply_with_keyboard;
 use self::delivery::reply;
 use self::delivery::TelegramNotifier;
 use self::delivery::TelegramReply;
-#[cfg(test)]
-use self::rollout::active_rollout_turn;
-#[cfg(test)]
-use self::rollout::apply_rollout_task_event;
-use self::rollout::codex_state_db_paths;
-use self::rollout::latest_active_rollout_turn;
-#[cfg(test)]
-use self::rollout::loopback_listen_urls;
-#[cfg(test)]
-use self::rollout::observe_active_rollout;
-#[cfg(test)]
-use self::rollout::pid_holding_file;
-#[cfg(test)]
-use self::rollout::pid_listening_urls;
-use self::rollout::proxy_events_since;
-#[cfg(test)]
-use self::rollout::proxy_log_approval_observe_event;
-#[cfg(test)]
-use self::rollout::proxy_log_observe_event;
-use self::rollout::rollout_events_since;
-#[cfg(test)]
-use self::rollout::rollout_history_item;
-use self::rollout::rollout_history_text;
-#[cfg(test)]
-use self::rollout::rollout_observe_event;
-use self::rollout::rollout_path_for_thread;
-#[cfg(test)]
-use self::rollout::rollout_task_event;
-#[cfg(test)]
-use self::rollout::send_rollout_agent_message;
-#[cfg(test)]
-use self::rollout::ObserveTerminal;
-#[cfg(test)]
-use self::rollout::ObservedRolloutTerminal;
-use self::rollout::RolloutObserveEvent;
-#[cfg(test)]
-use self::rollout::RolloutTaskEvent;
 use self::state::read_state;
 use self::state::write_state;
 use self::state::TelegramBinding;
-#[cfg(test)]
-use self::state::TelegramPendingApproval;
 use self::state::TelegramRoute;
 use self::state::TelegramState;
-use self::state::TelegramWatchSource;
 #[cfg(test)]
 use self::transcript::activity_watch_text;
-#[cfg(test)]
-use self::transcript::thinking_watch_text;
 #[cfg(test)]
 use self::transcript::TelegramActivityPanel;
 #[cfg(test)]
 use self::transcript::TelegramStatusPanel;
-#[cfg(test)]
-use self::transcript::TelegramThinkingPanel;
 #[cfg(test)]
 use self::transcript::TelegramTranscriptTarget;
 use self::transcript::TelegramTurnTerminal;
@@ -159,12 +102,12 @@ use self::watch::send_watch_events;
 #[cfg(test)]
 use self::watch::telegram_retry_after_delay;
 use self::watch::TelegramWatchSink;
+use self::watch::WatchEvent;
 use self::watch::WatchSendResult;
+use self::watch::WatchTerminal;
 
 const PORTAL_TOPIC_TITLE: &str = "cx portal";
 const PORTAL_APP_SERVER_TIMEOUT: Duration = Duration::from_millis(750);
-#[cfg(test)]
-const ROLLOUT_OWNER_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 const WATCH_DRAIN_MAX_LINES: usize = 1000;
 
 pub fn run(args: TelegramRunArgs) -> Result<()> {
@@ -539,130 +482,332 @@ fn drain_watched_binding(
     binding: &TelegramBinding,
     notifier: &TelegramNotifier<'_>,
 ) -> Result<()> {
-    let Some(thread_id) = binding.app_thread_id.as_deref() else {
-        return Ok(());
-    };
-    let source = select_watch_source(paths, thread_id, binding.watch_source);
-    if let Some(stored) = state.binding_for_route_mut(route, binding.alias.as_deref()) {
-        stored.watch_source = Some(source);
-    }
-
-    match source {
-        TelegramWatchSource::Proxy => {
-            drain_watched_proxy_binding(paths, state, route, binding, notifier, thread_id)
-        }
-        TelegramWatchSource::Rollout => {
-            drain_watched_rollout_binding(paths, state, route, binding, notifier, thread_id)
-        }
-    }
-}
-
-fn drain_watched_proxy_binding(
-    paths: &ManagerPaths,
-    state: &mut TelegramState,
-    route: &TelegramRoute,
-    binding: &TelegramBinding,
-    notifier: &TelegramNotifier<'_>,
-    thread_id: &str,
-) -> Result<()> {
-    let proxy_path = proxy_event_log_path(paths);
-    if !proxy_path.exists() {
-        return Ok(());
-    }
-    let proxy_len = fs::metadata(&proxy_path)
-        .with_context(|| format!("stat proxy event log {}", proxy_path.display()))?
-        .len();
-    let proxy_offset = binding
-        .watch_proxy_offset
-        .filter(|offset| *offset <= proxy_len)
-        .unwrap_or(proxy_len);
-    let mut pending_approvals = binding.watch_pending_approvals.clone();
-    let proxy_drain = proxy_events_since(
-        &proxy_path,
-        proxy_offset,
-        WATCH_DRAIN_MAX_LINES,
-        thread_id,
-        &mut pending_approvals,
-        true,
-    )?;
-    let send_result =
-        send_watch_events_for_binding(route, notifier, proxy_drain.events, state, binding)?;
-    if let Some(stored) = state.binding_for_route_mut(route, binding.alias.as_deref()) {
-        stored.watch_proxy_offset = Some(proxy_drain.next_offset);
-        stored.watch_activity = send_result.activity;
-        stored.watch_thinking = send_result.thinking;
-        stored.watch_status = send_result.status;
-        stored.watch_last_agent_message = send_result.last_agent_message;
-        stored.watch_pending_approvals = pending_approvals;
-    }
-    Ok(())
-}
-
-fn drain_watched_rollout_binding(
-    paths: &ManagerPaths,
-    state: &mut TelegramState,
-    route: &TelegramRoute,
-    binding: &TelegramBinding,
-    notifier: &TelegramNotifier<'_>,
-    thread_id: &str,
-) -> Result<()> {
-    let Some(path) = rollout_path_for_thread(paths, thread_id) else {
-        return Ok(());
-    };
-    if !path.exists() {
-        return Ok(());
-    }
-
-    let file_len = fs::metadata(&path)
-        .with_context(|| format!("stat rollout {}", path.display()))?
-        .len();
-    let active_turn_offset = latest_active_rollout_turn(&path)
+    let canonical_app_thread = session::show_session(paths, &binding.session_id)
         .ok()
-        .flatten()
-        .map(|(_, offset)| offset);
-    let start_offset =
-        watch_rollout_start_offset(binding.watch_rollout_offset, file_len, active_turn_offset);
-    let drain = rollout_events_since(&path, start_offset, WATCH_DRAIN_MAX_LINES)?;
-    let mut events = drain.events;
-    let mut pending_approvals = binding.watch_pending_approvals.clone();
-    let mut next_proxy_offset = binding.watch_proxy_offset;
-    let proxy_path = proxy_event_log_path(paths);
-    if proxy_path.exists() {
-        let proxy_len = fs::metadata(&proxy_path)
-            .with_context(|| format!("stat proxy event log {}", proxy_path.display()))?
-            .len();
-        let proxy_offset = binding
-            .watch_proxy_offset
-            .filter(|offset| *offset <= proxy_len)
-            .unwrap_or(proxy_len);
-        let proxy_drain = proxy_events_since(
-            &proxy_path,
-            proxy_offset,
-            WATCH_DRAIN_MAX_LINES,
-            thread_id,
-            &mut pending_approvals,
-            false,
-        )?;
-        next_proxy_offset = Some(proxy_drain.next_offset);
-        events.extend(proxy_drain.events);
+        .and_then(|session| session.app_thread);
+    let canonical_thread_id = canonical_app_thread
+        .as_ref()
+        .map(|app_thread| app_thread.thread_id.as_str())
+        .or(binding.app_thread_id.as_deref());
+    let Some(thread_id) = canonical_thread_id else {
+        return Ok(());
+    };
+    drain_watched_app_server_binding(paths, state, route, binding, notifier, thread_id)
+}
+
+fn drain_watched_app_server_binding(
+    paths: &ManagerPaths,
+    state: &mut TelegramState,
+    route: &TelegramRoute,
+    binding: &TelegramBinding,
+    notifier: &TelegramNotifier<'_>,
+    thread_id: &str,
+) -> Result<()> {
+    let session_app_thread = session::show_session(paths, &binding.session_id)
+        .ok()
+        .and_then(|session| session.app_thread);
+    let cwd = binding.app_thread_cwd.as_deref().or(session_app_thread
+        .as_ref()
+        .map(|app_thread| app_thread.cwd.as_str()));
+    let path = session_app_thread
+        .as_ref()
+        .and_then(|app_thread| app_thread.path.as_deref());
+    let mut client = connect_app_server_with_timeout(paths, Duration::from_millis(750))?;
+    let server = serve::ready_app_server(paths)?;
+    let resolver_cwd = cwd
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .context("resolve cwd for Telegram watch app-server thread")?;
+    let outcome = thread_resolver::resolve_app_thread(
+        paths,
+        &mut client,
+        ThreadResolverScope {
+            cwd: resolver_cwd,
+            channel_id: Some(binding.channel_id.clone()),
+            explicit_thread_id: Some(thread_id.to_string()),
+            slot: Some(server.slot),
+            generation: 0,
+        },
+    )?;
+    let live_thread_id = match outcome.decision {
+        ThreadResolverDecision::AttachExisting { thread_id } => thread_id,
+        ThreadResolverDecision::StartNew { .. } => outcome
+            .thread_id
+            .context("thread resolver started a thread without returning its id")?,
+        ThreadResolverDecision::Refuse { reason } => anyhow::bail!("{reason}"),
+    };
+    sync_binding_from_session(
+        paths,
+        state,
+        route,
+        binding.alias.as_deref(),
+        &binding.session_id,
+    )?;
+    let updated_app_thread = session::show_session(paths, &binding.session_id)
+        .ok()
+        .and_then(|session| session.app_thread);
+    let live_cwd = updated_app_thread
+        .as_ref()
+        .map(|app_thread| app_thread.cwd.as_str())
+        .or(cwd);
+    let live_path = updated_app_thread
+        .as_ref()
+        .and_then(|app_thread| app_thread.path.as_deref())
+        .or(path);
+    let _ = client.thread_resume_with_path(&live_thread_id, live_path, live_cwd, true)?;
+    let read = client.thread_read(&live_thread_id, true)?;
+    let (mut events, mut latest_app_turn_id) =
+        app_server_history_events_since(&read.turns, binding.watch_app_last_turn_id.as_deref());
+    if latest_app_turn_id.is_none() {
+        latest_app_turn_id = binding.watch_app_last_turn_id.clone();
     }
-    let send_result = send_watch_events_for_binding(route, notifier, events, state, binding)?;
+    client.drain_thread_events(
+        &live_thread_id,
+        None,
+        WATCH_DRAIN_MAX_LINES,
+        |event| {
+            match event {
+                ParsedServerEvent::Stream(event) => {
+                    events.push(WatchEvent::Stream(event));
+                }
+                ParsedServerEvent::TurnCompleted { turn_id, .. } => {
+                    latest_app_turn_id = Some(turn_id.clone());
+                    events.push(WatchEvent::Terminal {
+                        turn_id: Some(turn_id),
+                        terminal: WatchTerminal::Completed,
+                        duration_ms: None,
+                        last_agent_message: None,
+                    });
+                }
+                ParsedServerEvent::ApprovalRequest(_) => {
+                    events.push(WatchEvent::Stream(AppStreamEvent::Info(
+                        "Codex is waiting for approval in another client.".to_string(),
+                    )));
+                }
+            }
+            Ok(())
+        },
+        |_approval| Ok(None),
+    )?;
+    let _ = client.thread_unsubscribe(&live_thread_id);
+    let send_result = if events.is_empty() {
+        None
+    } else {
+        Some(send_watch_events_for_binding(
+            route, notifier, events, state, binding,
+        )?)
+    };
     if let Some(stored) = state.binding_for_route_mut(route, binding.alias.as_deref()) {
-        stored.watch_rollout_offset = Some(drain.next_offset);
-        stored.watch_proxy_offset = next_proxy_offset;
-        stored.watch_activity = send_result.activity;
-        stored.watch_thinking = send_result.thinking;
-        stored.watch_status = send_result.status;
-        stored.watch_last_agent_message = send_result.last_agent_message;
-        stored.watch_pending_approvals = pending_approvals;
+        if let Some(send_result) = send_result {
+            stored.watch_activity = send_result.activity;
+            stored.watch_thinking = send_result.thinking;
+            stored.watch_status = send_result.status;
+            stored.watch_last_agent_message = send_result.last_agent_message;
+        }
+        stored.watch_app_last_turn_id = latest_app_turn_id;
     }
     Ok(())
+}
+
+fn app_server_history_events_since(
+    turns: &[Value],
+    last_seen_turn_id: Option<&str>,
+) -> (Vec<WatchEvent>, Option<String>) {
+    let latest_turn_id = turns
+        .last()
+        .and_then(history_turn_id)
+        .map(str::to_string)
+        .or_else(|| last_seen_turn_id.map(str::to_string));
+    let Some(last_seen_turn_id) = last_seen_turn_id else {
+        return (Vec::new(), latest_turn_id);
+    };
+
+    let mut seen_cursor = false;
+    let mut events = Vec::new();
+    let mut latest_emitted = None::<String>;
+    for turn in turns {
+        let turn_id = history_turn_id(turn).map(str::to_string);
+        if turn_id.as_deref() == Some(last_seen_turn_id) {
+            seen_cursor = true;
+            continue;
+        }
+        if !seen_cursor
+            && turns.iter().any(|candidate| {
+                history_turn_id(candidate)
+                    .is_some_and(|candidate_id| candidate_id == last_seen_turn_id)
+            })
+        {
+            continue;
+        }
+        if events.len() >= WATCH_DRAIN_MAX_LINES {
+            break;
+        }
+        if let Some(turn_id) = turn_id.clone() {
+            latest_emitted = Some(turn_id);
+        }
+        events.push(WatchEvent::Stream(AppStreamEvent::TurnStarted));
+        if let Some(items) = turn.get("items").and_then(Value::as_array) {
+            for item in items {
+                events.extend(history_item_events(item));
+                if events.len() >= WATCH_DRAIN_MAX_LINES {
+                    break;
+                }
+            }
+        }
+        if let Some(terminal) = history_turn_terminal(turn) {
+            events.push(WatchEvent::Terminal {
+                turn_id,
+                terminal,
+                duration_ms: turn.get("durationMs").and_then(Value::as_i64),
+                last_agent_message: history_turn_last_agent_message(turn),
+            });
+        }
+    }
+    (events, latest_emitted.or(latest_turn_id))
+}
+
+fn history_turn_id(turn: &Value) -> Option<&str> {
+    turn.get("id").and_then(Value::as_str)
+}
+
+fn history_turn_terminal(turn: &Value) -> Option<WatchTerminal> {
+    let status = turn.get("status").and_then(Value::as_str)?;
+    match normalize_history_kind(status).as_str() {
+        "completed" | "succeeded" | "success" => Some(WatchTerminal::Completed),
+        "failed" | "cancelled" | "canceled" | "aborted" => Some(WatchTerminal::Aborted),
+        _ => None,
+    }
+}
+
+fn history_item_events(item: &Value) -> Vec<WatchEvent> {
+    if let Some(payload) = history_item_payload(item, "userMessage") {
+        if let Some(text) = history_user_message_text(payload) {
+            return vec![WatchEvent::Stream(AppStreamEvent::UserMessage(text))];
+        }
+    }
+    if let Some(payload) = history_item_payload(item, "agentMessage") {
+        if let Some(text) = payload.get("text").and_then(Value::as_str) {
+            return vec![WatchEvent::Stream(AppStreamEvent::AgentDelta(
+                text.to_string(),
+            ))];
+        }
+    }
+    if let Some(payload) = history_item_payload(item, "reasoning") {
+        let text = payload
+            .get("summary")
+            .or_else(|| payload.get("content"))
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .filter(|text| !text.trim().is_empty());
+        if let Some(text) = text {
+            return vec![
+                WatchEvent::Stream(AppStreamEvent::ReasoningStarted),
+                WatchEvent::Stream(AppStreamEvent::ReasoningDelta(text)),
+            ];
+        }
+    }
+    if let Some(payload) = history_item_payload(item, "commandExecution") {
+        if let Some(command) = history_command_execution(payload) {
+            return vec![WatchEvent::Stream(match command.status {
+                CommandExecutionStatus::InProgress => AppStreamEvent::CommandStarted(command),
+                _ => AppStreamEvent::CommandCompleted(command),
+            })];
+        }
+    }
+    Vec::new()
+}
+
+fn history_turn_last_agent_message(turn: &Value) -> Option<String> {
+    let items = turn.get("items").and_then(Value::as_array)?;
+    items.iter().rev().find_map(|item| {
+        history_item_payload(item, "agentMessage")?
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    })
+}
+
+fn history_user_message_text(payload: &Value) -> Option<String> {
+    let content = payload.get("content").and_then(Value::as_array)?;
+    let text = content
+        .iter()
+        .filter_map(|item| item.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.trim().is_empty()).then_some(text)
+}
+
+fn history_command_execution(payload: &Value) -> Option<CommandExecution> {
+    Some(CommandExecution {
+        item_id: payload.get("id")?.as_str()?.to_string(),
+        command: payload.get("command")?.as_str()?.to_string(),
+        cwd: payload
+            .get("cwd")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        activity: None,
+        status: history_command_status(payload.get("status").and_then(Value::as_str)),
+        exit_code: payload.get("exitCode").and_then(Value::as_i64),
+        duration_ms: payload.get("durationMs").and_then(Value::as_i64),
+        aggregated_output: payload
+            .get("aggregatedOutput")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    })
+}
+
+fn history_command_status(status: Option<&str>) -> CommandExecutionStatus {
+    match status.map(normalize_history_kind).as_deref() {
+        Some("inprogress" | "running") => CommandExecutionStatus::InProgress,
+        Some("completed" | "succeeded" | "success") => CommandExecutionStatus::Completed,
+        Some("failed" | "error") => CommandExecutionStatus::Failed,
+        Some("declined") => CommandExecutionStatus::Declined,
+        Some(status) => CommandExecutionStatus::Unknown(status.to_string()),
+        None => CommandExecutionStatus::Unknown(String::new()),
+    }
+}
+
+fn history_item_payload<'a>(item: &'a Value, expected_kind: &str) -> Option<&'a Value> {
+    if item
+        .get("type")
+        .and_then(Value::as_str)
+        .is_some_and(|kind| history_kind_matches(kind, expected_kind))
+    {
+        return Some(item);
+    }
+    if let Some(payload) = item.get(expected_kind) {
+        return Some(payload);
+    }
+    let object = item.as_object()?;
+    if object.len() != 1 {
+        return None;
+    }
+    let (kind, payload) = object.iter().next()?;
+    history_kind_matches(kind, expected_kind).then_some(payload)
+}
+
+fn history_kind_matches(kind: &str, expected_kind: &str) -> bool {
+    normalize_history_kind(kind) == normalize_history_kind(expected_kind)
+}
+
+fn normalize_history_kind(kind: &str) -> String {
+    kind.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 fn send_watch_events_for_binding(
     route: &TelegramRoute,
     notifier: &TelegramNotifier<'_>,
-    events: Vec<RolloutObserveEvent>,
+    events: Vec<WatchEvent>,
     state: &TelegramState,
     binding: &TelegramBinding,
 ) -> Result<WatchSendResult> {
@@ -694,18 +839,15 @@ fn send_watch_events_for_binding(
     )
 }
 
-fn events_with_default_cwd(
-    events: Vec<RolloutObserveEvent>,
-    default_cwd: Option<&str>,
-) -> Vec<RolloutObserveEvent> {
+fn events_with_default_cwd(events: Vec<WatchEvent>, default_cwd: Option<&str>) -> Vec<WatchEvent> {
     let Some(default_cwd) = default_cwd.map(str::trim).filter(|cwd| !cwd.is_empty()) else {
         return events;
     };
     events
         .into_iter()
         .map(|event| match event {
-            RolloutObserveEvent::Stream(event) => {
-                RolloutObserveEvent::Stream(stream_event_with_default_cwd(event, default_cwd))
+            WatchEvent::Stream(event) => {
+                WatchEvent::Stream(stream_event_with_default_cwd(event, default_cwd))
             }
             event => event,
         })
@@ -734,31 +876,6 @@ fn fill_default_command_cwd(cwd: &mut String, default_cwd: &str) {
 
 fn command_cwd_is_missing(cwd: &str) -> bool {
     matches!(cwd.trim(), "" | "<unknown>")
-}
-
-fn select_watch_source(
-    paths: &ManagerPaths,
-    thread_id: &str,
-    stored_source: Option<TelegramWatchSource>,
-) -> TelegramWatchSource {
-    if rollout_path_for_thread(paths, thread_id).is_some() {
-        return TelegramWatchSource::Rollout;
-    }
-    match stored_source {
-        Some(TelegramWatchSource::Rollout) => TelegramWatchSource::Rollout,
-        Some(TelegramWatchSource::Proxy) | None => TelegramWatchSource::Proxy,
-    }
-}
-
-fn watch_rollout_start_offset(
-    stored_offset: Option<u64>,
-    file_len: u64,
-    active_turn_offset: Option<u64>,
-) -> u64 {
-    match stored_offset {
-        Some(offset) if offset <= file_len => offset,
-        Some(_) | None => active_turn_offset.unwrap_or(file_len),
-    }
 }
 
 fn watched_bindings(state: &TelegramState) -> Vec<TelegramBinding> {
@@ -1518,7 +1635,7 @@ fn observe_portal_thread(
         state.bind_app_thread(paths, &effective_route, entry, topic_created_by_adapter)?;
     if let Some(stored) = state.binding_for_route_mut(&effective_route, None) {
         stored.telegram_paused = true;
-        initialize_watch_cursor(paths, stored);
+        initialize_watch_cursor(stored);
         binding = stored.clone();
     }
     session::record_channel_message(
@@ -1531,7 +1648,7 @@ fn observe_portal_thread(
     write_state(paths, state)?;
 
     if let Some(notifier) = options.notifier {
-        send_watch_intro(paths, state, notifier, &effective_route, &binding, entry)?;
+        send_watch_intro(state, notifier, &effective_route, &binding, entry)?;
         write_state(paths, state)?;
     }
 
@@ -1648,7 +1765,7 @@ fn watch_bound_thread(
     };
     if let Some(stored) = state.binding_for_route_mut(route, binding.alias.as_deref()) {
         stored.telegram_paused = true;
-        initialize_watch_cursor(paths, stored);
+        initialize_watch_cursor(stored);
     }
     release_binding_lease_if_owned(paths, binding)?;
     let binding = state
@@ -1667,40 +1784,13 @@ fn watch_bound_thread(
     Ok(None)
 }
 
-fn initialize_watch_cursor(paths: &ManagerPaths, binding: &mut TelegramBinding) {
+fn initialize_watch_cursor(binding: &mut TelegramBinding) {
     binding.watch_activity = None;
     binding.watch_thinking = None;
     binding.watch_status = None;
-    binding.watch_source = None;
+    binding.watch_app_last_turn_id = None;
     binding.watch_last_agent_message = None;
     binding.watch_pending_approvals.clear();
-    if binding.watch_proxy_offset.is_none() {
-        if let Ok(metadata) = fs::metadata(proxy_event_log_path(paths)) {
-            binding.watch_proxy_offset = Some(metadata.len());
-        }
-    }
-    if binding.watch_rollout_offset.is_some() {
-        return;
-    }
-    let Some(thread_id) = binding.app_thread_id.as_deref() else {
-        return;
-    };
-    let Some(path) = rollout_path_for_thread(paths, thread_id) else {
-        return;
-    };
-    let Ok(metadata) = fs::metadata(&path) else {
-        return;
-    };
-    let offset = latest_active_rollout_turn(&path)
-        .ok()
-        .flatten()
-        .map(|(_, offset)| offset)
-        .unwrap_or_else(|| metadata.len());
-    binding.watch_rollout_offset = Some(offset);
-}
-
-fn proxy_event_log_path(paths: &ManagerPaths) -> PathBuf {
-    paths.serve_dir().join("events").join("default.jsonl")
 }
 
 fn refresh_work_panel(
@@ -1806,41 +1896,9 @@ fn list_portal_entries(
     route_log: &str,
 ) -> Result<Vec<AppThreadPortalEntry>> {
     let candidate_limit = limit.saturating_mul(8).max(50);
-    let mut candidates = Vec::new();
-    let mut app_server_error = None::<anyhow::Error>;
-
-    match app_server_portal_candidates(paths, candidate_limit, trace_timings, route_log) {
-        Ok(mut app_candidates) => candidates.append(&mut app_candidates),
-        Err(err) => {
-            if trace_timings {
-                eprintln!(
-                    "telegram timing route={} phase=portal_app_server_error error={err:#}",
-                    route_log
-                );
-            }
-            app_server_error = Some(err);
-        }
-    }
-
-    let local_start = Instant::now();
-    let mut local_candidates = local_state_portal_candidates(paths, candidate_limit);
-    if trace_timings {
-        eprintln!(
-            "telegram timing route={} phase=portal_local_state threads={} elapsed_ms={}",
-            route_log,
-            local_candidates.len(),
-            elapsed_ms(local_start)
-        );
-    }
-    candidates.append(&mut local_candidates);
-
-    let entries = filter_portal_candidates(candidates, limit);
-    if entries.is_empty() {
-        if let Some(err) = app_server_error {
-            return Err(err);
-        }
-    }
-    Ok(entries)
+    let candidates =
+        app_server_portal_candidates(paths, candidate_limit, trace_timings, route_log)?;
+    Ok(filter_portal_candidates(candidates, limit))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1897,84 +1955,12 @@ fn app_server_portal_candidates(
         .collect())
 }
 
-fn local_state_portal_candidates(paths: &ManagerPaths, limit: u64) -> Vec<PortalEntryCandidate> {
-    let mut candidates = Vec::new();
-    for db_path in codex_state_db_paths(paths) {
-        if !db_path.exists() {
-            continue;
-        }
-        match local_state_portal_candidates_from_db(&db_path, limit) {
-            Ok(mut db_candidates) => candidates.append(&mut db_candidates),
-            Err(err) => {
-                eprintln!(
-                    "telegram portal skipped local state db {}: {err:#}",
-                    db_path.display()
-                );
-            }
-        }
-    }
-    candidates
-}
-
-fn local_state_portal_candidates_from_db(
-    db_path: &Path,
-    limit: u64,
-) -> Result<Vec<PortalEntryCandidate>> {
-    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .with_context(|| format!("open {}", db_path.display()))?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, title, first_user_message, cwd, updated_at \
-                 FROM threads \
-                 WHERE rollout_path <> '' \
-                 ORDER BY updated_at DESC \
-                 LIMIT ?1",
-        )
-        .with_context(|| format!("prepare portal state query for {}", db_path.display()))?;
-    let rows = stmt.query_map(params![limit as i64], |row| {
-        let thread_id: String = row.get(0)?;
-        let title: Option<String> = row.get(1)?;
-        let preview: Option<String> = row.get(2)?;
-        let cwd: Option<String> = row.get(3)?;
-        let updated_at_unix: i64 = row.get(4)?;
-        Ok((
-            thread_id,
-            title.unwrap_or_default(),
-            preview.unwrap_or_default(),
-            cwd.unwrap_or_default(),
-            updated_at_unix,
-        ))
-    })?;
-
-    let mut candidates = Vec::new();
-    for row in rows {
-        let (thread_id, title, preview, cwd, updated_at_unix) = row?;
-        candidates.push(PortalEntryCandidate {
-            entry: AppThreadPortalEntry {
-                thread_id,
-                title: (!title.trim().is_empty()).then_some(title),
-                preview,
-                cwd,
-                active: false,
-                watchable: true,
-                status: "notLoaded".to_string(),
-            },
-            updated_at_unix,
-            priority: 1,
-        });
-    }
-    Ok(candidates)
-}
-
 fn filter_portal_candidates(
     candidates: Vec<PortalEntryCandidate>,
     limit: u64,
 ) -> Vec<AppThreadPortalEntry> {
     let mut by_thread = BTreeMap::<String, PortalEntryCandidate>::new();
     for candidate in candidates {
-        if is_local_watch_regression_entry(&candidate.entry) {
-            continue;
-        }
         by_thread
             .entry(candidate.entry.thread_id.clone())
             .and_modify(|existing| {
@@ -2019,32 +2005,6 @@ where
             .collect(),
         limit,
     )
-}
-
-#[cfg(test)]
-fn open_tui_portal_entries(
-    paths: &ManagerPaths,
-    max_candidates: u64,
-) -> Result<Vec<AppThreadPortalEntry>> {
-    Ok(filter_portal_candidates(
-        local_state_portal_candidates(paths, max_candidates),
-        max_candidates,
-    ))
-}
-
-fn is_local_watch_regression_entry(entry: &AppThreadPortalEntry) -> bool {
-    const MARKERS: [&str; 3] = [
-        "For Telegram watch E2E marker",
-        "Telegram watch regression",
-        "For a local watch integration test",
-    ];
-    MARKERS.iter().any(|marker| {
-        entry
-            .title
-            .as_deref()
-            .is_some_and(|title| title.contains(marker))
-            || entry.preview.contains(marker)
-    })
 }
 
 fn portal_text(entries: &[AppThreadPortalEntry]) -> String {
@@ -2095,7 +2055,6 @@ fn work_topic_title(entry: &AppThreadPortalEntry) -> String {
 }
 
 fn send_watch_intro(
-    paths: &ManagerPaths,
     state: &mut TelegramState,
     notifier: &TelegramNotifier<'_>,
     route: &TelegramRoute,
@@ -2111,15 +2070,6 @@ fn send_watch_intro(
                 route.display()
             );
             return Ok(());
-        }
-    }
-
-    if let Some(history) = rollout_history_text(paths, &entry.thread_id, 6)? {
-        if let Err(err) = notifier.send_chunks(route, &history) {
-            eprintln!(
-                "telegram watch history delivery failed for {}: {err:#}",
-                route.display()
-            );
         }
     }
     Ok(())
@@ -2292,42 +2242,70 @@ fn run_codex_turn(
         .binding_for_route(route, alias)
         .cloned()
         .with_context(|| format!("Telegram route {} is not bound", route.display()))?;
-    let thread_id = match binding_snapshot.app_thread_id.clone() {
-        Some(thread_id) => {
-            let resume_start = Instant::now();
-            if let Err(err) =
-                client.thread_resume(&thread_id, binding_snapshot.app_thread_cwd.as_deref())
-            {
-                eprintln!("app-server thread/resume before Telegram turn failed: {err:#}");
-            }
-            if trace_timings {
-                eprintln!(
-                    "telegram timing route={} thread_id={} phase=thread_resume elapsed_ms={}",
-                    route_log,
-                    thread_id,
-                    elapsed_ms(resume_start)
-                );
-            }
-            thread_id
-        }
-        None => {
-            let start_thread_start = Instant::now();
-            let thread = client.thread_start(binding_snapshot.app_thread_cwd.as_deref())?;
-            let binding = state
-                .binding_for_route_mut(route, alias)
-                .with_context(|| format!("Telegram route {} is not bound", route.display()))?;
-            binding.app_thread_id = Some(thread.upstream_thread_id.clone());
-            if trace_timings {
-                eprintln!(
-                    "telegram timing route={} thread_id={} phase=thread_start elapsed_ms={}",
-                    route_log,
-                    thread.upstream_thread_id,
-                    elapsed_ms(start_thread_start)
-                );
-            }
-            thread.upstream_thread_id
-        }
+    let session_app_thread = session::show_session(paths, &binding_snapshot.session_id)
+        .ok()
+        .and_then(|session| session.app_thread);
+    let resolver_cwd = binding_snapshot
+        .app_thread_cwd
+        .as_deref()
+        .or(session_app_thread
+            .as_ref()
+            .map(|app_thread| app_thread.cwd.as_str()))
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .context("resolve cwd for Telegram app-server thread")?;
+    let explicit_thread_id = binding_snapshot
+        .app_thread_id
+        .clone()
+        .or_else(|| session_app_thread.map(|app_thread| app_thread.thread_id));
+    let resolve_start = Instant::now();
+    let outcome = thread_resolver::resolve_app_thread(
+        paths,
+        &mut client,
+        ThreadResolverScope {
+            cwd: resolver_cwd,
+            channel_id: Some(binding_snapshot.channel_id.clone()),
+            explicit_thread_id,
+            slot: None,
+            generation: 0,
+        },
+    )?;
+    let thread_id = match outcome.decision {
+        ThreadResolverDecision::AttachExisting { thread_id } => thread_id,
+        ThreadResolverDecision::StartNew { .. } => outcome
+            .thread_id
+            .context("thread resolver started a thread without returning its id")?,
+        ThreadResolverDecision::Refuse { reason } => anyhow::bail!("{reason}"),
     };
+    if trace_timings {
+        eprintln!(
+            "telegram timing route={} thread_id={} phase=thread_resolve elapsed_ms={}",
+            route_log,
+            thread_id,
+            elapsed_ms(resolve_start)
+        );
+    }
+    let resume_start = Instant::now();
+    let resumed = client.thread_resume(&thread_id, binding_snapshot.app_thread_cwd.as_deref());
+    if let Err(err) = resumed {
+        eprintln!("app-server thread/resume before Telegram turn failed: {err:#}");
+    }
+    sync_binding_from_session(paths, state, route, alias, &binding_snapshot.session_id)?;
+    if trace_timings {
+        eprintln!(
+            "telegram timing route={} thread_id={} phase=thread_resume elapsed_ms={}",
+            route_log,
+            thread_id,
+            elapsed_ms(resume_start)
+        );
+    }
+    if let Some(active_turn_id) = client.active_turn_id(&thread_id)? {
+        let steered = client.turn_steer(&thread_id, &active_turn_id, prompt)?;
+        return Ok(CodexTurnOutput {
+            assistant_text: format!("Sent to active Codex turn {}.", steered.turn_id),
+            streamed_to_telegram: false,
+        });
+    }
     let mut sink = notifier.map(|notifier| {
         TelegramWatchSink::new_best_effort(notifier, route.clone(), None, None, None)
     });
@@ -2385,6 +2363,25 @@ fn run_codex_turn(
         assistant_text: turn.assistant_text,
         streamed_to_telegram: sink.is_some_and(|sink| sink.assistant_completed_text_sent()),
     })
+}
+
+fn sync_binding_from_session(
+    paths: &ManagerPaths,
+    state: &mut TelegramState,
+    route: &TelegramRoute,
+    alias: Option<&str>,
+    session_id: &session::SessionId,
+) -> Result<()> {
+    let session = session::show_session(paths, session_id)?;
+    let Some(app_thread) = session.app_thread else {
+        return Ok(());
+    };
+    if let Some(binding) = state.binding_for_route_mut(route, alias) {
+        binding.app_thread_id = Some(app_thread.thread_id);
+        binding.app_thread_cwd = Some(app_thread.cwd);
+        binding.app_thread_title = app_thread.title;
+    }
+    Ok(())
 }
 
 struct CodexTurnOutput {

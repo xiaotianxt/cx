@@ -13,7 +13,6 @@ use crate::app_server::AppStreamEvent;
 
 use super::api::is_telegram_missing_thread_error;
 use super::api::telegram_text_chunks;
-use super::rollout::RolloutObserveEvent;
 use super::state::TelegramRoute;
 use super::transcript::info_watch_text;
 use super::transcript::user_watch_text;
@@ -27,6 +26,23 @@ use super::transcript::TelegramTranscriptTarget;
 use super::transcript::TelegramTurnTerminal;
 use super::TelegramNotifier;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum WatchEvent {
+    Stream(AppStreamEvent),
+    Terminal {
+        turn_id: Option<String>,
+        terminal: WatchTerminal,
+        duration_ms: Option<i64>,
+        last_agent_message: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WatchTerminal {
+    Completed,
+    Aborted,
+}
+
 pub(super) struct WatchSendResult {
     pub(super) activity: Option<TelegramActivityState>,
     pub(super) thinking: Option<TelegramThinkingState>,
@@ -37,7 +53,7 @@ pub(super) struct WatchSendResult {
 pub(super) fn send_watch_events(
     route: &TelegramRoute,
     notifier: &TelegramNotifier<'_>,
-    events: Vec<RolloutObserveEvent>,
+    events: Vec<WatchEvent>,
     activity: Option<TelegramActivityState>,
     thinking: Option<TelegramThinkingState>,
     status: Option<TelegramStatusState>,
@@ -49,28 +65,28 @@ pub(super) fn send_watch_events(
     let mut pending_agent_message = None::<String>;
     for event in events {
         match event {
-            RolloutObserveEvent::Stream(AppStreamEvent::TurnStarted) => {
+            WatchEvent::Stream(AppStreamEvent::TurnStarted) => {
                 last_sent_agent_message = None;
                 pending_agent_message = None;
                 sink.push_event(AppStreamEvent::TurnStarted)?;
             }
-            RolloutObserveEvent::Stream(AppStreamEvent::AgentDelta(message)) => {
-                push_rollout_agent_message_if_new(
+            WatchEvent::Stream(AppStreamEvent::AgentDelta(message)) => {
+                push_agent_message_if_new(
                     &mut sink,
                     &message,
                     last_sent_agent_message.as_deref(),
                     &mut pending_agent_message,
                 )?;
             }
-            RolloutObserveEvent::Stream(event) => sink.push_event(event)?,
-            RolloutObserveEvent::Terminal {
+            WatchEvent::Stream(event) => sink.push_event(event)?,
+            WatchEvent::Terminal {
                 duration_ms,
                 terminal,
                 last_agent_message,
                 ..
             } => {
                 if let Some(message) = last_agent_message {
-                    push_rollout_agent_message_if_new(
+                    push_agent_message_if_new(
                         &mut sink,
                         &message,
                         last_sent_agent_message.as_deref(),
@@ -95,7 +111,7 @@ pub(super) fn send_watch_events(
     })
 }
 
-fn push_rollout_agent_message_if_new(
+fn push_agent_message_if_new(
     sink: &mut TelegramWatchSink<'_>,
     message: &str,
     last_sent_agent_message: Option<&str>,
@@ -112,10 +128,10 @@ fn push_rollout_agent_message_if_new(
     Ok(())
 }
 
-fn telegram_turn_terminal(terminal: super::rollout::ObserveTerminal) -> TelegramTurnTerminal {
+fn telegram_turn_terminal(terminal: WatchTerminal) -> TelegramTurnTerminal {
     match terminal {
-        super::rollout::ObserveTerminal::Completed => TelegramTurnTerminal::Done,
-        super::rollout::ObserveTerminal::Aborted => TelegramTurnTerminal::Interrupted,
+        WatchTerminal::Completed => TelegramTurnTerminal::Done,
+        WatchTerminal::Aborted => TelegramTurnTerminal::Interrupted,
     }
 }
 

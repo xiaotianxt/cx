@@ -12,14 +12,14 @@ pub(crate) struct OutputRateLimitSignal {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct RolloutTurnState {
+pub(crate) struct TurnSideEffectState {
     user_message_seen: bool,
     assistant_message_seen: bool,
     side_effect_seen: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RolloutRateLimitSignal {
+pub(crate) struct StreamRateLimitSignal {
     pub(crate) safe_to_continue: bool,
 }
 
@@ -50,21 +50,21 @@ pub(crate) fn classify_output(text: &str) -> Option<OutputRateLimitSignal> {
     None
 }
 
-pub(crate) fn inspect_rollout_fragment(
+pub(crate) fn inspect_stream_fragment(
     fragment: &str,
-    state: &mut RolloutTurnState,
-) -> Option<RolloutRateLimitSignal> {
+    state: &mut TurnSideEffectState,
+) -> Option<StreamRateLimitSignal> {
     let mut signal = None;
     for line in fragment.lines() {
-        inspect_rollout_line(line, state, &mut signal);
+        inspect_stream_line(line, state, &mut signal);
     }
     signal
 }
 
-fn inspect_rollout_line(
+fn inspect_stream_line(
     line: &str,
-    state: &mut RolloutTurnState,
-    signal: &mut Option<RolloutRateLimitSignal>,
+    state: &mut TurnSideEffectState,
+    signal: &mut Option<StreamRateLimitSignal>,
 ) {
     let parsed = serde_json::from_str::<Value>(line).ok();
     let payload_type = parsed
@@ -74,9 +74,9 @@ fn inspect_rollout_line(
     let line_lower = line.to_ascii_lowercase();
 
     if matches!(payload_type, Some("user_message")) || line_lower.contains("\"user_message\"") {
-        *state = RolloutTurnState {
+        *state = TurnSideEffectState {
             user_message_seen: true,
-            ..RolloutTurnState::default()
+            ..TurnSideEffectState::default()
         };
     }
 
@@ -103,7 +103,7 @@ fn inspect_rollout_line(
         .is_some_and(json_contains_rate_limit_reached)
         || fallback_line_mentions_rate_limit(&line_lower);
     if reached {
-        *signal = Some(RolloutRateLimitSignal {
+        *signal = Some(StreamRateLimitSignal {
             safe_to_continue: state.user_message_seen
                 && !state.assistant_message_seen
                 && !state.side_effect_seen,
@@ -197,29 +197,29 @@ mod tests {
     }
 
     #[test]
-    fn rollout_rate_limit_without_side_effect_is_safe_to_continue() {
-        let mut state = RolloutTurnState::default();
+    fn app_stream_rate_limit_without_side_effect_is_safe_to_continue() {
+        let mut state = TurnSideEffectState::default();
         let fragment = r#"{"payload":{"type":"user_message","message":"finish it"}}"#.to_string()
             + "\n"
             + r#"{"payload":{"type":"turn_started"}}"#
             + "\n"
             + r#"{"payload":{"type":"token_count","info":{"rate_limits":{"primary":{"used_percent":100.0}}}}}"#;
 
-        let signal = inspect_rollout_fragment(&fragment, &mut state).unwrap();
+        let signal = inspect_stream_fragment(&fragment, &mut state).unwrap();
 
         assert!(signal.safe_to_continue);
     }
 
     #[test]
-    fn rollout_rate_limit_after_tool_side_effect_is_not_safe_to_continue() {
-        let mut state = RolloutTurnState::default();
+    fn app_stream_rate_limit_after_tool_side_effect_is_not_safe_to_continue() {
+        let mut state = TurnSideEffectState::default();
         let fragment = r#"{"payload":{"type":"user_message","message":"edit files"}}"#.to_string()
             + "\n"
             + r#"{"payload":{"type":"exec_command_begin"}}"#
             + "\n"
             + r#"{"payload":{"type":"token_count","info":{"rate_limits":{"primary":{"rate_limit_reached_type":"primary"}}}}}"#;
 
-        let signal = inspect_rollout_fragment(&fragment, &mut state).unwrap();
+        let signal = inspect_stream_fragment(&fragment, &mut state).unwrap();
 
         assert!(!signal.safe_to_continue);
     }

@@ -1,6 +1,5 @@
 mod app_server;
 mod auth;
-mod autoresume;
 mod channel;
 mod cli;
 mod completion;
@@ -21,6 +20,7 @@ mod slot;
 mod stats;
 mod supervisor;
 mod target;
+mod thread_resolver;
 mod transfer;
 mod usage;
 

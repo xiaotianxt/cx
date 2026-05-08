@@ -5,12 +5,9 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::ffi::OsString;
-use std::fs;
 use std::io;
 use std::io::IsTerminal;
 use std::io::Read;
-use std::io::Seek;
-use std::io::SeekFrom;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::mpsc;
@@ -30,7 +27,6 @@ use portable_pty::CommandBuilder;
 use portable_pty::MasterPty;
 use portable_pty::PtySize;
 
-use crate::autoresume;
 use crate::paths::ManagerPaths;
 use crate::run;
 use crate::run::CodexCommandSpec;
@@ -54,7 +50,6 @@ pub(crate) struct SupervisorLaunch {
     pub(crate) original_codex_args: Vec<OsString>,
     pub(crate) initial_spec: CodexCommandSpec,
     pub(crate) session_id: Option<String>,
-    pub(crate) workspace: PathBuf,
     pub(crate) quiet: bool,
     pub(crate) debug: bool,
 }
@@ -127,7 +122,6 @@ struct Supervisor {
     original_codex_args: Vec<OsString>,
     current_slot: String,
     session_id: Option<String>,
-    workspace: PathBuf,
     quiet: bool,
     debug: bool,
     tx: mpsc::Sender<SupervisorEvent>,
@@ -138,7 +132,6 @@ struct Supervisor {
     cooldowns: BTreeMap<String, Instant>,
     output_ring: VecDeque<u8>,
     output_signal_seen: bool,
-    rollout_watcher: Option<RolloutWatcher>,
 }
 
 impl Supervisor {
@@ -174,7 +167,6 @@ impl Supervisor {
             original_codex_args: launch.original_codex_args,
             current_slot: launch.selected_slot,
             session_id: launch.session_id,
-            workspace: launch.workspace,
             quiet: launch.quiet,
             debug: launch.debug,
             tx,
@@ -185,7 +177,6 @@ impl Supervisor {
             cooldowns: BTreeMap::new(),
             output_ring: VecDeque::new(),
             output_signal_seen: false,
-            rollout_watcher: None,
         })
     }
 
@@ -260,9 +251,7 @@ impl Supervisor {
         self.state.last_event = Some(format!("child exited with {code}"));
         let _ = self.write_state();
 
-        if self.output_signal_seen
-            && self.handle_rate_limit_detected(RateLimitSource::Output, false)?
-        {
+        if self.output_signal_seen && self.handle_rate_limit_detected(false)? {
             return Ok(None);
         }
 
@@ -330,12 +319,6 @@ impl Supervisor {
     }
 
     fn tick(&mut self) -> Result<()> {
-        self.refresh_session_from_state(false)?;
-        if let Some(watcher) = &mut self.rollout_watcher {
-            if let Some(signal) = watcher.scan()? {
-                self.handle_rate_limit_detected(RateLimitSource::Rollout, signal.safe_to_continue)?;
-            }
-        }
         Ok(())
     }
 
@@ -348,19 +331,12 @@ impl Supervisor {
             .to_string();
         if rate_limit::classify_output(&text).is_some() {
             self.output_signal_seen = true;
-            self.handle_rate_limit_detected(RateLimitSource::Output, false)?;
+            self.handle_rate_limit_detected(false)?;
         }
         Ok(())
     }
 
-    fn handle_rate_limit_detected(
-        &mut self,
-        source: RateLimitSource,
-        safe_to_continue: bool,
-    ) -> Result<bool> {
-        if self.session_id.is_none() {
-            self.refresh_session_from_state(false)?;
-        }
+    fn handle_rate_limit_detected(&mut self, safe_to_continue: bool) -> Result<bool> {
         if self.session_id.is_none() {
             self.state.last_event = Some(String::from(
                 "rate-limit signal ignored: session id unknown",
@@ -372,7 +348,7 @@ impl Supervisor {
 
         let checker = UsageChecker::new(run::usage_timeout())?;
         let result = checker.query_slot(&self.paths, &self.current_slot, 0);
-        let decision = RotationDecision::from_signal(source, &result);
+        let decision = RotationDecision::from_result(&result);
         match decision {
             RotationDecision::Confirmed { cooldown } => {
                 self.cooldowns
@@ -407,7 +383,6 @@ impl Supervisor {
     }
 
     fn manual_rotate(&mut self, slot: Option<String>, continue_after: bool) -> Result<()> {
-        self.refresh_session_from_state(false)?;
         if self.session_id.is_none() {
             anyhow::bail!("session id is unknown; refusing rotate/resume");
         }
@@ -422,7 +397,6 @@ impl Supervisor {
         continue_after: bool,
     ) -> Result<()> {
         self.session_id = Some(session_id);
-        self.rollout_watcher = None;
         let slot = match slot {
             Some(slot) => self.select_slot(Some(slot))?,
             None => self.current_slot.clone(),
@@ -455,7 +429,6 @@ impl Supervisor {
         self.state.slot = self.current_slot.clone();
         self.state.session_id = self.session_id.clone();
         self.state.last_event = Some(reason.to_string());
-        self.rollout_watcher = None;
         self.start_child(spec, true)
     }
 
@@ -498,7 +471,7 @@ impl Supervisor {
         self.cooldowns.retain(|_, until| *until > now);
     }
 
-    fn start_child(&mut self, spec: CodexCommandSpec, known_session: bool) -> Result<()> {
+    fn start_child(&mut self, spec: CodexCommandSpec, _known_session: bool) -> Result<()> {
         let generation = self.generation + 1;
         self.generation = generation;
         self.output_signal_seen = false;
@@ -555,9 +528,6 @@ impl Supervisor {
         self.state.last_event = Some(format!("child started on {}", self.current_slot));
         self.write_state()?;
 
-        if known_session {
-            self.refresh_session_from_state(true)?;
-        }
         Ok(())
     }
 
@@ -605,42 +575,6 @@ impl Supervisor {
         }
     }
 
-    fn refresh_session_from_state(&mut self, existing_session_start_at_end: bool) -> Result<()> {
-        let slot_home = self.paths.slot_home(&self.current_slot);
-        if let Some(session_id) = self.session_id.clone() {
-            if self.rollout_watcher.is_none() {
-                if let Some(candidate) =
-                    autoresume::session_candidate_by_id(&slot_home, &session_id)
-                {
-                    self.set_rollout_path(candidate.rollout_path, existing_session_start_at_end)?;
-                }
-            }
-            return Ok(());
-        }
-
-        let Some(candidate) = autoresume::latest_session_candidate(&slot_home, &self.workspace)
-        else {
-            return Ok(());
-        };
-        self.session_id = Some(candidate.session_id);
-        self.state.session_id = self.session_id.clone();
-        self.state.last_event = Some(String::from("session discovered"));
-        self.set_rollout_path(candidate.rollout_path, false)?;
-        self.write_state()
-    }
-
-    fn set_rollout_path(&mut self, path: PathBuf, start_at_end: bool) -> Result<()> {
-        if self
-            .rollout_watcher
-            .as_ref()
-            .is_some_and(|watcher| watcher.path == path)
-        {
-            return Ok(());
-        }
-        self.rollout_watcher = Some(RolloutWatcher::new(path, start_at_end)?);
-        Ok(())
-    }
-
     fn push_output_ring(&mut self, bytes: &[u8]) {
         for byte in bytes {
             if self.output_ring.len() == OUTPUT_RING_LIMIT {
@@ -663,12 +597,6 @@ impl Supervisor {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum RateLimitSource {
-    Rollout,
-    Output,
-}
-
-#[derive(Debug, Clone, Copy)]
 enum RotationDecision {
     Confirmed { cooldown: Duration },
     LowConfidence { cooldown: Duration },
@@ -676,7 +604,7 @@ enum RotationDecision {
 }
 
 impl RotationDecision {
-    fn from_signal(source: RateLimitSource, result: &crate::usage::SlotResult) -> Self {
+    fn from_result(result: &crate::usage::SlotResult) -> Self {
         if result.status == SlotStatus::Exhausted {
             return Self::Confirmed {
                 cooldown: cooldown_from_result(result),
@@ -692,62 +620,7 @@ impl RotationDecision {
             };
         }
 
-        let _ = source;
-
         Self::NotConfirmed
-    }
-}
-
-struct RolloutWatcher {
-    path: PathBuf,
-    offset: u64,
-    turn_state: rate_limit::RolloutTurnState,
-}
-
-impl RolloutWatcher {
-    fn new(path: PathBuf, start_at_end: bool) -> Result<Self> {
-        let offset = if start_at_end {
-            fs::metadata(&path)
-                .map(|metadata| metadata.len())
-                .unwrap_or(0)
-        } else {
-            0
-        };
-        Ok(Self {
-            path,
-            offset,
-            turn_state: rate_limit::RolloutTurnState::default(),
-        })
-    }
-
-    fn scan(&mut self) -> Result<Option<rate_limit::RolloutRateLimitSignal>> {
-        let mut file = match fs::File::open(&self.path) {
-            Ok(file) => file,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(err) => return Err(err).with_context(|| format!("open {}", self.path.display())),
-        };
-        let len = file
-            .metadata()
-            .with_context(|| format!("stat {}", self.path.display()))?
-            .len();
-        if len < self.offset {
-            self.offset = 0;
-        }
-        if len == self.offset {
-            return Ok(None);
-        }
-
-        file.seek(SeekFrom::Start(self.offset))
-            .with_context(|| format!("seek {}", self.path.display()))?;
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)
-            .with_context(|| format!("read {}", self.path.display()))?;
-        self.offset = len;
-        let fragment = String::from_utf8_lossy(&bytes);
-        Ok(rate_limit::inspect_rollout_fragment(
-            &fragment,
-            &mut self.turn_state,
-        ))
     }
 }
 

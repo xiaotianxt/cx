@@ -133,7 +133,6 @@ use self::rollout::ObserveTerminal;
 #[cfg(test)]
 use self::rollout::ObservedRolloutTerminal;
 use self::rollout::RolloutObserveEvent;
-use self::rollout::RolloutOpenFiles;
 #[cfg(test)]
 use self::rollout::RolloutTaskEvent;
 use self::state::read_state;
@@ -164,6 +163,7 @@ use self::watch::WatchSendResult;
 
 const PORTAL_TOPIC_TITLE: &str = "cx portal";
 const PORTAL_APP_SERVER_TIMEOUT: Duration = Duration::from_millis(750);
+#[cfg(test)]
 const ROLLOUT_OWNER_PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 const WATCH_DRAIN_MAX_LINES: usize = 1000;
 
@@ -1777,7 +1777,7 @@ fn list_portal_entries(
     }
 
     let local_start = Instant::now();
-    let mut local_candidates = local_state_portal_candidates(paths, candidate_limit)?;
+    let mut local_candidates = local_state_portal_candidates(paths, candidate_limit);
     if trace_timings {
         eprintln!(
             "telegram timing route={} phase=portal_local_state threads={} elapsed_ms={}",
@@ -1851,35 +1851,34 @@ fn app_server_portal_candidates(
         .collect())
 }
 
-fn local_state_portal_candidates(
-    paths: &ManagerPaths,
-    limit: u64,
-) -> Result<Vec<PortalEntryCandidate>> {
+fn local_state_portal_candidates(paths: &ManagerPaths, limit: u64) -> Vec<PortalEntryCandidate> {
     let mut candidates = Vec::new();
-    let mut open_rollouts = RolloutOpenFiles::snapshot();
     for db_path in codex_state_db_paths(paths) {
         if !db_path.exists() {
             continue;
         }
-        candidates.extend(local_state_portal_candidates_from_db(
-            &db_path,
-            limit,
-            &mut open_rollouts,
-        )?);
+        match local_state_portal_candidates_from_db(&db_path, limit) {
+            Ok(mut db_candidates) => candidates.append(&mut db_candidates),
+            Err(err) => {
+                eprintln!(
+                    "telegram portal skipped local state db {}: {err:#}",
+                    db_path.display()
+                );
+            }
+        }
     }
-    Ok(candidates)
+    candidates
 }
 
 fn local_state_portal_candidates_from_db(
     db_path: &Path,
     limit: u64,
-    open_rollouts: &mut RolloutOpenFiles,
 ) -> Result<Vec<PortalEntryCandidate>> {
     let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("open {}", db_path.display()))?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, title, first_user_message, cwd, archived, rollout_path, updated_at \
+            "SELECT id, title, first_user_message, cwd, updated_at \
                  FROM threads \
                  WHERE rollout_path <> '' \
                  ORDER BY updated_at DESC \
@@ -1891,38 +1890,19 @@ fn local_state_portal_candidates_from_db(
         let title: Option<String> = row.get(1)?;
         let preview: Option<String> = row.get(2)?;
         let cwd: Option<String> = row.get(3)?;
-        let archived = row.get::<_, i64>(4)? != 0;
-        let rollout_path: String = row.get(5)?;
-        let updated_at_unix: i64 = row.get(6)?;
+        let updated_at_unix: i64 = row.get(4)?;
         Ok((
             thread_id,
             title.unwrap_or_default(),
             preview.unwrap_or_default(),
             cwd.unwrap_or_default(),
-            archived,
-            PathBuf::from(rollout_path),
             updated_at_unix,
         ))
     })?;
 
     let mut candidates = Vec::new();
     for row in rows {
-        let (thread_id, title, preview, cwd, archived, rollout_path, updated_at_unix) = row?;
-        let active = open_rollouts
-            .active_rollout_turn_for_path(&rollout_path, &thread_id)
-            .ok()
-            .flatten()
-            .is_some();
-        if archived && !active {
-            continue;
-        }
-        let status = if active {
-            "active-tui"
-        } else if open_rollouts.rollout_file_is_open_path(&rollout_path, &thread_id) {
-            "open-tui"
-        } else {
-            "notLoaded"
-        };
+        let (thread_id, title, preview, cwd, updated_at_unix) = row?;
         candidates.push(PortalEntryCandidate {
             entry: AppThreadPortalEntry {
                 thread_id,
@@ -1931,10 +1911,10 @@ fn local_state_portal_candidates_from_db(
                 cwd,
                 active: false,
                 watchable: true,
-                status: status.to_string(),
+                status: "notLoaded".to_string(),
             },
             updated_at_unix,
-            priority: if active { 2 } else { 1 },
+            priority: 1,
         });
     }
     Ok(candidates)
@@ -2001,7 +1981,7 @@ fn open_tui_portal_entries(
     max_candidates: u64,
 ) -> Result<Vec<AppThreadPortalEntry>> {
     Ok(filter_portal_candidates(
-        local_state_portal_candidates(paths, max_candidates)?,
+        local_state_portal_candidates(paths, max_candidates),
         max_candidates,
     ))
 }

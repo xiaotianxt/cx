@@ -3,16 +3,18 @@
 //! This module translates local Codex transcript/proxy records into the stream
 //! events consumed by Telegram watch delivery.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::BufRead;
 use std::io::BufReader;
+use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::path::Path;
 use std::path::PathBuf;
 #[cfg(test)]
 use std::thread;
+#[cfg(test)]
 use std::time::Duration;
 #[cfg(test)]
 use std::time::Instant;
@@ -25,6 +27,7 @@ use rusqlite::OpenFlags;
 use serde_json::Value;
 
 use crate::app_server::parse_server_event;
+#[cfg(test)]
 use crate::app_server::AppServerClient;
 use crate::app_server::AppStreamEvent;
 use crate::app_server::CommandActivity;
@@ -35,7 +38,11 @@ use crate::paths::ManagerPaths;
 
 use super::state::TelegramPendingApproval;
 use super::truncate_chars;
+#[cfg(test)]
 use super::ROLLOUT_OWNER_PROBE_TIMEOUT;
+
+const ROLLOUT_REVERSE_CHUNK_SIZE: usize = 64 * 1024;
+const ROLLOUT_MAX_REVERSE_LINE: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ObserveTerminal {
@@ -43,81 +50,12 @@ pub(super) enum ObserveTerminal {
     Aborted,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ActiveRolloutTurn {
     pub(super) path: PathBuf,
     pub(super) turn_id: String,
     pub(super) offset: u64,
-}
-
-#[derive(Debug, Default)]
-pub(super) struct RolloutOpenFiles {
-    holders_by_path: BTreeMap<PathBuf, u32>,
-    listen_urls_by_pid: BTreeMap<u32, Vec<String>>,
-    active_turn_by_url_thread: BTreeMap<(String, String), bool>,
-}
-
-impl RolloutOpenFiles {
-    pub(super) fn snapshot() -> Self {
-        Self {
-            holders_by_path: open_rollout_holders(),
-            listen_urls_by_pid: BTreeMap::new(),
-            active_turn_by_url_thread: BTreeMap::new(),
-        }
-    }
-
-    pub(super) fn active_rollout_turn_for_path(
-        &mut self,
-        path: &Path,
-        thread_id: &str,
-    ) -> Result<Option<ActiveRolloutTurn>> {
-        let Some(pid) = self.pid_holding_path(path) else {
-            return Ok(None);
-        };
-        let Some((turn_id, offset)) = latest_active_rollout_turn(path)? else {
-            return Ok(None);
-        };
-        if !self.holder_is_watchable(pid, thread_id) {
-            return Ok(None);
-        }
-        Ok(Some(ActiveRolloutTurn {
-            path: path.to_path_buf(),
-            turn_id,
-            offset,
-        }))
-    }
-
-    pub(super) fn rollout_file_is_open_path(&mut self, path: &Path, thread_id: &str) -> bool {
-        let Some(pid) = self.pid_holding_path(path) else {
-            return false;
-        };
-        self.holder_is_watchable(pid, thread_id)
-    }
-
-    fn pid_holding_path(&self, path: &Path) -> Option<u32> {
-        self.holders_by_path.get(&rollout_path_key(path)).copied()
-    }
-
-    fn holder_is_watchable(&mut self, pid: u32, thread_id: &str) -> bool {
-        let urls = self
-            .listen_urls_by_pid
-            .entry(pid)
-            .or_insert_with(|| pid_listening_urls(pid))
-            .clone();
-        if urls.is_empty() {
-            return true;
-        }
-        urls.into_iter().any(|url| {
-            let key = (url.clone(), thread_id.to_string());
-            if let Some(active) = self.active_turn_by_url_thread.get(&key) {
-                return *active;
-            }
-            let active = app_server_has_active_turn(&url, thread_id, ROLLOUT_OWNER_PROBE_TIMEOUT)
-                .unwrap_or(false);
-            self.active_turn_by_url_thread.insert(key, active);
-            active
-        })
-    }
 }
 
 #[cfg(test)]
@@ -210,28 +148,117 @@ pub(super) fn active_rollout_turn_for_path(
 }
 
 pub(super) fn latest_active_rollout_turn(path: &Path) -> Result<Option<(String, u64)>> {
-    let file = fs::File::open(path).with_context(|| format!("open rollout {}", path.display()))?;
-    let mut reader = BufReader::new(file);
-    let mut active_turns = Vec::<(String, u64)>::new();
-    let mut line = String::new();
-    loop {
-        let line_offset = reader
-            .stream_position()
-            .with_context(|| format!("read rollout position {}", path.display()))?;
-        line.clear();
-        let read = reader
-            .read_line(&mut line)
+    let mut file =
+        fs::File::open(path).with_context(|| format!("open rollout {}", path.display()))?;
+    let file_len = file
+        .metadata()
+        .with_context(|| format!("stat rollout {}", path.display()))?
+        .len();
+    let mut cursor = file_len;
+    let mut carry = Vec::<u8>::new();
+    let mut closed_turns = BTreeSet::<String>::new();
+    let mut discarding_oversize_line = false;
+
+    while cursor > 0 {
+        let read_len = cursor.min(ROLLOUT_REVERSE_CHUNK_SIZE as u64) as usize;
+        let chunk_start = cursor - read_len as u64;
+        let mut chunk = vec![0; read_len];
+        file.seek(SeekFrom::Start(chunk_start))
+            .with_context(|| format!("seek rollout {}", path.display()))?;
+        file.read_exact(&mut chunk)
             .with_context(|| format!("read rollout {}", path.display()))?;
-        if read == 0 {
+
+        if discarding_oversize_line {
+            let Some(newline) = chunk.iter().rposition(|byte| *byte == b'\n') else {
+                cursor = chunk_start;
+                continue;
+            };
+            chunk.truncate(newline);
+            discarding_oversize_line = false;
+        }
+
+        if !carry.is_empty() {
+            chunk.extend_from_slice(&carry);
+            carry.clear();
+        }
+
+        let mut line_end = chunk.len();
+        while let Some(newline) = chunk[..line_end].iter().rposition(|byte| *byte == b'\n') {
+            let line_start = newline + 1;
+            if let Some(active) = reverse_active_rollout_line(
+                &chunk[line_start..line_end],
+                chunk_start + line_start as u64,
+                &mut closed_turns,
+            ) {
+                return Ok(active);
+            }
+            line_end = newline;
+        }
+
+        if chunk_start == 0 {
+            if let Some(active) =
+                reverse_active_rollout_line(&chunk[..line_end], 0, &mut closed_turns)
+            {
+                return Ok(active);
+            }
             break;
         }
-        apply_rollout_task_event(&mut active_turns, rollout_task_event(&line), line_offset);
+
+        if line_end > ROLLOUT_MAX_REVERSE_LINE {
+            discarding_oversize_line = true;
+        } else {
+            carry.extend_from_slice(&chunk[..line_end]);
+        }
+        cursor = chunk_start;
     }
-    Ok(active_turns
-        .last()
-        .map(|(turn_id, offset)| (turn_id.clone(), *offset)))
+
+    Ok(None)
 }
 
+fn reverse_active_rollout_line(
+    line: &[u8],
+    offset: u64,
+    closed_turns: &mut BTreeSet<String>,
+) -> Option<Option<(String, u64)>> {
+    if line.is_empty()
+        || line.len() > ROLLOUT_MAX_REVERSE_LINE
+        || !looks_like_rollout_task_line(line)
+    {
+        return None;
+    }
+    let line = std::str::from_utf8(line).ok()?;
+    match rollout_task_event(line)? {
+        RolloutTaskEvent::Started(turn_id) if !closed_turns.contains(&turn_id) => {
+            Some(Some((turn_id, offset)))
+        }
+        RolloutTaskEvent::Started(_) => None,
+        RolloutTaskEvent::Terminal {
+            turn_id: Some(turn_id),
+            ..
+        } => {
+            closed_turns.insert(turn_id);
+            None
+        }
+        RolloutTaskEvent::Terminal { turn_id: None, .. } => Some(None),
+    }
+}
+
+fn looks_like_rollout_task_line(line: &[u8]) -> bool {
+    bytes_contains(line, b"task_started")
+        || bytes_contains(line, b"turn_started")
+        || bytes_contains(line, b"task_complete")
+        || bytes_contains(line, b"turn_complete")
+        || bytes_contains(line, b"turn_aborted")
+        || bytes_contains(line, b"turn_context")
+}
+
+fn bytes_contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+#[cfg(test)]
 pub(super) fn apply_rollout_task_event(
     active_turns: &mut Vec<(String, u64)>,
     event: Option<RolloutTaskEvent>,
@@ -1553,6 +1580,7 @@ fn rollout_holder_is_watchable(pid: u32, thread_id: &str) -> bool {
     })
 }
 
+#[cfg(test)]
 fn app_server_has_active_turn(url: &str, thread_id: &str, timeout: Duration) -> Result<bool> {
     let mut client = AppServerClient::connect(url, timeout)?;
     client.initialize("cx-telegram", env!("CARGO_PKG_VERSION"))?;
@@ -1575,43 +1603,7 @@ pub(super) fn pid_holding_file(path: &Path) -> Option<u32> {
         .find_map(|line| line.strip_prefix('p')?.parse::<u32>().ok())
 }
 
-fn open_rollout_holders() -> BTreeMap<PathBuf, u32> {
-    let output = std::process::Command::new("lsof")
-        .args(["-nP", "-Fpn"])
-        .stdin(std::process::Stdio::null())
-        .output();
-    let Ok(output) = output else {
-        return BTreeMap::new();
-    };
-    if !output.status.success() {
-        return BTreeMap::new();
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let mut holders = BTreeMap::<PathBuf, u32>::new();
-    let mut current_pid = None::<u32>;
-    for line in text.lines() {
-        if let Some(pid) = line.strip_prefix('p').and_then(|pid| pid.parse().ok()) {
-            current_pid = Some(pid);
-            continue;
-        }
-        let Some(path) = line.strip_prefix('n') else {
-            continue;
-        };
-        if !(path.contains("/rollout-") && path.ends_with(".jsonl")) {
-            continue;
-        }
-        let Some(pid) = current_pid else {
-            continue;
-        };
-        holders.insert(rollout_path_key(Path::new(path)), pid);
-    }
-    holders
-}
-
-fn rollout_path_key(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
-}
-
+#[cfg(test)]
 pub(super) fn pid_listening_urls(pid: u32) -> Vec<String> {
     let output = std::process::Command::new("lsof")
         .args([
@@ -1634,6 +1626,7 @@ pub(super) fn pid_listening_urls(pid: u32) -> Vec<String> {
     loopback_listen_urls(&text)
 }
 
+#[cfg(test)]
 pub(super) fn loopback_listen_urls(text: &str) -> Vec<String> {
     let mut urls = Vec::new();
     for line in text.lines() {
@@ -1648,6 +1641,7 @@ pub(super) fn loopback_listen_urls(text: &str) -> Vec<String> {
     urls
 }
 
+#[cfg(test)]
 fn loopback_port(addr: &str) -> Option<u16> {
     addr.strip_prefix("127.0.0.1:")
         .or_else(|| addr.strip_prefix("localhost:"))

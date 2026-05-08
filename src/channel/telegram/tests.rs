@@ -1033,6 +1033,85 @@ fn rollout_task_events_accept_turn_context_start() {
 }
 
 #[test]
+fn latest_active_rollout_turn_reads_recent_unclosed_turn_from_tail() {
+    let paths = temp_paths("latest-active-tail");
+    fs::create_dir_all(&paths.base_codex_home).unwrap();
+    let path = paths.base_codex_home.join("rollout.jsonl");
+    let mut content = Vec::new();
+
+    push_rollout_line(
+        &mut content,
+        r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+    );
+    push_rollout_line(
+        &mut content,
+        r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"}}"#,
+    );
+    let turn_2_offset = push_rollout_line(
+        &mut content,
+        r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-2"}}"#,
+    );
+    push_rollout_line(
+        &mut content,
+        r#"{"type":"event_msg","payload":{"type":"agent_message","message":"still working"}}"#,
+    );
+    fs::write(&path, content).unwrap();
+
+    assert_eq!(
+        latest_active_rollout_turn(&path).unwrap(),
+        Some(("turn-2".to_string(), turn_2_offset))
+    );
+}
+
+#[test]
+fn latest_active_rollout_turn_ignores_closed_turn_from_tail() {
+    let paths = temp_paths("latest-active-closed-tail");
+    fs::create_dir_all(&paths.base_codex_home).unwrap();
+    let path = paths.base_codex_home.join("rollout.jsonl");
+    let mut content = Vec::new();
+
+    push_rollout_line(
+        &mut content,
+        r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+    );
+    push_rollout_line(
+        &mut content,
+        r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1"}}"#,
+    );
+    fs::write(&path, content).unwrap();
+
+    assert_eq!(latest_active_rollout_turn(&path).unwrap(), None);
+}
+
+#[test]
+fn latest_active_rollout_turn_skips_large_non_lifecycle_lines() {
+    let paths = temp_paths("latest-active-large-line");
+    fs::create_dir_all(&paths.base_codex_home).unwrap();
+    let path = paths.base_codex_home.join("rollout.jsonl");
+    let mut content = Vec::new();
+
+    let turn_offset = push_rollout_line(
+        &mut content,
+        r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-large"}}"#,
+    );
+    content.extend(std::iter::repeat_n(b'x', 2_000_000));
+    content.push(b'\n');
+    fs::write(&path, content).unwrap();
+
+    assert_eq!(
+        latest_active_rollout_turn(&path).unwrap(),
+        Some(("turn-large".to_string(), turn_offset))
+    );
+}
+
+fn push_rollout_line(content: &mut Vec<u8>, line: &str) -> u64 {
+    let offset = content.len() as u64;
+    content.extend_from_slice(line.as_bytes());
+    content.push(b'\n');
+    offset
+}
+
+#[test]
 fn rollout_path_for_thread_keeps_archived_active_rollouts_visible() {
     let paths = temp_paths("rollout-archived-path");
     fs::create_dir_all(&paths.base_codex_home).unwrap();
@@ -1122,7 +1201,7 @@ fn watch_source_keeps_persisted_rollout_when_registration_is_temporarily_missing
 }
 
 #[test]
-fn open_tui_portal_entries_ignores_archived_idle_rollouts() {
+fn open_tui_portal_entries_keeps_recent_archived_rollouts_visible() {
     let paths = temp_paths("rollout-archived-idle");
     fs::create_dir_all(&paths.base_codex_home).unwrap();
     let rollout = paths.base_codex_home.join("archived-idle-rollout.jsonl");
@@ -1178,7 +1257,9 @@ fn open_tui_portal_entries_ignores_archived_idle_rollouts() {
 
     let entries = open_tui_portal_entries(&paths, 10).unwrap();
 
-    assert!(entries.is_empty());
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].thread_id, "thread-archived-idle");
+    assert_eq!(entries[0].status, "notLoaded");
     let _ = fs::remove_dir_all(paths.base_codex_home);
 }
 
@@ -1225,7 +1306,7 @@ fn active_rollout_turn_requires_active_turn_proof_from_listener_holder() {
 }
 
 #[test]
-fn open_tui_portal_entries_keeps_archived_active_rollouts_visible() {
+fn open_tui_portal_entries_keeps_active_archived_rollouts_visible_without_probe() {
     let paths = temp_paths("rollout-archived-active");
     fs::create_dir_all(&paths.base_codex_home).unwrap();
     let rollout = paths.base_codex_home.join("archived-active-rollout.jsonl");
@@ -1283,7 +1364,7 @@ fn open_tui_portal_entries_keeps_archived_active_rollouts_visible() {
 
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].thread_id, "thread-archived-active");
-    assert_eq!(entries[0].status, "active-tui");
+    assert_eq!(entries[0].status, "notLoaded");
     let _ = fs::remove_dir_all(paths.base_codex_home);
 }
 

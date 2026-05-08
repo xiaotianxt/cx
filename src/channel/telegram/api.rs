@@ -3,9 +3,16 @@
 //! This module owns Telegram protocol details. Higher-level routing, session
 //! state, and transcript rendering should stay in sibling modules.
 
+use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::thread;
+use std::time::Duration;
+use std::time::Instant;
+
 use anyhow::Context;
 use anyhow::Result;
 use reqwest::blocking::Client;
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -14,6 +21,193 @@ struct TelegramResponse<T> {
     ok: bool,
     result: Option<T>,
     description: Option<String>,
+    parameters: Option<TelegramResponseParameters>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramResponseParameters {
+    retry_after: Option<u64>,
+}
+
+const TELEGRAM_MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(300);
+const TELEGRAM_RATE_LIMIT_SLACK: Duration = Duration::from_secs(1);
+const TELEGRAM_MAX_RATE_LIMIT_RETRIES: usize = 2;
+
+static TELEGRAM_NEXT_REQUEST_AT: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TelegramRequestMode {
+    Reliable,
+    BestEffort,
+}
+
+impl<T> TelegramResponse<T> {
+    fn description_or_unknown(&self) -> String {
+        self.description
+            .clone()
+            .unwrap_or_else(|| "unknown error".to_string())
+    }
+
+    fn retry_after_seconds(&self) -> Option<u64> {
+        self.parameters
+            .as_ref()
+            .and_then(|parameters| parameters.retry_after)
+            .or_else(|| {
+                self.description
+                    .as_deref()
+                    .and_then(telegram_retry_after_seconds_from_description)
+            })
+    }
+}
+
+fn telegram_rate_limit_state() -> &'static Mutex<Option<Instant>> {
+    TELEGRAM_NEXT_REQUEST_AT.get_or_init(|| Mutex::new(None))
+}
+
+fn telegram_rate_limit_delay() -> Duration {
+    let next_request_at = telegram_rate_limit_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    next_request_at
+        .map(|next| next.saturating_duration_since(Instant::now()))
+        .unwrap_or_default()
+}
+
+fn wait_for_telegram_rate_limit(method: &str, mode: TelegramRequestMode) -> Result<()> {
+    loop {
+        let sleep_for = telegram_rate_limit_delay();
+        if sleep_for.is_zero() {
+            return Ok(());
+        }
+        if mode == TelegramRequestMode::BestEffort {
+            anyhow::bail!(
+                "Telegram {method} skipped: global rate limit active for {}ms",
+                sleep_for.as_millis()
+            );
+        }
+        if sleep_for >= Duration::from_secs(1) {
+            eprintln!(
+                "telegram global rate limit waiting method={method} cooldown_ms={}",
+                sleep_for.as_millis()
+            );
+        }
+        thread::sleep(sleep_for);
+    }
+}
+
+fn record_telegram_request_spacing() {
+    let next_allowed = Instant::now() + TELEGRAM_MIN_REQUEST_INTERVAL;
+    let mut next_request_at = telegram_rate_limit_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *next_request_at =
+        Some(next_request_at.map_or(next_allowed, |existing| existing.max(next_allowed)));
+}
+
+fn record_telegram_retry_after(method: &str, seconds: u64) {
+    let delay = Duration::from_secs(seconds).saturating_add(TELEGRAM_RATE_LIMIT_SLACK);
+    let next_allowed = Instant::now() + delay;
+    let mut next_request_at = telegram_rate_limit_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *next_request_at =
+        Some(next_request_at.map_or(next_allowed, |existing| existing.max(next_allowed)));
+    eprintln!(
+        "telegram global rate limit method={method} retry_after_s={seconds} cooldown_ms={}",
+        delay.as_millis()
+    );
+}
+
+fn telegram_retry_after_seconds_from_description(description: &str) -> Option<u64> {
+    let marker = "retry after ";
+    let start = description.find(marker)? + marker.len();
+    description[start..]
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>()
+        .parse::<u64>()
+        .ok()
+}
+
+fn post_form<T, P>(
+    client: &Client,
+    token: &str,
+    method: &'static str,
+    payload: &P,
+) -> Result<TelegramResponse<T>>
+where
+    T: DeserializeOwned,
+    P: Serialize + ?Sized,
+{
+    post_form_with_mode(
+        client,
+        token,
+        method,
+        payload,
+        TelegramRequestMode::Reliable,
+    )
+}
+
+fn post_form_best_effort<T, P>(
+    client: &Client,
+    token: &str,
+    method: &'static str,
+    payload: &P,
+) -> Result<TelegramResponse<T>>
+where
+    T: DeserializeOwned,
+    P: Serialize + ?Sized,
+{
+    post_form_with_mode(
+        client,
+        token,
+        method,
+        payload,
+        TelegramRequestMode::BestEffort,
+    )
+}
+
+fn post_form_with_mode<T, P>(
+    client: &Client,
+    token: &str,
+    method: &'static str,
+    payload: &P,
+    mode: TelegramRequestMode,
+) -> Result<TelegramResponse<T>>
+where
+    T: DeserializeOwned,
+    P: Serialize + ?Sized,
+{
+    let url = telegram_method_url(token, method);
+    for attempt in 0..=TELEGRAM_MAX_RATE_LIMIT_RETRIES {
+        wait_for_telegram_rate_limit(method, mode)?;
+        let response = client
+            .post(url.as_str())
+            .form(payload)
+            .send()
+            .map_err(|err| {
+                anyhow::anyhow!("Telegram {method} request failed: {}", err.without_url())
+            })?;
+        let response = response.json::<TelegramResponse<T>>().map_err(|err| {
+            anyhow::anyhow!(
+                "decode Telegram {method} response failed: {}",
+                err.without_url()
+            )
+        })?;
+        record_telegram_request_spacing();
+        if !response.ok {
+            if let Some(seconds) = response.retry_after_seconds() {
+                record_telegram_retry_after(method, seconds);
+                if mode == TelegramRequestMode::Reliable
+                    && attempt < TELEGRAM_MAX_RATE_LIMIT_RETRIES
+                {
+                    continue;
+                }
+            }
+        }
+        return Ok(response);
+    }
+    unreachable!("bounded Telegram retry loop always returns")
 }
 
 #[derive(Debug, Serialize)]
@@ -251,7 +445,6 @@ pub(super) fn send_message(
     text: &str,
     reply_markup: Option<&TelegramInlineKeyboardMarkup>,
 ) -> Result<i64> {
-    let url = telegram_method_url(token, "sendMessage");
     let chat_id = chat_id.to_string();
     let message_thread_id = message_thread_id.map(|thread_id| thread_id.to_string());
     let reply_markup = reply_markup
@@ -266,23 +459,11 @@ pub(super) fn send_message(
         message_thread_id,
         reply_markup: reply_markup.as_deref(),
     };
-    let response = client.post(url).form(&payload).send().map_err(|err| {
-        anyhow::anyhow!("Telegram sendMessage request failed: {}", err.without_url())
-    })?;
-    let response = response
-        .json::<TelegramResponse<TelegramSentMessage>>()
-        .map_err(|err| {
-            anyhow::anyhow!(
-                "decode Telegram sendMessage response failed: {}",
-                err.without_url()
-            )
-        })?;
+    let response = post_form::<TelegramSentMessage, _>(client, token, "sendMessage", &payload)?;
     if !response.ok {
         anyhow::bail!(
             "Telegram sendMessage failed: {}",
-            response
-                .description
-                .unwrap_or_else(|| "unknown error".to_string())
+            response.description_or_unknown()
         );
     }
     response
@@ -310,7 +491,6 @@ pub(super) fn edit_message_text(
     text: &str,
     reply_markup: Option<&TelegramInlineKeyboardMarkup>,
 ) -> Result<()> {
-    let url = telegram_method_url(token, "editMessageText");
     let chat_id = chat_id.to_string();
     let message_id = message_id.to_string();
     let reply_markup = reply_markup
@@ -325,20 +505,7 @@ pub(super) fn edit_message_text(
         parse_mode: Some("HTML"),
         reply_markup: reply_markup.as_deref(),
     };
-    let response = client.post(url).form(&payload).send().map_err(|err| {
-        anyhow::anyhow!(
-            "Telegram editMessageText request failed: {}",
-            err.without_url()
-        )
-    })?;
-    let response = response
-        .json::<TelegramResponse<serde_json::Value>>()
-        .map_err(|err| {
-            anyhow::anyhow!(
-                "decode Telegram editMessageText response failed: {}",
-                err.without_url()
-            )
-        })?;
+    let response = post_form::<serde_json::Value, _>(client, token, "editMessageText", &payload)?;
     if !response.ok {
         if response
             .description
@@ -349,9 +516,7 @@ pub(super) fn edit_message_text(
         }
         anyhow::bail!(
             "Telegram editMessageText failed: {}",
-            response
-                .description
-                .unwrap_or_else(|| "unknown error".to_string())
+            response.description_or_unknown()
         );
     }
     Ok(())
@@ -369,25 +534,13 @@ pub(super) fn delete_message(
     chat_id: i64,
     message_id: i64,
 ) -> Result<()> {
-    let url = telegram_method_url(token, "deleteMessage");
     let chat_id = chat_id.to_string();
     let message_id = message_id.to_string();
     let payload = TelegramDeleteMessage {
         chat_id: chat_id.as_str(),
         message_id: message_id.as_str(),
     };
-    let response = client.post(url).form(&payload).send().map_err(|err| {
-        anyhow::anyhow!(
-            "Telegram deleteMessage request failed: {}",
-            err.without_url()
-        )
-    })?;
-    let response = response.json::<TelegramResponse<bool>>().map_err(|err| {
-        anyhow::anyhow!(
-            "decode Telegram deleteMessage response failed: {}",
-            err.without_url()
-        )
-    })?;
+    let response = post_form::<bool, _>(client, token, "deleteMessage", &payload)?;
     if !response.ok {
         if response
             .description
@@ -398,9 +551,7 @@ pub(super) fn delete_message(
         }
         anyhow::bail!(
             "Telegram deleteMessage failed: {}",
-            response
-                .description
-                .unwrap_or_else(|| "unknown error".to_string())
+            response.description_or_unknown()
         );
     }
     Ok(())
@@ -418,32 +569,16 @@ pub(super) fn create_forum_topic(
     chat_id: i64,
     name: &str,
 ) -> Result<i64> {
-    let url = telegram_method_url(token, "createForumTopic");
     let chat_id = chat_id.to_string();
     let payload = TelegramForumTopicParams {
         chat_id: chat_id.as_str(),
         name,
     };
-    let response = client.post(url).form(&payload).send().map_err(|err| {
-        anyhow::anyhow!(
-            "Telegram createForumTopic request failed: {}",
-            err.without_url()
-        )
-    })?;
-    let response = response
-        .json::<TelegramResponse<serde_json::Value>>()
-        .map_err(|err| {
-            anyhow::anyhow!(
-                "decode Telegram createForumTopic response failed: {}",
-                err.without_url()
-            )
-        })?;
+    let response = post_form::<serde_json::Value, _>(client, token, "createForumTopic", &payload)?;
     if !response.ok {
         anyhow::bail!(
             "Telegram createForumTopic failed: {}",
-            response
-                .description
-                .unwrap_or_else(|| "unknown error".to_string())
+            response.description_or_unknown()
         );
     }
     let topic_id = response
@@ -467,33 +602,17 @@ pub(super) fn delete_forum_topic(
     chat_id: i64,
     message_thread_id: i64,
 ) -> Result<()> {
-    let url = telegram_method_url(token, "deleteForumTopic");
     let chat_id = chat_id.to_string();
     let message_thread_id = message_thread_id.to_string();
     let payload = TelegramDeleteForumTopicParams {
         chat_id: chat_id.as_str(),
         message_thread_id: message_thread_id.as_str(),
     };
-    let response = client.post(url).form(&payload).send().map_err(|err| {
-        anyhow::anyhow!(
-            "Telegram deleteForumTopic request failed: {}",
-            err.without_url()
-        )
-    })?;
-    let response = response
-        .json::<TelegramResponse<serde_json::Value>>()
-        .map_err(|err| {
-            anyhow::anyhow!(
-                "decode Telegram deleteForumTopic response failed: {}",
-                err.without_url()
-            )
-        })?;
+    let response = post_form::<serde_json::Value, _>(client, token, "deleteForumTopic", &payload)?;
     if !response.ok {
         anyhow::bail!(
             "Telegram deleteForumTopic failed: {}",
-            response
-                .description
-                .unwrap_or_else(|| "unknown error".to_string())
+            response.description_or_unknown()
         );
     }
     Ok(())
@@ -511,26 +630,13 @@ pub(super) fn edit_general_forum_topic(
     chat_id: i64,
     name: &str,
 ) -> Result<()> {
-    let url = telegram_method_url(token, "editGeneralForumTopic");
     let chat_id = chat_id.to_string();
     let payload = TelegramEditGeneralForumTopicParams {
         chat_id: chat_id.as_str(),
         name,
     };
-    let response = client.post(url).form(&payload).send().map_err(|err| {
-        anyhow::anyhow!(
-            "Telegram editGeneralForumTopic request failed: {}",
-            err.without_url()
-        )
-    })?;
-    let response = response
-        .json::<TelegramResponse<serde_json::Value>>()
-        .map_err(|err| {
-            anyhow::anyhow!(
-                "decode Telegram editGeneralForumTopic response failed: {}",
-                err.without_url()
-            )
-        })?;
+    let response =
+        post_form::<serde_json::Value, _>(client, token, "editGeneralForumTopic", &payload)?;
     if !response.ok {
         if response
             .description
@@ -541,9 +647,7 @@ pub(super) fn edit_general_forum_topic(
         }
         anyhow::bail!(
             "Telegram editGeneralForumTopic failed: {}",
-            response
-                .description
-                .unwrap_or_else(|| "unknown error".to_string())
+            response.description_or_unknown()
         );
     }
     Ok(())
@@ -555,25 +659,12 @@ struct TelegramGeneralForumTopicParams<'a> {
 }
 
 pub(super) fn unhide_general_forum_topic(client: &Client, token: &str, chat_id: i64) -> Result<()> {
-    let url = telegram_method_url(token, "unhideGeneralForumTopic");
     let chat_id = chat_id.to_string();
     let payload = TelegramGeneralForumTopicParams {
         chat_id: chat_id.as_str(),
     };
-    let response = client.post(url).form(&payload).send().map_err(|err| {
-        anyhow::anyhow!(
-            "Telegram unhideGeneralForumTopic request failed: {}",
-            err.without_url()
-        )
-    })?;
-    let response = response
-        .json::<TelegramResponse<serde_json::Value>>()
-        .map_err(|err| {
-            anyhow::anyhow!(
-                "decode Telegram unhideGeneralForumTopic response failed: {}",
-                err.without_url()
-            )
-        })?;
+    let response =
+        post_form::<serde_json::Value, _>(client, token, "unhideGeneralForumTopic", &payload)?;
     if !response.ok {
         if response
             .description
@@ -584,9 +675,7 @@ pub(super) fn unhide_general_forum_topic(client: &Client, token: &str, chat_id: 
         }
         anyhow::bail!(
             "Telegram unhideGeneralForumTopic failed: {}",
-            response
-                .description
-                .unwrap_or_else(|| "unknown error".to_string())
+            response.description_or_unknown()
         );
     }
     Ok(())
@@ -619,7 +708,6 @@ pub(super) fn send_chat_action(
     chat_id: i64,
     message_thread_id: Option<i64>,
 ) -> Result<()> {
-    let url = telegram_method_url(token, "sendChatAction");
     let chat_id = chat_id.to_string();
     let message_thread_id = message_thread_id.map(|thread_id| thread_id.to_string());
     let payload = TelegramSendChatAction {
@@ -627,26 +715,12 @@ pub(super) fn send_chat_action(
         action: "typing",
         message_thread_id,
     };
-    let response = client.post(url).form(&payload).send().map_err(|err| {
-        anyhow::anyhow!(
-            "Telegram sendChatAction request failed: {}",
-            err.without_url()
-        )
-    })?;
-    let response = response
-        .json::<TelegramResponse<serde_json::Value>>()
-        .map_err(|err| {
-            anyhow::anyhow!(
-                "decode Telegram sendChatAction response failed: {}",
-                err.without_url()
-            )
-        })?;
+    let response =
+        post_form_best_effort::<serde_json::Value, _>(client, token, "sendChatAction", &payload)?;
     if !response.ok {
         anyhow::bail!(
             "Telegram sendChatAction failed: {}",
-            response
-                .description
-                .unwrap_or_else(|| "unknown error".to_string())
+            response.description_or_unknown()
         );
     }
     Ok(())
@@ -673,7 +747,6 @@ pub(super) fn set_message_reaction(
     message_id: i64,
     emoji: &str,
 ) -> Result<()> {
-    let url = telegram_method_url(token, "setMessageReaction");
     let chat_id = chat_id.to_string();
     let message_id = message_id.to_string();
     let reaction = serde_json::to_string(&[TelegramReaction {
@@ -686,26 +759,16 @@ pub(super) fn set_message_reaction(
         message_id: message_id.as_str(),
         reaction: reaction.as_str(),
     };
-    let response = client.post(url).form(&payload).send().map_err(|err| {
-        anyhow::anyhow!(
-            "Telegram setMessageReaction request failed: {}",
-            err.without_url()
-        )
-    })?;
-    let response = response
-        .json::<TelegramResponse<serde_json::Value>>()
-        .map_err(|err| {
-            anyhow::anyhow!(
-                "decode Telegram setMessageReaction response failed: {}",
-                err.without_url()
-            )
-        })?;
+    let response = post_form_best_effort::<serde_json::Value, _>(
+        client,
+        token,
+        "setMessageReaction",
+        &payload,
+    )?;
     if !response.ok {
         anyhow::bail!(
             "Telegram setMessageReaction failed: {}",
-            response
-                .description
-                .unwrap_or_else(|| "unknown error".to_string())
+            response.description_or_unknown()
         );
     }
     Ok(())
@@ -724,63 +787,33 @@ pub(super) fn answer_callback_query(
     callback_query_id: &str,
     text: Option<&str>,
 ) -> Result<()> {
-    let url = telegram_method_url(token, "answerCallbackQuery");
     let payload = TelegramAnswerCallbackQuery {
         callback_query_id,
         text,
     };
-    let response = client.post(url).form(&payload).send().map_err(|err| {
-        anyhow::anyhow!(
-            "Telegram answerCallbackQuery request failed: {}",
-            err.without_url()
-        )
-    })?;
-    let response = response
-        .json::<TelegramResponse<serde_json::Value>>()
-        .map_err(|err| {
-            anyhow::anyhow!(
-                "decode Telegram answerCallbackQuery response failed: {}",
-                err.without_url()
-            )
-        })?;
+    let response = post_form_best_effort::<serde_json::Value, _>(
+        client,
+        token,
+        "answerCallbackQuery",
+        &payload,
+    )?;
     if !response.ok {
         anyhow::bail!(
             "Telegram answerCallbackQuery failed: {}",
-            response
-                .description
-                .unwrap_or_else(|| "unknown error".to_string())
+            response.description_or_unknown()
         );
     }
     Ok(())
 }
 
 pub(super) fn sync_bot_commands(client: &Client, token: &str) -> Result<()> {
-    let url = telegram_method_url(token, "setMyCommands");
     let commands = serde_json::to_string(bot_commands()).context("serialize bot commands")?;
-    let response = client
-        .post(url)
-        .form(&[("commands", commands.as_str())])
-        .send()
-        .map_err(|err| {
-            anyhow::anyhow!(
-                "Telegram setMyCommands request failed: {}",
-                err.without_url()
-            )
-        })?;
-    let response = response
-        .json::<TelegramResponse<serde_json::Value>>()
-        .map_err(|err| {
-            anyhow::anyhow!(
-                "decode Telegram setMyCommands response failed: {}",
-                err.without_url()
-            )
-        })?;
+    let payload = [("commands", commands.as_str())];
+    let response = post_form::<serde_json::Value, _>(client, token, "setMyCommands", &payload)?;
     if !response.ok {
         anyhow::bail!(
             "Telegram setMyCommands failed: {}",
-            response
-                .description
-                .unwrap_or_else(|| "unknown error".to_string())
+            response.description_or_unknown()
         );
     }
     Ok(())

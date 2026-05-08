@@ -2337,7 +2337,7 @@ fn run_codex_turn(
     }
     Ok(CodexTurnOutput {
         assistant_text: turn.assistant_text,
-        streamed_to_telegram: sink.is_some_and(|sink| sink.sent_any()),
+        streamed_to_telegram: sink.is_some_and(|sink| sink.assistant_sent_any()),
     })
 }
 

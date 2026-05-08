@@ -330,7 +330,7 @@ impl<'a> TelegramWatchSink<'a> {
                     if !self.best_effort_delivery {
                         return Err(err);
                     }
-                    self.agent.last_sent_chars = self.agent.text.chars().count();
+                    self.agent.mark_delivery_attempted();
                     log_watch_delivery_failure(&self.agent.route, "agent message", err);
                 }
                 if !had_agent && self.agent.message_id.is_some() {
@@ -533,6 +533,10 @@ impl<'a> TelegramWatchSink<'a> {
             || self.activity.sent_any()
     }
 
+    pub(super) fn assistant_sent_any(&self) -> bool {
+        self.agent.sent_any()
+    }
+
     pub(super) fn activity_state(&self) -> Option<TelegramActivityState> {
         self.activity.to_state()
     }
@@ -664,8 +668,8 @@ struct TelegramDeltaSink<'a> {
 }
 
 impl<'a> TelegramDeltaSink<'a> {
-    const MIN_EDIT_INTERVAL: Duration = Duration::from_millis(900);
-    const MIN_DELTA_CHARS: usize = 240;
+    const MIN_EDIT_INTERVAL: Duration = Duration::from_secs(3);
+    const MIN_DELTA_CHARS: usize = 600;
 
     fn new(notifier: &'a TelegramNotifier<'a>, route: TelegramRoute) -> Self {
         Self {
@@ -698,6 +702,10 @@ impl<'a> TelegramDeltaSink<'a> {
 
     fn sent_any(&self) -> bool {
         self.sent_any
+    }
+
+    fn mark_delivery_attempted(&mut self) {
+        self.last_flush = Instant::now();
     }
 
     fn flush(&mut self, final_flush: bool) -> Result<()> {

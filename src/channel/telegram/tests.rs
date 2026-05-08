@@ -1586,6 +1586,7 @@ fn watch_sink_does_not_move_persisted_status_without_new_tail_content() {
     let sink = TelegramWatchSink::new_best_effort(&notifier, route, None, None, status.to_state());
 
     assert!(!sink.status_needs_tail);
+    assert!(!sink.assistant_sent_any());
 }
 
 #[test]

@@ -39,7 +39,7 @@ pub(super) struct TelegramStatusPanel {
 }
 
 impl TelegramStatusPanel {
-    const MIN_EDIT_INTERVAL: Duration = Duration::from_secs(1);
+    const MIN_EDIT_INTERVAL: Duration = Duration::from_secs(15);
 
     fn new() -> Self {
         Self {
@@ -244,8 +244,8 @@ pub(super) struct TelegramThinkingPanel {
 }
 
 impl TelegramThinkingPanel {
-    const MIN_EDIT_INTERVAL: Duration = Duration::from_millis(900);
-    const MIN_DELTA_CHARS: usize = 160;
+    const MIN_EDIT_INTERVAL: Duration = Duration::from_secs(4);
+    const MIN_DELTA_CHARS: usize = 500;
 
     pub(super) fn new() -> Self {
         Self {
@@ -462,7 +462,7 @@ pub(super) struct TelegramActivityPanel {
 
 impl TelegramActivityPanel {
     const MAX_ITEMS: usize = 8;
-    const MIN_EDIT_INTERVAL: Duration = Duration::from_secs(2);
+    const MIN_EDIT_INTERVAL: Duration = Duration::from_secs(5);
 
     pub(super) fn new() -> Self {
         Self {

@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::path::Path;
 use std::path::PathBuf;
@@ -536,11 +537,28 @@ pub(crate) fn resolve_codex_bin(override_path: Option<&Path>) -> Result<PathBuf>
             }
         }
     }
+    if let Some(path) = find_executable_on_path(Path::new("codex")) {
+        return Ok(path);
+    }
     let fallback = paths::home_dir()?.join(".local/share/mise/installs/codex/0.125.0/codex");
     if fallback.exists() {
         return Ok(fallback);
     }
     Ok(PathBuf::from("codex"))
+}
+
+pub(crate) fn find_executable_on_path(command: &Path) -> Option<PathBuf> {
+    find_executable_on_path_with_env(command, std::env::var_os("PATH").as_deref())
+}
+
+fn find_executable_on_path_with_env(command: &Path, path_env: Option<&OsStr>) -> Option<PathBuf> {
+    if command.components().count() != 1 {
+        return None;
+    }
+    let path_env = path_env?;
+    std::env::split_paths(path_env)
+        .map(|dir| dir.join(command))
+        .find(|candidate| candidate.is_file())
 }
 
 fn first_forwarded_non_option(args: &[OsString]) -> Option<String> {
@@ -960,5 +978,26 @@ mod tests {
             Some("ws://127.0.0.1:17654")
         );
         assert_eq!(remote_resume_thread_id(&args), Some("thread-1"));
+    }
+
+    #[test]
+    fn find_executable_on_path_uses_absolute_path_entries() {
+        let root = std::env::temp_dir().join(format!("cx-path-test-{}", std::process::id()));
+        let bin = root.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let executable = bin.join("codex");
+        std::fs::write(&executable, "").unwrap();
+        let path_env = std::env::join_paths([bin]).unwrap();
+
+        assert_eq!(
+            find_executable_on_path_with_env(Path::new("codex"), Some(path_env.as_os_str())),
+            Some(executable)
+        );
+        assert_eq!(
+            find_executable_on_path_with_env(Path::new("bin/codex"), Some(path_env.as_os_str())),
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

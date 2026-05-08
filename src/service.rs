@@ -166,6 +166,7 @@ pub fn start(args: ServiceStartArgs) -> Result<()> {
     fs::create_dir_all(paths.service_dir())
         .with_context(|| format!("create {}", paths.service_dir().display()))?;
     validate_spec(&args.spec)?;
+    let run_spec = service_runtime_spec(&args.spec)?;
 
     let state_file = paths.service_state_file();
     if let Some(state) = read_state_if_exists(&state_file)? {
@@ -192,7 +193,7 @@ pub fn start(args: ServiceStartArgs) -> Result<()> {
     let exe = std::env::current_exe().context("resolve current cx executable")?;
     let mut command = Command::new(exe);
     command.arg("service").arg("run");
-    append_spec_args(&mut command, &args.spec);
+    append_spec_args(&mut command, &run_spec);
     detach_background_command(&mut command);
     command
         .stdin(Stdio::null())
@@ -442,6 +443,7 @@ pub fn install(args: ServiceInstallArgs) -> Result<()> {
     fs::create_dir_all(paths.service_dir())
         .with_context(|| format!("create {}", paths.service_dir().display()))?;
     validate_spec(&args.spec)?;
+    let run_spec = service_runtime_spec(&args.spec)?;
     let plist = paths.service_launchd_plist_file()?;
     if let Some(parent) = plist.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
@@ -452,7 +454,7 @@ pub fn install(args: ServiceInstallArgs) -> Result<()> {
         String::from("service"),
         String::from("run"),
     ];
-    append_spec_argv(&mut argv, &args.spec);
+    append_spec_argv(&mut argv, &run_spec);
     let content = launchd_plist(&argv, &paths.service_log_file(), &paths.service_log_file());
     fs::write(&plist, content).with_context(|| format!("write {}", plist.display()))?;
     println!("installed launchd service: {}", plist.display());
@@ -482,6 +484,32 @@ fn validate_spec(spec: &ServiceSpecArgs) -> Result<()> {
         return Ok(());
     }
     Ok(())
+}
+
+fn service_runtime_spec(spec: &ServiceSpecArgs) -> Result<ServiceSpecArgs> {
+    let mut run_spec = spec.clone();
+    let codex_bin = run::resolve_codex_bin(spec.codex_bin.as_deref())?;
+    run_spec.codex_bin = Some(resolve_launchable_command_path(&codex_bin)?);
+    Ok(run_spec)
+}
+
+fn resolve_launchable_command_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    if let Some(found) = run::find_executable_on_path(path) {
+        return Ok(found);
+    }
+    let candidate = std::env::current_dir()
+        .context("resolve current directory for codex path")?
+        .join(path);
+    if candidate.is_file() {
+        return Ok(candidate);
+    }
+    anyhow::bail!(
+        "unable to resolve codex executable {}; pass --codex-bin /absolute/path",
+        path.display()
+    );
 }
 
 impl AppServerSupervisor {
@@ -1678,6 +1706,33 @@ mod tests {
 
         assert!(argv.contains(&"--allow-chat=-1003586916929".to_string()));
         assert!(!argv.contains(&"--allow-chat".to_string()));
+    }
+
+    #[test]
+    fn service_argv_includes_resolved_codex_bin_for_supervised_runs() {
+        let spec = ServiceSpecArgs {
+            manager_dir: None,
+            codex_bin: Some(PathBuf::from("/opt/homebrew/bin/codex")),
+            slot: None,
+            target: None,
+            listen: "ws://127.0.0.1:0".to_string(),
+            no_telegram: false,
+            telegram_bot_token_env: "TELEGRAM_BOT_TOKEN".to_string(),
+            allow_chats: Vec::new(),
+            acquire_lease: false,
+            steal: false,
+            log_updates: false,
+            app_server_timeout: 600.0,
+        };
+        let run_spec = service_runtime_spec(&spec).unwrap();
+        let mut argv = Vec::new();
+
+        append_spec_argv(&mut argv, &run_spec);
+
+        let codex_bin = argv
+            .windows(2)
+            .find_map(|window| (window[0] == "--codex-bin").then(|| window[1].clone()));
+        assert_eq!(codex_bin, Some(String::from("/opt/homebrew/bin/codex")));
     }
 
     #[test]

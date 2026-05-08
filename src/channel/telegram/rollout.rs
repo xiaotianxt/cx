@@ -3,6 +3,7 @@
 //! This module translates local Codex transcript/proxy records into the stream
 //! events consumed by Telegram watch delivery.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::BufRead;
 use std::io::BufReader;
@@ -47,6 +48,76 @@ pub(super) struct ActiveRolloutTurn {
     pub(super) path: PathBuf,
     pub(super) turn_id: String,
     pub(super) offset: u64,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct RolloutOpenFiles {
+    holders_by_path: BTreeMap<PathBuf, u32>,
+    listen_urls_by_pid: BTreeMap<u32, Vec<String>>,
+    active_turn_by_url_thread: BTreeMap<(String, String), bool>,
+}
+
+impl RolloutOpenFiles {
+    pub(super) fn snapshot() -> Self {
+        Self {
+            holders_by_path: open_rollout_holders(),
+            listen_urls_by_pid: BTreeMap::new(),
+            active_turn_by_url_thread: BTreeMap::new(),
+        }
+    }
+
+    pub(super) fn active_rollout_turn_for_path(
+        &mut self,
+        path: &Path,
+        thread_id: &str,
+    ) -> Result<Option<ActiveRolloutTurn>> {
+        let Some(pid) = self.pid_holding_path(path) else {
+            return Ok(None);
+        };
+        let Some((turn_id, offset)) = latest_active_rollout_turn(path)? else {
+            return Ok(None);
+        };
+        if !self.holder_is_watchable(pid, thread_id) {
+            return Ok(None);
+        }
+        Ok(Some(ActiveRolloutTurn {
+            path: path.to_path_buf(),
+            turn_id,
+            offset,
+        }))
+    }
+
+    pub(super) fn rollout_file_is_open_path(&mut self, path: &Path, thread_id: &str) -> bool {
+        let Some(pid) = self.pid_holding_path(path) else {
+            return false;
+        };
+        self.holder_is_watchable(pid, thread_id)
+    }
+
+    fn pid_holding_path(&self, path: &Path) -> Option<u32> {
+        self.holders_by_path.get(&rollout_path_key(path)).copied()
+    }
+
+    fn holder_is_watchable(&mut self, pid: u32, thread_id: &str) -> bool {
+        let urls = self
+            .listen_urls_by_pid
+            .entry(pid)
+            .or_insert_with(|| pid_listening_urls(pid))
+            .clone();
+        if urls.is_empty() {
+            return true;
+        }
+        urls.into_iter().any(|url| {
+            let key = (url.clone(), thread_id.to_string());
+            if let Some(active) = self.active_turn_by_url_thread.get(&key) {
+                return *active;
+            }
+            let active = app_server_has_active_turn(&url, thread_id, ROLLOUT_OWNER_PROBE_TIMEOUT)
+                .unwrap_or(false);
+            self.active_turn_by_url_thread.insert(key, active);
+            active
+        })
+    }
 }
 
 #[cfg(test)]
@@ -114,6 +185,7 @@ pub(super) fn active_rollout_turn(
     active_rollout_turn_for_path(&path, thread_id)
 }
 
+#[cfg(test)]
 pub(super) fn active_rollout_turn_for_path(
     path: &Path,
     thread_id: &str,
@@ -1470,13 +1542,7 @@ pub(super) fn rollout_path_for_thread(paths: &ManagerPaths, thread_id: &str) -> 
     rollout_thread_info(paths, thread_id).map(|info| info.path)
 }
 
-pub(super) fn rollout_file_is_open_path(path: &Path, thread_id: &str) -> bool {
-    let Some(pid) = pid_holding_file(path) else {
-        return false;
-    };
-    rollout_holder_is_watchable(pid, thread_id)
-}
-
+#[cfg(test)]
 fn rollout_holder_is_watchable(pid: u32, thread_id: &str) -> bool {
     let urls = pid_listening_urls(pid);
     if urls.is_empty() {
@@ -1493,6 +1559,7 @@ fn app_server_has_active_turn(url: &str, thread_id: &str, timeout: Duration) -> 
     Ok(client.active_turn_id(thread_id)?.is_some())
 }
 
+#[cfg(test)]
 pub(super) fn pid_holding_file(path: &Path) -> Option<u32> {
     let output = std::process::Command::new("lsof")
         .args(["-nP", "-Fp", "--"])
@@ -1506,6 +1573,43 @@ pub(super) fn pid_holding_file(path: &Path) -> Option<u32> {
     let text = String::from_utf8_lossy(&output.stdout);
     text.lines()
         .find_map(|line| line.strip_prefix('p')?.parse::<u32>().ok())
+}
+
+fn open_rollout_holders() -> BTreeMap<PathBuf, u32> {
+    let output = std::process::Command::new("lsof")
+        .args(["-nP", "-Fpn"])
+        .stdin(std::process::Stdio::null())
+        .output();
+    let Ok(output) = output else {
+        return BTreeMap::new();
+    };
+    if !output.status.success() {
+        return BTreeMap::new();
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut holders = BTreeMap::<PathBuf, u32>::new();
+    let mut current_pid = None::<u32>;
+    for line in text.lines() {
+        if let Some(pid) = line.strip_prefix('p').and_then(|pid| pid.parse().ok()) {
+            current_pid = Some(pid);
+            continue;
+        }
+        let Some(path) = line.strip_prefix('n') else {
+            continue;
+        };
+        if !(path.contains("/rollout-") && path.ends_with(".jsonl")) {
+            continue;
+        }
+        let Some(pid) = current_pid else {
+            continue;
+        };
+        holders.insert(rollout_path_key(Path::new(path)), pid);
+    }
+    holders
+}
+
+fn rollout_path_key(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 pub(super) fn pid_listening_urls(pid: u32) -> Vec<String> {

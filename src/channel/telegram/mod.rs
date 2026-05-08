@@ -100,7 +100,6 @@ use self::delivery::TelegramNotifier;
 use self::delivery::TelegramReply;
 #[cfg(test)]
 use self::rollout::active_rollout_turn;
-use self::rollout::active_rollout_turn_for_path;
 #[cfg(test)]
 use self::rollout::apply_rollout_task_event;
 use self::rollout::codex_state_db_paths;
@@ -119,7 +118,6 @@ use self::rollout::proxy_log_approval_observe_event;
 #[cfg(test)]
 use self::rollout::proxy_log_observe_event;
 use self::rollout::rollout_events_since;
-use self::rollout::rollout_file_is_open_path;
 #[cfg(test)]
 use self::rollout::rollout_history_item;
 use self::rollout::rollout_history_text;
@@ -135,6 +133,7 @@ use self::rollout::ObserveTerminal;
 #[cfg(test)]
 use self::rollout::ObservedRolloutTerminal;
 use self::rollout::RolloutObserveEvent;
+use self::rollout::RolloutOpenFiles;
 #[cfg(test)]
 use self::rollout::RolloutTaskEvent;
 use self::state::read_state;
@@ -1857,11 +1856,16 @@ fn local_state_portal_candidates(
     limit: u64,
 ) -> Result<Vec<PortalEntryCandidate>> {
     let mut candidates = Vec::new();
+    let mut open_rollouts = RolloutOpenFiles::snapshot();
     for db_path in codex_state_db_paths(paths) {
         if !db_path.exists() {
             continue;
         }
-        candidates.extend(local_state_portal_candidates_from_db(&db_path, limit)?);
+        candidates.extend(local_state_portal_candidates_from_db(
+            &db_path,
+            limit,
+            &mut open_rollouts,
+        )?);
     }
     Ok(candidates)
 }
@@ -1869,6 +1873,7 @@ fn local_state_portal_candidates(
 fn local_state_portal_candidates_from_db(
     db_path: &Path,
     limit: u64,
+    open_rollouts: &mut RolloutOpenFiles,
 ) -> Result<Vec<PortalEntryCandidate>> {
     let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("open {}", db_path.display()))?;
@@ -1903,7 +1908,8 @@ fn local_state_portal_candidates_from_db(
     let mut candidates = Vec::new();
     for row in rows {
         let (thread_id, title, preview, cwd, archived, rollout_path, updated_at_unix) = row?;
-        let active = active_rollout_turn_for_path(&rollout_path, &thread_id)
+        let active = open_rollouts
+            .active_rollout_turn_for_path(&rollout_path, &thread_id)
             .ok()
             .flatten()
             .is_some();
@@ -1912,7 +1918,7 @@ fn local_state_portal_candidates_from_db(
         }
         let status = if active {
             "active-tui"
-        } else if rollout_file_is_open_path(&rollout_path, &thread_id) {
+        } else if open_rollouts.rollout_file_is_open_path(&rollout_path, &thread_id) {
             "open-tui"
         } else {
             "notLoaded"

@@ -88,6 +88,7 @@ fn telegram_state_round_trips_without_token() {
         watch_activity: None,
         watch_thinking: None,
         watch_status: None,
+        watch_pending_approvals: Vec::new(),
     });
 
     write_state(&paths, &state).unwrap();
@@ -239,6 +240,7 @@ fn existing_binding_is_trusted_without_allow_chat() {
         watch_activity: None,
         watch_thinking: None,
         watch_status: None,
+        watch_pending_approvals: Vec::new(),
     });
     let trusted = trusted_chats(&state, Vec::new());
 
@@ -271,6 +273,7 @@ fn chat_level_binding_trusts_forum_topic_routes() {
         watch_activity: None,
         watch_thinking: None,
         watch_status: None,
+        watch_pending_approvals: Vec::new(),
     });
     let trusted = trusted_chats(&state, Vec::new());
     let message = text_message(-10042, Some(99), "/new build");
@@ -1645,7 +1648,7 @@ fn rollout_observe_event_reads_agent_and_terminal_messages() {
         rollout_observe_event(
             r#"{"type":"event_msg","payload":{"type":"agent_message","message":"hello","phase":"commentary"}}"#,
         ),
-        Some(RolloutObserveEvent::Stream(AppStreamEvent::ReasoningDelta(
+        Some(RolloutObserveEvent::Stream(AppStreamEvent::AgentDelta(
             "hello".to_string()
         )))
     );
@@ -1667,6 +1670,20 @@ fn rollout_observe_event_reads_agent_and_terminal_messages() {
             duration_ms: Some(2500),
             last_agent_message: Some("done".to_string()),
         })
+    );
+}
+
+#[test]
+fn rollout_observe_event_reads_assistant_response_items_as_visible_messages() {
+    let event = rollout_observe_event(
+        r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"opening note"}],"phase":"commentary"}}"#,
+    );
+
+    assert_eq!(
+        event,
+        Some(RolloutObserveEvent::Stream(AppStreamEvent::AgentDelta(
+            "opening note".to_string()
+        )))
     );
 }
 
@@ -1923,6 +1940,27 @@ fn proxy_log_observe_event_reads_client_user_message() {
             "please inspect this".to_string()
         )))
     );
+}
+
+#[test]
+fn proxy_log_approval_observe_event_renders_tui_decision_history() {
+    let mut pending = Vec::<TelegramPendingApproval>::new();
+    let request = r#"{"timestampUnixMs":1,"connectionId":3,"direction":"server_to_client","method":"item/commandExecution/requestApproval","threadId":"thread-1","turnId":"turn-1","message":{"id":"approval-1","method":"item/commandExecution/requestApproval","params":{"threadId":"thread-1","turnId":"turn-1","command":["/bin/zsh","-lc","git mv src/channel/telegram.rs src/channel/telegram/mod.rs"]}}}"#;
+    let response = r#"{"timestampUnixMs":2,"connectionId":3,"direction":"client_to_server","method":null,"threadId":null,"turnId":null,"message":{"id":"approval-1","result":{"decision":"cancel"}}}"#;
+
+    assert_eq!(
+        proxy_log_approval_observe_event(request, "thread-1", &mut pending),
+        None
+    );
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        proxy_log_approval_observe_event(response, "thread-1", &mut pending),
+        Some(RolloutObserveEvent::Stream(AppStreamEvent::Info(
+            "✗ You canceled the request to run git mv src/channel/telegram.rs src/channel/telegram/mod.rs"
+                .to_string()
+        )))
+    );
+    assert!(pending.is_empty());
 }
 
 #[test]
@@ -2238,6 +2276,12 @@ fn approval_callback_data_round_trips() {
         Some(TelegramApprovalDecision::AcceptForSession)
     );
     assert_eq!(parse_approval_callback_data(&data, "other"), None);
+
+    let cancel = approval_callback_data(nonce, TelegramApprovalDecision::Cancel);
+    assert_eq!(
+        parse_approval_callback_data(&cancel, nonce),
+        Some(TelegramApprovalDecision::Cancel)
+    );
 }
 
 #[test]
@@ -2260,6 +2304,9 @@ fn approval_response_maps_command_and_permissions_requests() {
             "decision": "acceptForSession"
         })
     );
+    let cancel_result =
+        approval_response_result(&command, TelegramApprovalDecision::Cancel).unwrap();
+    assert_eq!(cancel_result["decision"], json!("cancel"));
 
     let permissions = ApprovalRequest {
         id: json!("request-1"),

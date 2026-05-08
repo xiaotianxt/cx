@@ -6,6 +6,8 @@ use std::io::Write;
 use std::net::TcpListener;
 use std::net::TcpStream;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread;
@@ -33,6 +35,7 @@ pub(crate) struct AppServerProxy {
 #[serde(rename_all = "camelCase")]
 struct ProxyEventRecord<'a> {
     timestamp_unix_ms: u128,
+    connection_id: u64,
     direction: &'static str,
     method: Option<&'a str>,
     thread_id: Option<String>,
@@ -71,6 +74,7 @@ impl AppServerProxy {
                 )
             })?;
         let event_log = Arc::new(Mutex::new(event_log));
+        let next_connection_id = Arc::new(AtomicU64::new(1));
 
         Ok(thread::spawn(move || {
             for accepted in listener.incoming() {
@@ -79,8 +83,11 @@ impl AppServerProxy {
                 };
                 let upstream = upstream.clone();
                 let event_log = Arc::clone(&event_log);
+                let connection_id = next_connection_id.fetch_add(1, Ordering::Relaxed);
                 thread::spawn(move || {
-                    if let Err(err) = handle_connection(client, &upstream, &event_log) {
+                    if let Err(err) =
+                        handle_connection(client, &upstream, &event_log, connection_id)
+                    {
                         eprintln!("app-server proxy connection failed: {err:#}");
                     }
                 });
@@ -93,6 +100,7 @@ fn handle_connection(
     mut client: TcpStream,
     upstream_url: &LoopbackWsUrl,
     event_log: &Arc<Mutex<fs::File>>,
+    connection_id: u64,
 ) -> Result<()> {
     let request = read_http_head(&mut client).context("read app-server proxy request")?;
     let request_text = String::from_utf8_lossy(&request);
@@ -132,12 +140,14 @@ fn handle_connection(
     let client_reader = client.try_clone().context("clone client reader")?;
     let upstream_writer = upstream.try_clone().context("clone upstream writer")?;
     let client_to_upstream = thread::spawn(move || {
-        if let Err(err) = proxy_client_to_upstream(client_reader, upstream_writer, &client_log) {
+        if let Err(err) =
+            proxy_client_to_upstream(client_reader, upstream_writer, &client_log, connection_id)
+        {
             eprintln!("app-server proxy client stream failed: {err:#}");
         }
     });
 
-    let result = proxy_upstream_to_client(upstream, client, event_log);
+    let result = proxy_upstream_to_client(upstream, client, event_log, connection_id);
     let _ = client_to_upstream.join();
     result
 }
@@ -146,6 +156,7 @@ fn proxy_client_to_upstream(
     mut client: TcpStream,
     mut upstream: TcpStream,
     event_log: &Arc<Mutex<fs::File>>,
+    connection_id: u64,
 ) -> Result<()> {
     loop {
         let Some(frame) = read_frame(&mut client).context("read client websocket frame")? else {
@@ -153,7 +164,7 @@ fn proxy_client_to_upstream(
         };
         if frame.opcode() == 0x1 && frame.fin() {
             if let Ok(text) = String::from_utf8(frame.payload.clone()) {
-                record_ws_text(event_log, "client_to_server", &text);
+                record_ws_text(event_log, connection_id, "client_to_server", &text);
             }
         }
         write_frame_raw(&mut upstream, &frame).context("write upstream websocket frame")?;
@@ -167,6 +178,7 @@ fn proxy_upstream_to_client(
     mut upstream: TcpStream,
     mut client: TcpStream,
     event_log: &Arc<Mutex<fs::File>>,
+    connection_id: u64,
 ) -> Result<()> {
     loop {
         let Some(frame) = read_frame(&mut upstream).context("read upstream websocket frame")?
@@ -175,7 +187,7 @@ fn proxy_upstream_to_client(
         };
         if frame.opcode() == 0x1 && frame.fin() {
             if let Ok(text) = String::from_utf8(frame.payload.clone()) {
-                record_ws_text(event_log, "server_to_client", &text);
+                record_ws_text(event_log, connection_id, "server_to_client", &text);
             }
         }
         write_frame_raw(&mut client, &frame).context("write client websocket frame")?;
@@ -304,7 +316,12 @@ impl Frame {
     }
 }
 
-fn record_ws_text(event_log: &Arc<Mutex<fs::File>>, direction: &'static str, text: &str) {
+fn record_ws_text(
+    event_log: &Arc<Mutex<fs::File>>,
+    connection_id: u64,
+    direction: &'static str,
+    text: &str,
+) {
     let Ok(value) = serde_json::from_str::<Value>(text) else {
         return;
     };
@@ -315,6 +332,7 @@ fn record_ws_text(event_log: &Arc<Mutex<fs::File>>, direction: &'static str, tex
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_millis())
             .unwrap_or_default(),
+        connection_id,
         direction,
         method,
         thread_id: params.and_then(extract_thread_id),

@@ -115,6 +115,8 @@ use self::rollout::pid_holding_file;
 use self::rollout::pid_listening_urls;
 use self::rollout::proxy_events_since;
 #[cfg(test)]
+use self::rollout::proxy_log_approval_observe_event;
+#[cfg(test)]
 use self::rollout::proxy_log_observe_event;
 use self::rollout::rollout_events_since;
 use self::rollout::rollout_file_is_open_path;
@@ -138,6 +140,8 @@ use self::rollout::RolloutTaskEvent;
 use self::state::read_state;
 use self::state::write_state;
 use self::state::TelegramBinding;
+#[cfg(test)]
+use self::state::TelegramPendingApproval;
 use self::state::TelegramRoute;
 use self::state::TelegramState;
 use self::state::TelegramWatchSource;
@@ -573,8 +577,15 @@ fn drain_watched_proxy_binding(
         .watch_proxy_offset
         .filter(|offset| *offset <= proxy_len)
         .unwrap_or(proxy_len);
-    let proxy_drain =
-        proxy_events_since(&proxy_path, proxy_offset, WATCH_DRAIN_MAX_LINES, thread_id)?;
+    let mut pending_approvals = binding.watch_pending_approvals.clone();
+    let proxy_drain = proxy_events_since(
+        &proxy_path,
+        proxy_offset,
+        WATCH_DRAIN_MAX_LINES,
+        thread_id,
+        &mut pending_approvals,
+        true,
+    )?;
     let send_result =
         send_watch_events_for_binding(route, notifier, proxy_drain.events, state, binding)?;
     if let Some(stored) = state.binding_for_route_mut(route, binding.alias.as_deref()) {
@@ -583,6 +594,7 @@ fn drain_watched_proxy_binding(
         stored.watch_thinking = send_result.thinking;
         stored.watch_status = send_result.status;
         stored.watch_last_agent_message = send_result.last_agent_message;
+        stored.watch_pending_approvals = pending_approvals;
     }
     Ok(())
 }
@@ -612,13 +624,38 @@ fn drain_watched_rollout_binding(
     let start_offset =
         watch_rollout_start_offset(binding.watch_rollout_offset, file_len, active_turn_offset);
     let drain = rollout_events_since(&path, start_offset, WATCH_DRAIN_MAX_LINES)?;
-    let send_result = send_watch_events_for_binding(route, notifier, drain.events, state, binding)?;
+    let mut events = drain.events;
+    let mut pending_approvals = binding.watch_pending_approvals.clone();
+    let mut next_proxy_offset = binding.watch_proxy_offset;
+    let proxy_path = proxy_event_log_path(paths);
+    if proxy_path.exists() {
+        let proxy_len = fs::metadata(&proxy_path)
+            .with_context(|| format!("stat proxy event log {}", proxy_path.display()))?
+            .len();
+        let proxy_offset = binding
+            .watch_proxy_offset
+            .filter(|offset| *offset <= proxy_len)
+            .unwrap_or(proxy_len);
+        let proxy_drain = proxy_events_since(
+            &proxy_path,
+            proxy_offset,
+            WATCH_DRAIN_MAX_LINES,
+            thread_id,
+            &mut pending_approvals,
+            false,
+        )?;
+        next_proxy_offset = Some(proxy_drain.next_offset);
+        events.extend(proxy_drain.events);
+    }
+    let send_result = send_watch_events_for_binding(route, notifier, events, state, binding)?;
     if let Some(stored) = state.binding_for_route_mut(route, binding.alias.as_deref()) {
         stored.watch_rollout_offset = Some(drain.next_offset);
+        stored.watch_proxy_offset = next_proxy_offset;
         stored.watch_activity = send_result.activity;
         stored.watch_thinking = send_result.thinking;
         stored.watch_status = send_result.status;
         stored.watch_last_agent_message = send_result.last_agent_message;
+        stored.watch_pending_approvals = pending_approvals;
     }
     Ok(())
 }
@@ -892,6 +929,7 @@ enum TelegramApprovalDecision {
     AcceptOnce,
     AcceptForSession,
     Decline,
+    Cancel,
 }
 
 impl TelegramApprovalDecision {
@@ -900,6 +938,7 @@ impl TelegramApprovalDecision {
             Self::AcceptOnce => "Approved once",
             Self::AcceptForSession => "Approved for session",
             Self::Decline => "Denied",
+            Self::Cancel => "Canceled",
         }
     }
 }
@@ -909,6 +948,7 @@ fn approval_callback_data(nonce: &str, decision: TelegramApprovalDecision) -> St
         TelegramApprovalDecision::AcceptOnce => "a",
         TelegramApprovalDecision::AcceptForSession => "s",
         TelegramApprovalDecision::Decline => "d",
+        TelegramApprovalDecision::Cancel => "c",
     };
     format!("cx:ap:{nonce}:{suffix}")
 }
@@ -926,6 +966,7 @@ fn parse_approval_callback_data(
         "a" => Some(TelegramApprovalDecision::AcceptOnce),
         "s" => Some(TelegramApprovalDecision::AcceptForSession),
         "d" => Some(TelegramApprovalDecision::Decline),
+        "c" => Some(TelegramApprovalDecision::Cancel),
         _ => None,
     }
 }
@@ -1587,6 +1628,7 @@ fn initialize_watch_cursor(paths: &ManagerPaths, binding: &mut TelegramBinding) 
     binding.watch_status = None;
     binding.watch_source = None;
     binding.watch_last_agent_message = None;
+    binding.watch_pending_approvals.clear();
     if binding.watch_proxy_offset.is_none() {
         if let Ok(metadata) = fs::metadata(proxy_event_log_path(paths)) {
             binding.watch_proxy_offset = Some(metadata.len());
@@ -2430,6 +2472,10 @@ fn approval_keyboard(nonce: &str) -> TelegramInlineKeyboardMarkup {
                 text: String::from("Deny"),
                 callback_data: approval_callback_data(nonce, TelegramApprovalDecision::Decline),
             }],
+            vec![TelegramInlineKeyboardButton {
+                text: String::from("Cancel turn"),
+                callback_data: approval_callback_data(nonce, TelegramApprovalDecision::Cancel),
+            }],
         ],
     }
 }
@@ -2500,7 +2546,10 @@ fn approval_response_result(
             "decision": legacy_review_decision(decision),
         })),
         "item/permissions/requestApproval" => {
-            let permissions = if decision == TelegramApprovalDecision::Decline {
+            let permissions = if matches!(
+                decision,
+                TelegramApprovalDecision::Decline | TelegramApprovalDecision::Cancel
+            ) {
                 json!({})
             } else {
                 approval
@@ -2511,7 +2560,9 @@ fn approval_response_result(
             };
             let scope = match decision {
                 TelegramApprovalDecision::AcceptForSession => "session",
-                TelegramApprovalDecision::AcceptOnce | TelegramApprovalDecision::Decline => "turn",
+                TelegramApprovalDecision::AcceptOnce
+                | TelegramApprovalDecision::Decline
+                | TelegramApprovalDecision::Cancel => "turn",
             };
             Ok(json!({
                 "permissions": permissions,
@@ -2528,6 +2579,7 @@ fn command_execution_decision(decision: TelegramApprovalDecision) -> &'static st
         TelegramApprovalDecision::AcceptOnce => "accept",
         TelegramApprovalDecision::AcceptForSession => "acceptForSession",
         TelegramApprovalDecision::Decline => "decline",
+        TelegramApprovalDecision::Cancel => "cancel",
     }
 }
 
@@ -2536,6 +2588,7 @@ fn file_change_decision(decision: TelegramApprovalDecision) -> &'static str {
         TelegramApprovalDecision::AcceptOnce => "accept",
         TelegramApprovalDecision::AcceptForSession => "acceptForSession",
         TelegramApprovalDecision::Decline => "decline",
+        TelegramApprovalDecision::Cancel => "cancel",
     }
 }
 
@@ -2544,6 +2597,7 @@ fn legacy_review_decision(decision: TelegramApprovalDecision) -> &'static str {
         TelegramApprovalDecision::AcceptOnce => "approved",
         TelegramApprovalDecision::AcceptForSession => "approved_for_session",
         TelegramApprovalDecision::Decline => "denied",
+        TelegramApprovalDecision::Cancel => "denied",
     }
 }
 

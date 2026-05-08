@@ -79,6 +79,8 @@ pub(super) struct TelegramBinding {
     pub(super) watch_thinking: Option<TelegramThinkingState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) watch_status: Option<TelegramStatusState>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) watch_pending_approvals: Vec<TelegramPendingApproval>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -86,6 +88,15 @@ pub(super) struct TelegramBinding {
 pub(super) enum TelegramWatchSource {
     Proxy,
     Rollout,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct TelegramPendingApproval {
+    #[serde(default)]
+    pub(super) connection_id: u64,
+    pub(super) request_id: String,
+    pub(super) command: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -203,6 +214,7 @@ impl TelegramState {
             watch_activity: None,
             watch_thinking: None,
             watch_status: None,
+            watch_pending_approvals: Vec::new(),
         };
         self.bindings.push(binding.clone());
         self.set_active_route(route, alias);
@@ -233,6 +245,7 @@ impl TelegramState {
             stored.watch_activity = None;
             stored.watch_thinking = None;
             stored.watch_status = None;
+            stored.watch_pending_approvals.clear();
             binding = stored.clone();
         }
         debug_assert_eq!(binding.session_id, existing_session_id);

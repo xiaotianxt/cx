@@ -32,6 +32,7 @@ use crate::app_server::CommandExecutionStatus;
 use crate::app_server::ParsedServerEvent;
 use crate::paths::ManagerPaths;
 
+use super::state::TelegramPendingApproval;
 use super::truncate_chars;
 use super::ROLLOUT_OWNER_PROBE_TIMEOUT;
 
@@ -300,6 +301,8 @@ pub(super) fn proxy_events_since(
     start_offset: u64,
     max_lines: usize,
     thread_id: &str,
+    pending_approvals: &mut Vec<TelegramPendingApproval>,
+    include_stream_events: bool,
 ) -> Result<RolloutDrain> {
     let mut file =
         fs::File::open(path).with_context(|| format!("open proxy log {}", path.display()))?;
@@ -333,16 +336,162 @@ pub(super) fn proxy_events_since(
         next_offset = reader
             .stream_position()
             .with_context(|| format!("read proxy log position {}", path.display()))?;
-        let Some(event) = proxy_log_observe_event(&line, thread_id) else {
+        if let Some(event) = proxy_log_approval_observe_event(&line, thread_id, pending_approvals) {
+            events.push(event);
             continue;
-        };
-        events.push(event);
+        }
+        if include_stream_events {
+            if let Some(event) = proxy_log_observe_event(&line, thread_id) {
+                events.push(event);
+            }
+        }
     }
 
     Ok(RolloutDrain {
         events,
         next_offset,
     })
+}
+
+pub(super) fn proxy_log_approval_observe_event(
+    line: &str,
+    thread_id: &str,
+    pending_approvals: &mut Vec<TelegramPendingApproval>,
+) -> Option<RolloutObserveEvent> {
+    let value = serde_json::from_str::<Value>(line).ok()?;
+    let connection_id = value
+        .get("connectionId")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let direction = value.get("direction").and_then(Value::as_str)?;
+    let message = value.get("message")?;
+    match direction {
+        "server_to_client" => {
+            remember_proxy_approval_request(message, connection_id, thread_id, pending_approvals);
+            None
+        }
+        "client_to_server" => {
+            proxy_approval_response_event(message, connection_id, pending_approvals)
+        }
+        _ => None,
+    }
+}
+
+fn remember_proxy_approval_request(
+    message: &Value,
+    connection_id: u64,
+    thread_id: &str,
+    pending_approvals: &mut Vec<TelegramPendingApproval>,
+) {
+    if message.get("method").and_then(Value::as_str)
+        != Some("item/commandExecution/requestApproval")
+        && message.get("method").and_then(Value::as_str) != Some("execCommandApproval")
+    {
+        return;
+    }
+    let Some(params) = message.get("params") else {
+        return;
+    };
+    if params
+        .get("threadId")
+        .or_else(|| params.get("thread_id"))
+        .and_then(Value::as_str)
+        != Some(thread_id)
+    {
+        return;
+    }
+    let Some(request_id) = message.get("id").map(proxy_request_id_key) else {
+        return;
+    };
+    let Some(command) = proxy_approval_command(params) else {
+        return;
+    };
+    pending_approvals.retain(|pending| {
+        pending.connection_id != connection_id || pending.request_id != request_id
+    });
+    pending_approvals.push(TelegramPendingApproval {
+        connection_id,
+        request_id,
+        command,
+    });
+    if pending_approvals.len() > 32 {
+        let drain_count = pending_approvals.len() - 32;
+        pending_approvals.drain(0..drain_count);
+    }
+}
+
+fn proxy_approval_response_event(
+    message: &Value,
+    connection_id: u64,
+    pending_approvals: &mut Vec<TelegramPendingApproval>,
+) -> Option<RolloutObserveEvent> {
+    let request_id = message.get("id").map(proxy_request_id_key)?;
+    let decision = proxy_approval_decision(message.get("result")?)?;
+    let pending_index = pending_approvals.iter().position(|pending| {
+        pending.connection_id == connection_id && pending.request_id == request_id
+    })?;
+    let pending = pending_approvals.remove(pending_index);
+    Some(RolloutObserveEvent::Stream(AppStreamEvent::Info(
+        proxy_approval_decision_text(decision, &pending.command),
+    )))
+}
+
+fn proxy_request_id_key(id: &Value) -> String {
+    serde_json::to_string(id).unwrap_or_else(|_| id.to_string())
+}
+
+fn proxy_approval_command(params: &Value) -> Option<String> {
+    if let Some(command) = params.get("command").and_then(Value::as_str) {
+        return Some(truncate_exec_snippet(command));
+    }
+    let command = params.get("command")?.as_array()?;
+    let command = rollout_command_string(&serde_json::json!({ "command": command }))?;
+    Some(truncate_exec_snippet(&command))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProxyApprovalDecision {
+    Accept,
+    AcceptForSession,
+    Decline,
+    Cancel,
+}
+
+fn proxy_approval_decision(result: &Value) -> Option<ProxyApprovalDecision> {
+    match result.get("decision").and_then(Value::as_str)? {
+        "accept" | "approved" => Some(ProxyApprovalDecision::Accept),
+        "acceptForSession" | "approved_for_session" => {
+            Some(ProxyApprovalDecision::AcceptForSession)
+        }
+        "decline" | "denied" => Some(ProxyApprovalDecision::Decline),
+        "cancel" => Some(ProxyApprovalDecision::Cancel),
+        _ => None,
+    }
+}
+
+fn proxy_approval_decision_text(decision: ProxyApprovalDecision, command: &str) -> String {
+    match decision {
+        ProxyApprovalDecision::Accept => {
+            format!("✔ You approved codex to run {command} this time")
+        }
+        ProxyApprovalDecision::AcceptForSession => {
+            format!("✔ You approved codex to run {command} every time this session")
+        }
+        ProxyApprovalDecision::Decline => {
+            format!("✗ You did not approve codex to run {command}")
+        }
+        ProxyApprovalDecision::Cancel => {
+            format!("✗ You canceled the request to run {command}")
+        }
+    }
+}
+
+fn truncate_exec_snippet(command: &str) -> String {
+    let first_line = command
+        .split_once('\n')
+        .map(|(first, _)| format!("{first} ..."))
+        .unwrap_or_else(|| command.to_string());
+    truncate_chars(&first_line, 80)
 }
 
 pub(super) fn proxy_log_observe_event(line: &str, thread_id: &str) -> Option<RolloutObserveEvent> {
@@ -467,13 +616,10 @@ pub(super) fn rollout_observe_event(line: &str) -> Option<RolloutObserveEvent> {
         "context_compacted" => Some(RolloutObserveEvent::Stream(AppStreamEvent::Info(
             "Context compacted".to_string(),
         ))),
-        "agent_message" => value.get("message").and_then(Value::as_str).map(|message| {
-            let event = match value.get("phase").and_then(Value::as_str) {
-                Some("commentary") => AppStreamEvent::ReasoningDelta(message.to_string()),
-                _ => AppStreamEvent::AgentDelta(message.to_string()),
-            };
-            RolloutObserveEvent::Stream(event)
-        }),
+        "agent_message" => value
+            .get("message")
+            .and_then(Value::as_str)
+            .map(visible_agent_message_event),
         "patch_apply_begin" => Some(RolloutObserveEvent::Stream(AppStreamEvent::CommandStarted(
             rollout_patch_apply_command(value, CommandExecutionStatus::InProgress)?,
         ))),
@@ -514,6 +660,14 @@ pub(super) fn rollout_observe_event(line: &str) -> Option<RolloutObserveEvent> {
 fn rollout_response_item_observe_event(value: &Value) -> Option<RolloutObserveEvent> {
     let kind = value.get("type")?.as_str()?;
     match kind {
+        "message" if value.get("role").and_then(Value::as_str) == Some("assistant") => {
+            rollout_message_text(value).map(visible_agent_message_event)
+        }
+        "message" if value.get("role").and_then(Value::as_str) == Some("user") => {
+            rollout_message_text(value).map(|text| {
+                RolloutObserveEvent::Stream(AppStreamEvent::UserMessage(text.to_string()))
+            })
+        }
         "reasoning" => rollout_reasoning_delta(value)
             .map(|text| RolloutObserveEvent::Stream(AppStreamEvent::ReasoningDelta(text))),
         "function_call" if value.get("name").and_then(Value::as_str) == Some("exec_command") => {
@@ -553,6 +707,23 @@ fn rollout_response_item_observe_event(value: &Value) -> Option<RolloutObserveEv
         }
         _ => None,
     }
+}
+
+fn visible_agent_message_event(message: &str) -> RolloutObserveEvent {
+    RolloutObserveEvent::Stream(AppStreamEvent::AgentDelta(message.to_string()))
+}
+
+fn rollout_message_text(value: &Value) -> Option<&str> {
+    if let Some(text) = value.get("text").and_then(Value::as_str) {
+        return (!text.trim().is_empty()).then_some(text);
+    }
+    value
+        .get("content")?
+        .as_array()?
+        .iter()
+        .find(|item| item.get("type").and_then(Value::as_str) == Some("output_text"))
+        .and_then(|item| item.get("text").and_then(Value::as_str))
+        .filter(|text| !text.trim().is_empty())
 }
 
 fn rollout_apply_patch_start(value: &Value) -> Option<CommandExecution> {

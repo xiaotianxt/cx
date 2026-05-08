@@ -39,7 +39,7 @@ pub(super) struct TelegramStatusPanel {
 }
 
 impl TelegramStatusPanel {
-    const MIN_EDIT_INTERVAL: Duration = Duration::from_secs(20);
+    const MIN_EDIT_INTERVAL: Duration = Duration::from_secs(1);
 
     fn new() -> Self {
         Self {
@@ -222,10 +222,10 @@ pub(super) fn status_watch_text(panel: &TelegramStatusPanel) -> String {
     if panel.active {
         format!(
             "• **Working** ({} • esc to interrupt)",
-            format_duration_ms(elapsed as i64)
+            format_elapsed_compact_ms(elapsed)
         )
     } else {
-        format!("• **Done** ({})", format_duration_ms(elapsed as i64))
+        format!("• **Done** ({})", format_elapsed_compact_ms(elapsed))
     }
 }
 
@@ -1131,6 +1131,25 @@ fn format_duration_ms(duration_ms: i64) -> String {
     }
 }
 
+fn format_elapsed_compact_ms(duration_ms: u128) -> String {
+    fmt_elapsed_compact((duration_ms / 1000).min(u128::from(u64::MAX)) as u64)
+}
+
+fn fmt_elapsed_compact(elapsed_secs: u64) -> String {
+    if elapsed_secs < 60 {
+        return format!("{elapsed_secs}s");
+    }
+    if elapsed_secs < 3600 {
+        let minutes = elapsed_secs / 60;
+        let seconds = elapsed_secs % 60;
+        return format!("{minutes}m {seconds:02}s");
+    }
+    let hours = elapsed_secs / 3600;
+    let minutes = (elapsed_secs % 3600) / 60;
+    let seconds = elapsed_secs % 60;
+    format!("{hours}h {minutes:02}m {seconds:02}s")
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
@@ -1191,6 +1210,27 @@ mod tests {
 
         assert!(!panel.active);
         assert_eq!(panel.turn_finished_at_ms, Some(3500));
+        assert_eq!(status_watch_text(&panel), "• **Done** (2s)");
+    }
+
+    #[test]
+    fn status_watch_text_formats_elapsed_like_codex_tui() {
+        assert_eq!(fmt_elapsed_compact(0), "0s");
+        assert_eq!(fmt_elapsed_compact(59), "59s");
+        assert_eq!(fmt_elapsed_compact(60), "1m 00s");
+        assert_eq!(fmt_elapsed_compact(3599), "59m 59s");
+        assert_eq!(fmt_elapsed_compact(3600), "1h 00m 00s");
+        assert_eq!(fmt_elapsed_compact(7389), "2h 03m 09s");
+
+        let mut panel = TelegramStatusPanel::new();
+        panel.active = true;
+        panel.turn_started_at_ms = Some(1000);
+        panel.turn_finished_at_ms = Some(62_000);
+
+        assert_eq!(
+            status_watch_text(&panel),
+            "• **Working** (1m 01s • esc to interrupt)"
+        );
     }
 
     #[test]

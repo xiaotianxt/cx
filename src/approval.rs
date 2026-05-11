@@ -45,6 +45,7 @@ pub(crate) struct ApprovalBroker {
 
 #[derive(Debug, Clone, PartialEq)]
 struct PendingApproval {
+    sequence: u64,
     worker_id: WorkerId,
     worker_request_id: Value,
     thread_id: Option<String>,
@@ -53,6 +54,7 @@ struct PendingApproval {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CancelledApproval {
+    pub(crate) broker_approval_id: String,
     pub(crate) worker_id: WorkerId,
     pub(crate) worker_request_id: Value,
 }
@@ -79,6 +81,7 @@ impl ApprovalBroker {
         let broker_approval_id = format!("cx_approval_{id}");
         request["id"] = Value::String(broker_approval_id.clone());
         let pending = PendingApproval {
+            sequence: id,
             worker_id: worker_id.clone(),
             worker_request_id: worker_request_id.clone(),
             thread_id: thread_id.clone(),
@@ -104,10 +107,14 @@ impl ApprovalBroker {
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("approval broker lock poisoned"))?;
-        Ok(state
+        let mut approvals = state
             .pending
             .values()
             .filter(|approval| approval.thread_id.as_deref() == Some(thread_id))
+            .collect::<Vec<_>>();
+        approvals.sort_by_key(|approval| approval.sequence);
+        Ok(approvals
+            .into_iter()
             .map(|approval| approval.request.clone())
             .collect())
     }
@@ -180,21 +187,43 @@ impl ApprovalBroker {
         Ok(())
     }
 
-    pub(crate) fn cancel_worker(&self, worker_id: &WorkerId) -> Result<usize> {
+    pub(crate) fn cancel_worker(&self, worker_id: &WorkerId) -> Result<Vec<CancelledApproval>> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("approval broker lock poisoned"))?;
-        let pending_before = state.pending.len();
-        let claimed_before = state.claimed.len();
-        state
+        let mut cancelled = Vec::new();
+        let pending_ids = state
             .pending
-            .retain(|_, approval| &approval.worker_id != worker_id);
-        state
+            .iter()
+            .filter(|(_, approval)| &approval.worker_id == worker_id)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in pending_ids {
+            if let Some(approval) = state.pending.remove(&id) {
+                cancelled.push(CancelledApproval {
+                    broker_approval_id: id,
+                    worker_id: approval.worker_id,
+                    worker_request_id: approval.worker_request_id,
+                });
+            }
+        }
+        let claimed_ids = state
             .claimed
-            .retain(|_, approval| &approval.worker_id != worker_id);
-        Ok(pending_before.saturating_sub(state.pending.len())
-            + claimed_before.saturating_sub(state.claimed.len()))
+            .iter()
+            .filter(|(_, approval)| &approval.worker_id == worker_id)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in claimed_ids {
+            if let Some(approval) = state.claimed.remove(&id) {
+                cancelled.push(CancelledApproval {
+                    broker_approval_id: id,
+                    worker_id: approval.worker_id,
+                    worker_request_id: approval.worker_request_id,
+                });
+            }
+        }
+        Ok(cancelled)
     }
 
     pub(crate) fn cancel_thread(&self, thread_id: &str) -> Result<Vec<CancelledApproval>> {
@@ -212,6 +241,7 @@ impl ApprovalBroker {
         for id in pending_ids {
             if let Some(approval) = state.pending.remove(&id) {
                 cancelled.push(CancelledApproval {
+                    broker_approval_id: id,
                     worker_id: approval.worker_id,
                     worker_request_id: approval.worker_request_id,
                 });
@@ -226,6 +256,7 @@ impl ApprovalBroker {
         for id in claimed_ids {
             if let Some(approval) = state.claimed.remove(&id) {
                 cancelled.push(CancelledApproval {
+                    broker_approval_id: id,
                     worker_id: approval.worker_id,
                     worker_request_id: approval.worker_request_id,
                 });
@@ -353,6 +384,35 @@ mod tests {
     }
 
     #[test]
+    fn pending_requests_replay_in_registration_order() {
+        let broker = ApprovalBroker::default();
+        let worker = WorkerId::new("dia4", 1);
+        for request_id in 0..12 {
+            register_approval(&broker, worker.clone(), json!(request_id), Some("thread-1"));
+        }
+
+        let ids = broker
+            .pending_requests_for_thread("thread-1")
+            .unwrap()
+            .into_iter()
+            .map(|request| {
+                request
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap()
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            ids,
+            (0..12)
+                .map(|request_id| format!("cx_approval_{request_id}"))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn cancel_removes_unrouted_approval() {
         let broker = ApprovalBroker::default();
         let record = register_approval(
@@ -386,7 +446,7 @@ mod tests {
             ApprovalResponseRoute::Forward { .. }
         ));
 
-        assert_eq!(broker.cancel_worker(&worker).unwrap(), 2);
+        assert_eq!(broker.cancel_worker(&worker).unwrap().len(), 2);
         assert_eq!(
             broker
                 .resolve_response(&pending.broker_approval_id, json!({}))

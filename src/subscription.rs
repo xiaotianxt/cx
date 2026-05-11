@@ -35,6 +35,7 @@ struct SubscriptionState {
     clients: BTreeMap<ClientId, ClientSink>,
     threads: BTreeMap<String, BTreeSet<ClientId>>,
     approval_ready: BTreeMap<String, BTreeSet<ClientId>>,
+    delivered_approvals: BTreeMap<String, BTreeMap<ClientId, BTreeSet<String>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,6 +74,9 @@ impl SubscriptionHub {
         for ready in state.approval_ready.values_mut() {
             ready.remove(&client_id);
         }
+        for delivered in state.delivered_approvals.values_mut() {
+            delivered.remove(&client_id);
+        }
         state.threads.retain(|thread_id, subscribers| {
             let keep = !subscribers.is_empty();
             if !keep {
@@ -84,6 +88,9 @@ impl SubscriptionHub {
         state
             .approval_ready
             .retain(|thread_id, ready| !ready.is_empty() && live_threads.contains(thread_id));
+        state.delivered_approvals.retain(|thread_id, delivered| {
+            !delivered.is_empty() && live_threads.contains(thread_id)
+        });
         Ok(empty_threads)
     }
 
@@ -157,6 +164,16 @@ impl SubscriptionHub {
         if remove_empty_ready {
             state.approval_ready.remove(thread_id);
         }
+        let remove_empty_delivered =
+            if let Some(delivered) = state.delivered_approvals.get_mut(thread_id) {
+                delivered.remove(&client_id);
+                delivered.is_empty()
+            } else {
+                false
+            };
+        if remove_empty_delivered {
+            state.delivered_approvals.remove(thread_id);
+        }
         if remaining == 0 {
             state.threads.remove(thread_id);
         }
@@ -209,11 +226,12 @@ impl SubscriptionHub {
     pub(crate) fn fan_out_thread_approvals(
         &self,
         thread_id: &str,
+        approval_id: &str,
         message: String,
     ) -> Result<FanOutResult> {
-        let state = self.lock()?;
+        let mut state = self.lock()?;
         let subscribers = state.threads.get(thread_id).map(BTreeSet::len).unwrap_or(0);
-        let Some(ready) = state.approval_ready.get(thread_id) else {
+        let Some(ready) = state.approval_ready.get(thread_id).cloned() else {
             return Ok(FanOutResult {
                 subscribers,
                 ready: 0,
@@ -221,15 +239,8 @@ impl SubscriptionHub {
             });
         };
         let mut sent = 0usize;
-        for client_id in ready {
-            let Some(client) = state.clients.get(client_id) else {
-                continue;
-            };
-            if client
-                .sender
-                .send(ClientOutbound::Text(message.clone()))
-                .is_ok()
-            {
+        for client_id in &ready {
+            if send_approval_to_client(&mut state, thread_id, *client_id, approval_id, &message) {
                 sent += 1;
             }
         }
@@ -240,11 +251,82 @@ impl SubscriptionHub {
         })
     }
 
+    pub(crate) fn send_thread_approval_to_client(
+        &self,
+        client_id: ClientId,
+        thread_id: &str,
+        approval_id: &str,
+        message: String,
+    ) -> Result<bool> {
+        let mut state = self.lock()?;
+        if !state
+            .threads
+            .get(thread_id)
+            .is_some_and(|subscribers| subscribers.contains(&client_id))
+        {
+            return Ok(false);
+        }
+        Ok(send_approval_to_client(
+            &mut state,
+            thread_id,
+            client_id,
+            approval_id,
+            &message,
+        ))
+    }
+
+    pub(crate) fn forget_approval(&self, approval_id: &str) -> Result<()> {
+        let mut state = self.lock()?;
+        state.delivered_approvals.retain(|_, delivered| {
+            delivered.retain(|_, approvals| {
+                approvals.remove(approval_id);
+                !approvals.is_empty()
+            });
+            !delivered.is_empty()
+        });
+        Ok(())
+    }
+
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, SubscriptionState>> {
         self.inner
             .lock()
             .map_err(|_| anyhow::anyhow!("subscription hub lock poisoned"))
     }
+}
+
+fn send_approval_to_client(
+    state: &mut SubscriptionState,
+    thread_id: &str,
+    client_id: ClientId,
+    approval_id: &str,
+    message: &str,
+) -> bool {
+    if state
+        .delivered_approvals
+        .get(thread_id)
+        .and_then(|delivered| delivered.get(&client_id))
+        .is_some_and(|delivered| delivered.contains(approval_id))
+    {
+        return false;
+    }
+    let Some(client) = state.clients.get(&client_id) else {
+        return false;
+    };
+    if client
+        .sender
+        .send(ClientOutbound::Text(message.to_string()))
+        .is_err()
+    {
+        return false;
+    }
+    state
+        .delivered_approvals
+        .entry(thread_id.to_string())
+        .or_default()
+        .entry(client_id)
+        .or_default()
+        .insert(approval_id.to_string());
+    true
 }
 
 #[cfg(test)]
@@ -304,7 +386,7 @@ mod tests {
         );
 
         assert_eq!(
-            hub.fan_out_thread_approvals("thread-a", "approval".to_string())
+            hub.fan_out_thread_approvals("thread-a", "approval-1", "approval".to_string())
                 .unwrap(),
             FanOutResult {
                 subscribers: 2,
@@ -320,7 +402,7 @@ mod tests {
 
         hub.mark_approval_ready(pending, "thread-a").unwrap();
         assert_eq!(
-            hub.fan_out_thread_approvals("thread-a", "next".to_string())
+            hub.fan_out_thread_approvals("thread-a", "approval-2", "next".to_string())
                 .unwrap(),
             FanOutResult {
                 subscribers: 2,
@@ -336,5 +418,73 @@ mod tests {
             ready_rx.try_recv().unwrap(),
             ClientOutbound::Text("next".to_string())
         );
+    }
+
+    #[test]
+    fn approval_delivery_suppresses_duplicate_replay() {
+        let hub = SubscriptionHub::default();
+        let (tx, rx) = mpsc::channel();
+        let client = ClientId::new(1);
+        hub.register_client(client, ClientSink::new(tx)).unwrap();
+        hub.subscribe(client, "thread-a").unwrap();
+
+        assert_eq!(
+            hub.fan_out_thread_approvals("thread-a", "approval-1", "approval".to_string())
+                .unwrap(),
+            FanOutResult {
+                subscribers: 1,
+                ready: 1,
+                sent: 1,
+            }
+        );
+        assert!(!hub
+            .send_thread_approval_to_client(
+                client,
+                "thread-a",
+                "approval-1",
+                "approval".to_string()
+            )
+            .unwrap());
+
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            ClientOutbound::Text("approval".to_string())
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn forget_approval_allows_future_delivery_for_same_id() {
+        let hub = SubscriptionHub::default();
+        let (tx, rx) = mpsc::channel();
+        let client = ClientId::new(1);
+        hub.register_client(client, ClientSink::new(tx)).unwrap();
+        hub.subscribe(client, "thread-a").unwrap();
+
+        assert_eq!(
+            hub.fan_out_thread_approvals("thread-a", "approval-1", "approval".to_string())
+                .unwrap()
+                .sent,
+            1
+        );
+        hub.forget_approval("approval-1").unwrap();
+        assert!(hub
+            .send_thread_approval_to_client(
+                client,
+                "thread-a",
+                "approval-1",
+                "approval-again".to_string()
+            )
+            .unwrap());
+
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            ClientOutbound::Text("approval".to_string())
+        );
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            ClientOutbound::Text("approval-again".to_string())
+        );
+        assert!(rx.try_recv().is_err());
     }
 }

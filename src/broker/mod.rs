@@ -263,7 +263,7 @@ impl AppServerBroker {
                     if let Some(link) = links.remove(&worker_id) {
                         failed_links.push(link);
                     }
-                    self.state.approvals.cancel_worker(&worker_id)?;
+                    self.state.cancel_worker_approvals(&worker_id)?;
                     self.state.directory.mark_worker_unavailable(&worker_id)?;
                 }
                 crate::worker_pool::WorkerLifecycleEvent::Started(record) => {
@@ -412,7 +412,7 @@ impl BrokerShared {
     }
 
     fn fail_worker_link_pending(&self, link: &WorkerLink) -> Result<()> {
-        let _cancelled_approvals = self.approvals.cancel_worker(&link.worker_id)?;
+        self.cancel_worker_approvals(&link.worker_id)?;
         self.worker_pool
             .lock()
             .map_err(|_| anyhow::anyhow!("worker pool lock poisoned"))?
@@ -732,12 +732,22 @@ impl BrokerShared {
 
     fn cancel_thread_approvals(&self, thread_id: &str) -> Result<()> {
         for approval in self.approvals.cancel_thread(thread_id)? {
+            self.subscriptions
+                .forget_approval(&approval.broker_approval_id)?;
             let response = error_response(
                 approval.worker_request_id,
                 -32003,
                 "approval request cancelled because no broker client is subscribed".to_string(),
             );
             let _ = self.enqueue_worker_response(&approval.worker_id, response);
+        }
+        Ok(())
+    }
+
+    fn cancel_worker_approvals(&self, worker_id: &WorkerId) -> Result<()> {
+        for approval in self.approvals.cancel_worker(worker_id)? {
+            self.subscriptions
+                .forget_approval(&approval.broker_approval_id)?;
         }
         Ok(())
     }
@@ -1165,9 +1175,15 @@ fn replay_pending_approvals_to_client(
         .subscriptions
         .mark_approval_ready(client_id, thread_id)?;
     for request in state.approvals.pending_requests_for_thread(thread_id)? {
-        let _sent = state
-            .subscriptions
-            .send_client(client_id, serde_json::to_string(&request)?)?;
+        let Some(approval_id) = request.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let _sent = state.subscriptions.send_thread_approval_to_client(
+            client_id,
+            thread_id,
+            approval_id,
+            serde_json::to_string(&request)?,
+        )?;
     }
     Ok(())
 }
@@ -1233,9 +1249,11 @@ fn handle_worker_request(
     let text = serde_json::to_string(&approval.request)?;
     let subscribers = match thread_id.as_deref() {
         Some(thread_id) => {
-            let delivery = state
-                .subscriptions
-                .fan_out_thread_approvals(thread_id, text)?;
+            let delivery = state.subscriptions.fan_out_thread_approvals(
+                thread_id,
+                &broker_approval_id,
+                text,
+            )?;
             delivery.subscribers
         }
         None => 0,
@@ -1627,6 +1645,7 @@ fn handle_client_response(
                 return Err(err);
             }
             state.approvals.commit_response(&broker_approval_id)?;
+            state.subscriptions.forget_approval(&broker_approval_id)?;
         }
         ApprovalResponseRoute::AlreadyHandled => {
             let stale =
@@ -3092,6 +3111,49 @@ mod tests {
         assert_eq!(
             original_next.get("id").and_then(Value::as_str),
             resumed_next.get("id").and_then(Value::as_str)
+        );
+    }
+
+    #[test]
+    fn pending_approval_replay_skips_already_live_delivered_approval() {
+        let state = test_state();
+        let link = test_link(WorkerId::new("dia4", 1));
+        let client_id = ClientId::new(1);
+        let (tx, rx) = mpsc::channel();
+        state
+            .subscriptions
+            .register_client(client_id, ClientSink::new(tx))
+            .unwrap();
+        state
+            .subscriptions
+            .subscribe(client_id, "thread-1")
+            .unwrap();
+
+        handle_worker_request(
+            &state,
+            &link,
+            json!({
+                "id": 77,
+                "method": "item/commandExecution/requestApproval",
+                "params": {"threadId": "thread-1", "turnId": "turn-1", "command": "true"}
+            }),
+        )
+        .unwrap();
+        let live_approval = serde_json::from_str::<Value>(&recv_client_text(&rx)).unwrap();
+        let approval_id = live_approval.get("id").cloned().unwrap();
+
+        replay_pending_approvals_to_client(&state, client_id, "thread-1").unwrap();
+
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            state
+                .approvals
+                .pending_requests_for_thread("thread-1")
+                .unwrap()
+                .into_iter()
+                .map(|approval| approval.get("id").cloned().unwrap())
+                .collect::<Vec<_>>(),
+            vec![approval_id]
         );
     }
 

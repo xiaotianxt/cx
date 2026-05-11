@@ -1,16 +1,23 @@
+//! Low-level single-upstream app-server proxy.
+//!
+//! This remains for foreground `cx serve start`. The background service uses
+//! the broker module so it can route by thread and worker instead of forwarding
+//! every connection to one upstream.
+
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::ErrorKind;
 use std::io::Read;
 use std::io::Write;
+use std::net::Shutdown;
 use std::net::TcpListener;
 use std::net::TcpStream;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::RwLock;
 use std::thread;
 use std::time::Duration;
 use std::time::SystemTime;
@@ -35,19 +42,19 @@ pub(crate) struct AppServerProxy {
 #[derive(Debug, Clone)]
 enum ProxyUpstream {
     Fixed(String),
-    Dynamic(Arc<RwLock<String>>),
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ProxyEventRecord<'a> {
+struct ProxyEventRecord {
     timestamp_unix_ms: u128,
     connection_id: u64,
     direction: &'static str,
-    method: Option<&'a str>,
+    method: Option<String>,
     thread_id: Option<String>,
     turn_id: Option<String>,
-    message: &'a Value,
+    event_type: Option<String>,
+    rate_limit_reached: bool,
 }
 
 impl AppServerProxy {
@@ -59,38 +66,14 @@ impl AppServerProxy {
         }
     }
 
-    pub(crate) fn new_dynamic(
-        listen_url: String,
-        upstream_url: Arc<RwLock<String>>,
-        event_log: PathBuf,
-    ) -> Self {
-        Self {
-            listen_url,
-            upstream: ProxyUpstream::Dynamic(upstream_url),
-            event_log,
-        }
-    }
-
     pub(crate) fn spawn(self) -> Result<thread::JoinHandle<()>> {
         let listen = LoopbackWsUrl::parse(&self.listen_url)?;
-        if let Some(parent) = self.event_log.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-        }
         let listener = TcpListener::bind((listen.host(), listen.port()))
             .with_context(|| format!("bind app-server proxy {}", self.listen_url))?;
         listener
             .set_nonblocking(false)
             .context("configure app-server proxy listener")?;
-        let event_log = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.event_log)
-            .with_context(|| {
-                format!(
-                    "open app-server proxy event log {}",
-                    self.event_log.display()
-                )
-            })?;
+        let event_log = open_event_log(&self.event_log)?;
         let event_log = Arc::new(Mutex::new(event_log));
         let next_connection_id = Arc::new(AtomicU64::new(1));
 
@@ -223,12 +206,6 @@ impl ProxyUpstream {
     fn current(&self) -> Result<LoopbackWsUrl> {
         match self {
             Self::Fixed(url) => LoopbackWsUrl::parse(url),
-            Self::Dynamic(url) => {
-                let url = url
-                    .read()
-                    .map_err(|_| anyhow::anyhow!("proxy upstream lock poisoned"))?;
-                LoopbackWsUrl::parse(&url)
-            }
         }
     }
 }
@@ -239,8 +216,20 @@ fn proxy_client_to_upstream(
     event_log: &Arc<Mutex<fs::File>>,
     connection_id: u64,
 ) -> Result<()> {
+    let result =
+        proxy_client_to_upstream_inner(&mut client, &mut upstream, event_log, connection_id);
+    shutdown_pair(&client, &upstream);
+    result
+}
+
+fn proxy_client_to_upstream_inner(
+    client: &mut TcpStream,
+    upstream: &mut TcpStream,
+    event_log: &Arc<Mutex<fs::File>>,
+    connection_id: u64,
+) -> Result<()> {
     loop {
-        let Some(frame) = read_frame(&mut client).context("read client websocket frame")? else {
+        let Some(frame) = read_frame(client).context("read client websocket frame")? else {
             return Ok(());
         };
         if frame.opcode() == 0x1 && frame.fin() {
@@ -248,7 +237,7 @@ fn proxy_client_to_upstream(
                 record_ws_text(event_log, connection_id, "client_to_server", &text);
             }
         }
-        write_frame_raw(&mut upstream, &frame).context("write upstream websocket frame")?;
+        write_frame_raw(upstream, &frame).context("write upstream websocket frame")?;
         if frame.opcode() == 0x8 {
             return Ok(());
         }
@@ -261,9 +250,20 @@ fn proxy_upstream_to_client(
     event_log: &Arc<Mutex<fs::File>>,
     connection_id: u64,
 ) -> Result<()> {
+    let result =
+        proxy_upstream_to_client_inner(&mut upstream, &mut client, event_log, connection_id);
+    shutdown_pair(&upstream, &client);
+    result
+}
+
+fn proxy_upstream_to_client_inner(
+    upstream: &mut TcpStream,
+    client: &mut TcpStream,
+    event_log: &Arc<Mutex<fs::File>>,
+    connection_id: u64,
+) -> Result<()> {
     loop {
-        let Some(frame) = read_frame(&mut upstream).context("read upstream websocket frame")?
-        else {
+        let Some(frame) = read_frame(upstream).context("read upstream websocket frame")? else {
             return Ok(());
         };
         if frame.opcode() == 0x1 && frame.fin() {
@@ -271,11 +271,16 @@ fn proxy_upstream_to_client(
                 record_ws_text(event_log, connection_id, "server_to_client", &text);
             }
         }
-        write_frame_raw(&mut client, &frame).context("write client websocket frame")?;
+        write_frame_raw(client, &frame).context("write client websocket frame")?;
         if frame.opcode() == 0x8 {
             return Ok(());
         }
     }
+}
+
+fn shutdown_pair(left: &TcpStream, right: &TcpStream) {
+    let _ = left.shutdown(Shutdown::Both);
+    let _ = right.shutdown(Shutdown::Both);
 }
 
 fn websocket_upstream_request(request: &[u8]) -> Vec<u8> {
@@ -327,7 +332,14 @@ fn read_frame(stream: &mut TcpStream) -> Result<Option<Frame>> {
     let mut header = [0_u8; 2];
     match stream.read_exact(&mut header) {
         Ok(()) => {}
-        Err(err) if err.kind() == ErrorKind::UnexpectedEof => return Ok(None),
+        Err(err)
+            if matches!(
+                err.kind(),
+                ErrorKind::UnexpectedEof | ErrorKind::TimedOut | ErrorKind::WouldBlock
+            ) =>
+        {
+            return Ok(None);
+        }
         Err(err) => return Err(err).context("read frame header"),
     }
     let mut raw = Vec::from(header);
@@ -406,7 +418,10 @@ fn record_ws_text(
     let Ok(value) = serde_json::from_str::<Value>(text) else {
         return;
     };
-    let method = value.get("method").and_then(Value::as_str);
+    let method = value
+        .get("method")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let params = value.get("params");
     let record = ProxyEventRecord {
         timestamp_unix_ms: SystemTime::now()
@@ -418,7 +433,8 @@ fn record_ws_text(
         method,
         thread_id: params.and_then(extract_thread_id),
         turn_id: params.and_then(extract_turn_id),
-        message: &value,
+        event_type: extract_event_type(&value),
+        rate_limit_reached: has_rate_limit_fragment(&value),
     };
     let Ok(line) = serde_json::to_string(&record) else {
         return;
@@ -427,6 +443,38 @@ fn record_ws_text(
         return;
     };
     let _ = writeln!(file, "{line}");
+}
+
+fn open_event_log(path: &Path) -> Result<fs::File> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        options.mode(0o600);
+    }
+    let file = options
+        .open(path)
+        .with_context(|| format!("open app-server proxy event log {}", path.display()))?;
+    set_private_event_log_permissions(&file)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn set_private_event_log_permissions(file: &fs::File) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .context("set app-server proxy event log permissions")
+}
+
+#[cfg(not(unix))]
+fn set_private_event_log_permissions(_file: &fs::File) -> Result<()> {
+    Ok(())
 }
 
 fn extract_thread_id(value: &Value) -> Option<String> {
@@ -445,6 +493,22 @@ fn extract_turn_id(value: &Value) -> Option<String> {
         .or_else(|| value.pointer("/turn/id"))
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+fn extract_event_type(value: &Value) -> Option<String> {
+    value
+        .pointer("/params/payload/type")
+        .or_else(|| value.pointer("/params/event/type"))
+        .or_else(|| value.pointer("/params/type"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn has_rate_limit_fragment(value: &Value) -> bool {
+    value.pointer("/params/payload/info/rate_limits").is_some()
+        || value.pointer("/params/payload/info/rateLimits").is_some()
+        || value.pointer("/params/info/rate_limits").is_some()
+        || value.pointer("/params/info/rateLimits").is_some()
 }
 
 #[cfg(test)]
@@ -489,5 +553,126 @@ mod tests {
         let url = LoopbackWsUrl::parse(&format!("ws://127.0.0.1:{port}")).unwrap();
 
         assert!(!upstream_ready(&url));
+    }
+
+    #[test]
+    fn read_frame_returns_none_on_idle_timeout() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_millis(150));
+        });
+        let mut stream = TcpStream::connect(addr).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(25)))
+            .unwrap();
+
+        assert!(read_frame(&mut stream).unwrap().is_none());
+
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn client_close_shuts_down_upstream_even_when_another_clone_exists() {
+        let client_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let client_addr = client_listener.local_addr().unwrap();
+        let upstream_listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let upstream_addr = upstream_listener.local_addr().unwrap();
+
+        let client_peer = TcpStream::connect(client_addr).unwrap();
+        let (client_proxy, _) = client_listener.accept().unwrap();
+        let upstream_proxy = TcpStream::connect(upstream_addr).unwrap();
+        let upstream_held_clone = upstream_proxy.try_clone().unwrap();
+        let (mut upstream_peer, _) = upstream_listener.accept().unwrap();
+        upstream_peer
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .unwrap();
+        let event_log = temp_event_log("client-close-shutdown");
+
+        let handle = std::thread::spawn(move || {
+            proxy_client_to_upstream(client_proxy, upstream_proxy, &event_log, 1).unwrap();
+        });
+        drop(client_peer);
+
+        handle.join().unwrap();
+        let mut byte = [0_u8; 1];
+        match upstream_peer.read(&mut byte) {
+            Ok(0) => {}
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    ErrorKind::ConnectionReset | ErrorKind::UnexpectedEof
+                ) => {}
+            other => panic!("expected upstream peer to close, got {other:?}"),
+        }
+        drop(upstream_held_clone);
+    }
+
+    #[test]
+    fn record_ws_text_logs_metadata_without_message_body() {
+        let path = temp_event_log_path("redacted");
+        let event_log = Arc::new(Mutex::new(open_event_log(&path).unwrap()));
+        let text = serde_json::json!({
+            "id": 7,
+            "method": "turn/start",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "prompt": "private prompt contents"
+            }
+        })
+        .to_string();
+
+        record_ws_text(&event_log, 3, "client_to_server", &text);
+        event_log.lock().unwrap().flush().unwrap();
+
+        let contents = fs::read_to_string(&path).unwrap();
+        let record = serde_json::from_str::<Value>(contents.trim()).unwrap();
+        assert_eq!(
+            record.get("method").and_then(Value::as_str),
+            Some("turn/start")
+        );
+        assert_eq!(
+            record.get("threadId").and_then(Value::as_str),
+            Some("thread-1")
+        );
+        assert_eq!(record.get("turnId").and_then(Value::as_str), Some("turn-1"));
+        assert!(record.get("message").is_none());
+        assert!(!contents.contains("private prompt contents"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn event_log_file_is_private_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_event_log_path("permissions");
+        let file = open_event_log(&path).unwrap();
+        drop(file);
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+
+        let _ = fs::remove_file(path);
+    }
+
+    fn temp_event_log(name: &str) -> Arc<Mutex<fs::File>> {
+        let path = temp_event_log_path(name);
+        let file = open_event_log(&path).unwrap();
+        Arc::new(Mutex::new(file))
+    }
+
+    fn temp_event_log_path(name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "cx-proxy-{name}-{}-{unique}.jsonl",
+            std::process::id()
+        ))
     }
 }

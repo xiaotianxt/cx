@@ -2296,7 +2296,7 @@ mod tests {
         let request = ws::read_http_head(&mut stream)?;
         let response = BrokerWebSocket::accept_response(&request)?;
         stream.write_all(response.as_bytes())?;
-        BrokerWebSocket::finish_accept(stream)
+        BrokerWebSocket::finish_accept_with_buffer(stream, Vec::new())
     }
 
     fn recv_json_timeout(rx: &mpsc::Receiver<Value>) -> Value {
@@ -2312,6 +2312,45 @@ mod tests {
             ClientOutbound::Text(text) => text,
             ClientOutbound::Pong(_) => panic!("expected client text message, got pong"),
         }
+    }
+
+    fn masked_client_text_frame(text: &str) -> Vec<u8> {
+        let payload = text.as_bytes();
+        assert!(payload.len() < 126);
+        let mask = [1_u8, 2, 3, 4];
+        let mut frame = vec![0x81, 0x80 | payload.len() as u8];
+        frame.extend_from_slice(&mask);
+        frame.extend(
+            payload
+                .iter()
+                .enumerate()
+                .map(|(index, byte)| byte ^ mask[index % mask.len()]),
+        );
+        frame
+    }
+
+    fn read_server_text_frame(stream: &mut TcpStream) -> String {
+        let mut header = [0_u8; 2];
+        stream.read_exact(&mut header).unwrap();
+        assert_eq!(header[0] & 0x0f, 0x1);
+        assert_eq!(header[1] & 0x80, 0);
+        let len = match header[1] & 0x7f {
+            len if len < 126 => usize::from(len),
+            126 => {
+                let mut extended = [0_u8; 2];
+                stream.read_exact(&mut extended).unwrap();
+                usize::from(u16::from_be_bytes(extended))
+            }
+            127 => {
+                let mut extended = [0_u8; 8];
+                stream.read_exact(&mut extended).unwrap();
+                usize::try_from(u64::from_be_bytes(extended)).unwrap()
+            }
+            _ => unreachable!(),
+        };
+        let mut payload = vec![0_u8; len];
+        stream.read_exact(&mut payload).unwrap();
+        String::from_utf8(payload).unwrap()
     }
 
     fn try_recv_client_text(rx: &mpsc::Receiver<ClientOutbound>) -> String {
@@ -2569,11 +2608,16 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         listener.set_nonblocking(true).unwrap();
         let reactor_state = Arc::clone(&state);
-        let reactor =
-            thread::spawn(move || preflight::run_preflight_reactor(reactor_state, listener));
+        let reactor = thread::spawn(move || {
+            preflight::run_preflight_reactor_with_limits(
+                reactor_state,
+                listener,
+                preflight::PreflightLimits::new_for_test(8, 4),
+            )
+        });
 
         let mut slow_clients = Vec::new();
-        for _ in 0..32 {
+        for _ in 0..8 {
             let mut stream = TcpStream::connect(addr).unwrap();
             stream.write_all(b"GET /readyz").unwrap();
             slow_clients.push(stream);
@@ -2599,6 +2643,54 @@ mod tests {
 
         state.shutdown.store(true, Ordering::Release);
         drop(slow_clients);
+        if let Ok(stream) = TcpStream::connect(addr) {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+        reactor.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn preflight_preserves_websocket_frame_sent_with_http_head() {
+        let state = test_state();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let reactor_state = Arc::clone(&state);
+        let reactor =
+            thread::spawn(move || preflight::run_preflight_reactor(reactor_state, listener));
+        let request = format!(
+            "GET / HTTP/1.1\r\n\
+             Host: {addr}\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Version: 13\r\n\
+             \r\n"
+        );
+        let initialize = json!({
+            "id": 1,
+            "method": "initialize",
+            "params": {}
+        })
+        .to_string();
+        let mut bytes = request.into_bytes();
+        bytes.extend(masked_client_text_frame(&initialize));
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client.write_all(&bytes).unwrap();
+        let response = ws::read_http_head(&mut client).unwrap();
+        assert!(ws::request_line(&response).starts_with("HTTP/1.1 101 "));
+        let text = read_server_text_frame(&mut client);
+        let message = serde_json::from_str::<Value>(&text).unwrap();
+
+        assert_eq!(message.get("id").and_then(Value::as_i64), Some(1));
+        assert!(message.get("result").is_some());
+
+        state.shutdown.store(true, Ordering::Release);
+        drop(client);
         if let Ok(stream) = TcpStream::connect(addr) {
             let _ = stream.shutdown(Shutdown::Both);
         }

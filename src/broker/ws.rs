@@ -38,6 +38,7 @@ pub(crate) struct BrokerWebSocket {
 
 pub(crate) struct WebSocketReader {
     stream: TcpStream,
+    buffered: Vec<u8>,
 }
 
 pub(crate) struct WebSocketWriter {
@@ -86,14 +87,14 @@ impl BrokerWebSocket {
         Self::from_stream(stream, PeerRole::Client)
     }
 
-    pub(crate) fn finish_accept(stream: TcpStream) -> Result<Self> {
+    pub(crate) fn finish_accept_with_buffer(stream: TcpStream, buffered: Vec<u8>) -> Result<Self> {
         stream
             .set_read_timeout(None)
             .context("set broker websocket blocking read")?;
         stream
             .set_write_timeout(Some(Duration::from_secs(30)))
             .context("set broker websocket write timeout")?;
-        Self::from_stream(stream, PeerRole::Server)
+        Self::from_stream_with_buffer(stream, PeerRole::Server, buffered)
     }
 
     pub(crate) fn accept_response(request: &[u8]) -> Result<String> {
@@ -136,9 +137,17 @@ impl BrokerWebSocket {
     }
 
     fn from_stream(stream: TcpStream, role: PeerRole) -> Result<Self> {
+        Self::from_stream_with_buffer(stream, role, Vec::new())
+    }
+
+    fn from_stream_with_buffer(
+        stream: TcpStream,
+        role: PeerRole,
+        buffered: Vec<u8>,
+    ) -> Result<Self> {
         let writer_stream = stream.try_clone().context("clone websocket stream")?;
         Ok(Self {
-            reader: WebSocketReader { stream },
+            reader: WebSocketReader { stream, buffered },
             writer: WebSocketWriter {
                 stream: writer_stream,
                 role,
@@ -184,7 +193,7 @@ impl WebSocketReader {
 
     fn read_frame_blocking(&mut self) -> Result<Option<Frame>> {
         let mut header = [0_u8; 2];
-        match self.stream.read_exact(&mut header) {
+        match self.read_exact_buffered(&mut header) {
             Ok(()) => {}
             Err(err)
                 if matches!(
@@ -205,14 +214,12 @@ impl WebSocketReader {
         let mut len = u64::from(header[1] & 0x7f);
         if len == 126 {
             let mut extended = [0_u8; 2];
-            self.stream
-                .read_exact(&mut extended)
+            self.read_exact_buffered(&mut extended)
                 .context("read websocket frame length")?;
             len = u64::from(u16::from_be_bytes(extended));
         } else if len == 127 {
             let mut extended = [0_u8; 8];
-            self.stream
-                .read_exact(&mut extended)
+            self.read_exact_buffered(&mut extended)
                 .context("read websocket frame length")?;
             len = u64::from_be_bytes(extended);
         }
@@ -222,14 +229,12 @@ impl WebSocketReader {
 
         let mut mask = [0_u8; 4];
         if masked {
-            self.stream
-                .read_exact(&mut mask)
+            self.read_exact_buffered(&mut mask)
                 .context("read websocket frame mask")?;
         }
 
         let mut payload = vec![0_u8; len as usize];
-        self.stream
-            .read_exact(&mut payload)
+        self.read_exact_buffered(&mut payload)
             .context("read websocket frame payload")?;
         if masked {
             for (index, byte) in payload.iter_mut().enumerate() {
@@ -241,6 +246,20 @@ impl WebSocketReader {
             opcode,
             payload,
         }))
+    }
+
+    fn read_exact_buffered(&mut self, output: &mut [u8]) -> std::io::Result<()> {
+        let mut filled = 0;
+        if !self.buffered.is_empty() {
+            let count = output.len().min(self.buffered.len());
+            output[..count].copy_from_slice(&self.buffered[..count]);
+            self.buffered.drain(..count);
+            filled = count;
+        }
+        if filled < output.len() {
+            self.stream.read_exact(&mut output[filled..])?;
+        }
+        Ok(())
     }
 }
 

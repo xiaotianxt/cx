@@ -38,6 +38,35 @@ const CLIENT_PREFLIGHT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const ACCEPT_RESOURCE_BACKOFF: Duration = Duration::from_millis(250);
 
 pub(super) fn run_preflight_reactor(state: Arc<BrokerShared>, listener: TcpListener) -> Result<()> {
+    run_preflight_reactor_with_limits(state, listener, PreflightLimits::from_process())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PreflightLimits {
+    total: usize,
+    incomplete: usize,
+}
+
+impl PreflightLimits {
+    fn from_process() -> Self {
+        let total = preflight_connection_limit();
+        Self {
+            total,
+            incomplete: incomplete_handshake_limit(total),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn new_for_test(total: usize, incomplete: usize) -> Self {
+        Self { total, incomplete }
+    }
+}
+
+pub(super) fn run_preflight_reactor_with_limits(
+    state: Arc<BrokerShared>,
+    listener: TcpListener,
+    limits: PreflightLimits,
+) -> Result<()> {
     let mut listener = MioTcpListener::from_std(listener);
     let mut poll = Poll::new().context("create broker preflight poller")?;
     poll.registry()
@@ -46,7 +75,6 @@ pub(super) fn run_preflight_reactor(state: Arc<BrokerShared>, listener: TcpListe
 
     let mut events = Events::with_capacity(EVENT_CAPACITY);
     let mut connections = BTreeMap::<Token, PreflightConnection>::new();
-    let preflight_limit = preflight_connection_limit();
     let mut next_token = FIRST_CONNECTION_TOKEN;
     let mut listener_registered = true;
     let mut accept_resume_at = None;
@@ -84,7 +112,7 @@ pub(super) fn run_preflight_reactor(state: Arc<BrokerShared>, listener: TcpListe
                     &mut listener,
                     &mut connections,
                     &mut next_token,
-                    preflight_limit,
+                    limits,
                 )? {
                     AcceptOutcome::Ready => {}
                     AcceptOutcome::ResourceExhausted => {
@@ -116,6 +144,7 @@ pub(super) fn run_preflight_reactor(state: Arc<BrokerShared>, listener: TcpListe
 struct PreflightConnection {
     stream: MioTcpStream,
     request: Vec<u8>,
+    initial_websocket_bytes: Vec<u8>,
     response: Option<PreflightResponse>,
     deadline: Instant,
 }
@@ -145,9 +174,14 @@ impl PreflightConnection {
         Self {
             stream,
             request: Vec::new(),
+            initial_websocket_bytes: Vec::new(),
             response: None,
             deadline: Instant::now() + CLIENT_HANDSHAKE_TIMEOUT,
         }
+    }
+
+    fn incomplete(&self) -> bool {
+        self.response.is_none()
     }
 
     fn interest(&self) -> Interest {
@@ -182,15 +216,16 @@ impl PreflightConnection {
                 Ok(0) => return Ok(PreflightProgress::Close),
                 Ok(count) => {
                     self.request.extend_from_slice(&buffer[..count]);
+                    if let Some(head_end) = http_head_end(&self.request) {
+                        self.initial_websocket_bytes = self.request.split_off(head_end);
+                        self.prepare_response(state)?;
+                        return self.write_response();
+                    }
                     if self.request.len() > ws::MAX_HANDSHAKE_BYTES {
                         anyhow::bail!(
                             "broker client http head exceeded {} bytes",
                             ws::MAX_HANDSHAKE_BYTES
                         );
-                    }
-                    if self.request.ends_with(b"\r\n\r\n") {
-                        self.prepare_response(state)?;
-                        return self.write_response();
                     }
                 }
                 Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
@@ -257,12 +292,12 @@ impl PreflightConnection {
 }
 
 fn accept_connections(
-    state: &BrokerShared,
+    state: &Arc<BrokerShared>,
     registry: &mio::Registry,
     listener: &mut MioTcpListener,
     connections: &mut BTreeMap<Token, PreflightConnection>,
     next_token: &mut usize,
-    preflight_limit: usize,
+    limits: PreflightLimits,
 ) -> Result<AcceptOutcome> {
     let mut accepted = 0;
     loop {
@@ -270,13 +305,13 @@ fn accept_connections(
             return Ok(AcceptOutcome::Ready);
         }
         match listener.accept() {
-            Ok((mut stream, _addr)) => {
+            Ok((stream, _addr)) => {
                 accepted += 1;
                 if state.shutdown.load(Ordering::Acquire) {
                     let _ = stream.shutdown(Shutdown::Both);
                     return Ok(AcceptOutcome::Ready);
                 }
-                if connections.len() >= preflight_limit {
+                if connections.len() >= limits.total {
                     let _ = stream.shutdown(Shutdown::Both);
                     continue;
                 }
@@ -284,10 +319,41 @@ fn accept_connections(
                     let _ = stream.shutdown(Shutdown::Both);
                     continue;
                 };
-                registry
-                    .register(&mut stream, token, Interest::READABLE)
-                    .context("register broker preflight connection")?;
-                connections.insert(token, PreflightConnection::new(stream));
+                let over_incomplete_limit =
+                    incomplete_connection_count(connections) >= limits.incomplete;
+                let mut connection = PreflightConnection::new(stream);
+                match connection.read_request(state) {
+                    Ok(PreflightProgress::Pending)
+                        if over_incomplete_limit && connection.incomplete() =>
+                    {
+                        let _ = connection.stream.shutdown(Shutdown::Both);
+                    }
+                    Ok(PreflightProgress::Pending) => {
+                        let interest = connection.interest();
+                        registry
+                            .register(&mut connection.stream, token, interest)
+                            .context("register broker preflight connection")?;
+                        connections.insert(token, connection);
+                    }
+                    Ok(PreflightProgress::Close) => {
+                        let _ = connection.stream.shutdown(Shutdown::Both);
+                    }
+                    Ok(PreflightProgress::Upgrade) => {
+                        match finish_upgrade(connection.stream, connection.initial_websocket_bytes)
+                        {
+                            Ok(socket) => start_client_connection(Arc::clone(state), socket),
+                            Err(err) => {
+                                eprintln!("broker websocket finish accept failed: {err:#}");
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        let _ = connection.stream.shutdown(Shutdown::Both);
+                        if !state.shutdown.load(Ordering::Acquire) {
+                            eprintln!("broker preflight connection failed: {err:#}");
+                        }
+                    }
+                }
             }
             Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(AcceptOutcome::Ready),
             Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
@@ -328,7 +394,7 @@ fn handle_connection_event(
         }
         Ok(PreflightProgress::Upgrade) => {
             let _ = registry.deregister(&mut connection.stream);
-            match finish_upgrade(connection.stream) {
+            match finish_upgrade(connection.stream, connection.initial_websocket_bytes) {
                 Ok(socket) => start_client_connection(Arc::clone(state), socket),
                 Err(err) => eprintln!("broker websocket finish accept failed: {err:#}"),
             }
@@ -343,12 +409,15 @@ fn handle_connection_event(
     }
 }
 
-fn finish_upgrade(stream: MioTcpStream) -> Result<BrokerWebSocket> {
+fn finish_upgrade(
+    stream: MioTcpStream,
+    initial_websocket_bytes: Vec<u8>,
+) -> Result<BrokerWebSocket> {
     let stream = TcpStream::from(stream);
     stream
         .set_nonblocking(false)
         .context("set broker websocket blocking after handshake")?;
-    BrokerWebSocket::finish_accept(stream)
+    BrokerWebSocket::finish_accept_with_buffer(stream, initial_websocket_bytes)
 }
 
 fn expire_connections(
@@ -439,6 +508,20 @@ fn allocate_token(
     None
 }
 
+fn incomplete_connection_count(connections: &BTreeMap<Token, PreflightConnection>) -> usize {
+    connections
+        .values()
+        .filter(|connection| connection.incomplete())
+        .count()
+}
+
+fn http_head_end(bytes: &[u8]) -> Option<usize> {
+    bytes
+        .windows(b"\r\n\r\n".len())
+        .position(|window| window == b"\r\n\r\n")
+        .map(|position| position + b"\r\n\r\n".len())
+}
+
 fn preflight_connection_limit() -> usize {
     preflight_limit_for_fd_soft_limit(process_fd_soft_limit())
 }
@@ -449,6 +532,13 @@ fn preflight_limit_for_fd_soft_limit(soft_limit: Option<usize>) -> usize {
     };
     let budget = soft_limit.saturating_sub(PREFLIGHT_FD_RESERVE) / PREFLIGHT_FD_SHARE;
     budget.clamp(1, DEFAULT_MAX_PREFLIGHT_CONNECTIONS)
+}
+
+fn incomplete_handshake_limit(total: usize) -> usize {
+    if total <= 1 {
+        return 1;
+    }
+    total.saturating_sub((total / 4).clamp(1, 16)).max(1)
 }
 
 #[cfg(unix)]
@@ -499,6 +589,22 @@ mod tests {
             DEFAULT_MAX_PREFLIGHT_CONNECTIONS
         );
         assert_eq!(preflight_limit_for_fd_soft_limit(Some(32)), 1);
+    }
+
+    #[test]
+    fn incomplete_handshake_limit_reserves_accept_capacity() {
+        assert_eq!(incomplete_handshake_limit(1), 1);
+        assert_eq!(incomplete_handshake_limit(8), 6);
+        assert_eq!(incomplete_handshake_limit(48), 36);
+        assert_eq!(incomplete_handshake_limit(1024), 1008);
+    }
+
+    #[test]
+    fn http_head_end_finds_delimiter_before_extra_bytes() {
+        let bytes = b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n\x81\x00";
+
+        assert_eq!(http_head_end(bytes), Some(bytes.len() - 2));
+        assert_eq!(http_head_end(b"GET / HTTP/1.1\r\n"), None);
     }
 
     #[cfg(unix)]

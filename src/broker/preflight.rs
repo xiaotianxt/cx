@@ -29,9 +29,13 @@ use super::BrokerWebSocket;
 const LISTENER: Token = Token(0);
 const FIRST_CONNECTION_TOKEN: usize = 1;
 const EVENT_CAPACITY: usize = 128;
-const MAX_PREFLIGHT_CONNECTIONS: usize = 1024;
+const DEFAULT_MAX_PREFLIGHT_CONNECTIONS: usize = 1024;
+const PREFLIGHT_FD_RESERVE: usize = 64;
+const PREFLIGHT_FD_SHARE: usize = 4;
+const MAX_ACCEPTS_PER_TICK: usize = 64;
 const CLIENT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const CLIENT_PREFLIGHT_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const ACCEPT_RESOURCE_BACKOFF: Duration = Duration::from_millis(250);
 
 pub(super) fn run_preflight_reactor(state: Arc<BrokerShared>, listener: TcpListener) -> Result<()> {
     let mut listener = MioTcpListener::from_std(listener);
@@ -42,15 +46,27 @@ pub(super) fn run_preflight_reactor(state: Arc<BrokerShared>, listener: TcpListe
 
     let mut events = Events::with_capacity(EVENT_CAPACITY);
     let mut connections = BTreeMap::<Token, PreflightConnection>::new();
+    let preflight_limit = preflight_connection_limit();
     let mut next_token = FIRST_CONNECTION_TOKEN;
+    let mut listener_registered = true;
+    let mut accept_resume_at = None;
 
     loop {
         expire_connections(poll.registry(), &mut connections);
+        resume_accept_if_due(
+            poll.registry(),
+            &mut listener,
+            &mut listener_registered,
+            &mut accept_resume_at,
+        )?;
         if state.shutdown.load(Ordering::Acquire) {
             break;
         }
 
-        if let Err(err) = poll.poll(&mut events, next_poll_timeout(&connections)) {
+        if let Err(err) = poll.poll(
+            &mut events,
+            next_poll_timeout(&connections, accept_resume_at),
+        ) {
             if err.kind() == io::ErrorKind::Interrupted {
                 continue;
             }
@@ -61,20 +77,34 @@ pub(super) fn run_preflight_reactor(state: Arc<BrokerShared>, listener: TcpListe
         }
 
         for event in events.iter() {
-            if event.token() == LISTENER {
-                accept_connections(
+            if event.token() == LISTENER && listener_registered {
+                match accept_connections(
                     &state,
                     poll.registry(),
                     &mut listener,
                     &mut connections,
                     &mut next_token,
-                )?;
+                    preflight_limit,
+                )? {
+                    AcceptOutcome::Ready => {}
+                    AcceptOutcome::ResourceExhausted => {
+                        pause_accept(
+                            poll.registry(),
+                            &mut listener,
+                            &mut listener_registered,
+                            &mut accept_resume_at,
+                        )?;
+                    }
+                }
             } else {
                 handle_connection_event(&state, poll.registry(), &mut connections, event);
             }
         }
     }
 
+    if listener_registered {
+        let _ = poll.registry().deregister(&mut listener);
+    }
     for (_token, mut connection) in connections {
         let _ = poll.registry().deregister(&mut connection.stream);
         let _ = connection.stream.shutdown(Shutdown::Both);
@@ -102,6 +132,12 @@ enum PreflightProgress {
     Pending,
     Close,
     Upgrade,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AcceptOutcome {
+    Ready,
+    ResourceExhausted,
 }
 
 impl PreflightConnection {
@@ -226,15 +262,21 @@ fn accept_connections(
     listener: &mut MioTcpListener,
     connections: &mut BTreeMap<Token, PreflightConnection>,
     next_token: &mut usize,
-) -> Result<()> {
+    preflight_limit: usize,
+) -> Result<AcceptOutcome> {
+    let mut accepted = 0;
     loop {
+        if accepted >= MAX_ACCEPTS_PER_TICK {
+            return Ok(AcceptOutcome::Ready);
+        }
         match listener.accept() {
             Ok((mut stream, _addr)) => {
+                accepted += 1;
                 if state.shutdown.load(Ordering::Acquire) {
                     let _ = stream.shutdown(Shutdown::Both);
-                    return Ok(());
+                    return Ok(AcceptOutcome::Ready);
                 }
-                if connections.len() >= MAX_PREFLIGHT_CONNECTIONS {
+                if connections.len() >= preflight_limit {
                     let _ = stream.shutdown(Shutdown::Both);
                     continue;
                 }
@@ -247,8 +289,12 @@ fn accept_connections(
                     .context("register broker preflight connection")?;
                 connections.insert(token, PreflightConnection::new(stream));
             }
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => return Ok(AcceptOutcome::Ready),
             Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+            Err(err) if is_fd_exhaustion(&err) => {
+                eprintln!("broker accept paused after file descriptor exhaustion: {err}");
+                return Ok(AcceptOutcome::ResourceExhausted);
+            }
             Err(err) => return Err(err).context("accept broker client"),
         }
     }
@@ -322,11 +368,57 @@ fn expire_connections(
     }
 }
 
-fn next_poll_timeout(connections: &BTreeMap<Token, PreflightConnection>) -> Option<Duration> {
-    let next_deadline = connections
+fn resume_accept_if_due(
+    registry: &mio::Registry,
+    listener: &mut MioTcpListener,
+    listener_registered: &mut bool,
+    accept_resume_at: &mut Option<Instant>,
+) -> Result<()> {
+    if *listener_registered {
+        return Ok(());
+    }
+    let Some(deadline) = accept_resume_at else {
+        return Ok(());
+    };
+    if *deadline > Instant::now() {
+        return Ok(());
+    }
+    registry
+        .register(listener, LISTENER, Interest::READABLE)
+        .context("resume broker listener after fd exhaustion")?;
+    *listener_registered = true;
+    *accept_resume_at = None;
+    Ok(())
+}
+
+fn pause_accept(
+    registry: &mio::Registry,
+    listener: &mut MioTcpListener,
+    listener_registered: &mut bool,
+    accept_resume_at: &mut Option<Instant>,
+) -> Result<()> {
+    registry
+        .deregister(listener)
+        .context("pause broker listener after fd exhaustion")?;
+    *listener_registered = false;
+    *accept_resume_at = Some(Instant::now() + ACCEPT_RESOURCE_BACKOFF);
+    Ok(())
+}
+
+fn next_poll_timeout(
+    connections: &BTreeMap<Token, PreflightConnection>,
+    accept_resume_at: Option<Instant>,
+) -> Option<Duration> {
+    let next_connection_deadline = connections
         .values()
         .map(|connection| connection.deadline)
-        .min()?;
+        .min();
+    let next_deadline = match (next_connection_deadline, accept_resume_at) {
+        (Some(connection), Some(accept)) => Some(connection.min(accept)),
+        (Some(connection), None) => Some(connection),
+        (None, Some(accept)) => Some(accept),
+        (None, None) => None,
+    }?;
     Some(next_deadline.saturating_duration_since(Instant::now()))
 }
 
@@ -345,4 +437,81 @@ fn allocate_token(
         }
     }
     None
+}
+
+fn preflight_connection_limit() -> usize {
+    preflight_limit_for_fd_soft_limit(process_fd_soft_limit())
+}
+
+fn preflight_limit_for_fd_soft_limit(soft_limit: Option<usize>) -> usize {
+    let Some(soft_limit) = soft_limit else {
+        return DEFAULT_MAX_PREFLIGHT_CONNECTIONS;
+    };
+    let budget = soft_limit.saturating_sub(PREFLIGHT_FD_RESERVE) / PREFLIGHT_FD_SHARE;
+    budget.clamp(1, DEFAULT_MAX_PREFLIGHT_CONNECTIONS)
+}
+
+#[cfg(unix)]
+fn process_fd_soft_limit() -> Option<usize> {
+    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    // SAFETY: getrlimit writes a plain rlimit value into the provided pointer
+    // and does not retain it.
+    let result = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) };
+    if result != 0 {
+        return None;
+    }
+    // SAFETY: getrlimit succeeded, so the rlimit struct has been initialized.
+    let limit = unsafe { limit.assume_init() };
+    if limit.rlim_cur == libc::RLIM_INFINITY {
+        return None;
+    }
+    usize::try_from(limit.rlim_cur).ok()
+}
+
+#[cfg(not(unix))]
+fn process_fd_soft_limit() -> Option<usize> {
+    None
+}
+
+#[cfg(unix)]
+fn is_fd_exhaustion(err: &io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
+}
+
+#[cfg(not(unix))]
+fn is_fd_exhaustion(_err: &io::Error) -> bool {
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preflight_limit_uses_fraction_of_fd_budget() {
+        assert_eq!(
+            preflight_limit_for_fd_soft_limit(None),
+            DEFAULT_MAX_PREFLIGHT_CONNECTIONS
+        );
+        assert_eq!(preflight_limit_for_fd_soft_limit(Some(256)), 48);
+        assert_eq!(
+            preflight_limit_for_fd_soft_limit(Some(100_000)),
+            DEFAULT_MAX_PREFLIGHT_CONNECTIONS
+        );
+        assert_eq!(preflight_limit_for_fd_soft_limit(Some(32)), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fd_exhaustion_errors_are_recoverable_accept_errors() {
+        assert!(is_fd_exhaustion(&io::Error::from_raw_os_error(
+            libc::EMFILE
+        )));
+        assert!(is_fd_exhaustion(&io::Error::from_raw_os_error(
+            libc::ENFILE
+        )));
+        assert!(!is_fd_exhaustion(&io::Error::from_raw_os_error(
+            libc::ECONNABORTED
+        )));
+    }
 }

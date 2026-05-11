@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::ErrorKind;
 use std::io::Read;
 use std::io::Write;
+use std::net::Shutdown;
 use std::net::TcpStream;
 use std::net::ToSocketAddrs;
 use std::time::Duration;
@@ -97,6 +98,12 @@ impl WebSocket {
 
     pub(super) fn send_text(&mut self, text: &str) -> Result<()> {
         self.send_frame(0x1, text.as_bytes())
+    }
+
+    pub(super) fn shutdown(&mut self) -> Result<()> {
+        self.stream
+            .shutdown(Shutdown::Both)
+            .context("shutdown app-server websocket")
     }
 
     pub(super) fn read_text(&mut self) -> Result<String> {

@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -146,6 +147,14 @@ pub(crate) enum ParsedServerEvent {
     TurnCompleted { turn_id: String },
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ApprovalScope<'a> {
+    thread_id: &'a str,
+    turn_id: Option<&'a str>,
+}
+
+const MAX_QUEUED_APPROVALS: usize = 64;
+
 impl ThreadListInfo {
     fn from_response(response: &Value) -> Self {
         let thread_count = response
@@ -163,6 +172,8 @@ impl ThreadListInfo {
 pub(crate) struct AppServerClient {
     websocket: WebSocket,
     next_request_id: u64,
+    queued_approvals: VecDeque<ApprovalRequest>,
+    closed_reason: Option<String>,
 }
 
 impl AppServerClient {
@@ -172,6 +183,8 @@ impl AppServerClient {
         Ok(Self {
             websocket,
             next_request_id: 1,
+            queued_approvals: VecDeque::new(),
+            closed_reason: None,
         })
     }
 
@@ -374,6 +387,14 @@ impl AppServerClient {
     where
         F: FnMut(AppStreamEvent) -> Result<()>,
     {
+        self.ensure_open()?;
+        self.handle_queued_approvals(
+            ApprovalScope {
+                thread_id,
+                turn_id: None,
+            },
+            &mut on_approval,
+        )?;
         let request_id = self.send_request(
             "turn/start",
             protocol::TurnStartParams {
@@ -388,13 +409,20 @@ impl AppServerClient {
         self.collect_turn_start(request_id, thread_id, &mut on_event, &mut on_approval)
     }
 
-    pub(crate) fn turn_steer(
+    pub(crate) fn turn_steer_with_approval(
         &mut self,
         thread_id: &str,
         turn_id: &str,
         prompt: String,
+        mut on_approval: impl FnMut(ApprovalRequest) -> Result<Value>,
     ) -> Result<SteeredTurn> {
-        let response = self.request(
+        self.ensure_open()?;
+        let scope = ApprovalScope {
+            thread_id,
+            turn_id: Some(turn_id),
+        };
+        self.handle_queued_approvals(scope, &mut on_approval)?;
+        let response = self.request_with_approval(
             "turn/steer",
             protocol::TurnSteerParams {
                 thread_id: thread_id.to_string(),
@@ -404,6 +432,8 @@ impl AppServerClient {
                 }],
                 expected_turn_id: turn_id.to_string(),
             },
+            scope,
+            &mut on_approval,
         )?;
         let response = serde_json::from_value::<protocol::TurnSteerResponse>(response)
             .context("decode turn/steer response")?;
@@ -423,7 +453,19 @@ impl AppServerClient {
     where
         F: FnMut(ParsedServerEvent) -> Result<()>,
     {
+        self.ensure_open()?;
         let mut count = 0usize;
+        let scope = ApprovalScope { thread_id, turn_id };
+        while count < max_events {
+            let Some(approval) = self.pop_queued_approval(scope) else {
+                break;
+            };
+            if let Some(result) = on_approval(approval.clone())? {
+                self.send_success_response(approval.id.clone(), result)?;
+            }
+            on_event(ParsedServerEvent::ApprovalRequest(approval))?;
+            count += 1;
+        }
         while count < max_events {
             let Some(frame) = self.websocket.read_text_optional()? else {
                 return Ok(count);
@@ -443,11 +485,15 @@ impl AppServerClient {
             let message = serde_json::from_value::<ServerMessage>(value)
                 .context("decode app-server drain message")?;
             if let ServerMessage::Request(request) = message {
-                self.send_error_response(
-                    request.id,
-                    -32601,
-                    format!("unsupported app-server request: {}", request.method),
-                )?;
+                if let Some(approval) = ApprovalRequest::from_server_request(&request) {
+                    self.enqueue_approval(approval)?;
+                } else {
+                    self.send_error_response(
+                        request.id,
+                        -32601,
+                        format!("unsupported app-server request: {}", request.method),
+                    )?;
+                }
             }
         }
         Ok(count)
@@ -462,13 +508,28 @@ impl AppServerClient {
         P: Serialize,
     {
         let id = self.send_request(method, params)?;
-        self.read_response(method, id)
+        self.read_response(method, id, None, None)
+    }
+
+    fn request_with_approval<P>(
+        &mut self,
+        method: &'static str,
+        params: P,
+        scope: ApprovalScope<'_>,
+        on_approval: &mut impl FnMut(ApprovalRequest) -> Result<Value>,
+    ) -> Result<Value>
+    where
+        P: Serialize,
+    {
+        let id = self.send_request(method, params)?;
+        self.read_response(method, id, Some(scope), Some(on_approval))
     }
 
     fn send_request<P>(&mut self, method: &'static str, params: P) -> Result<u64>
     where
         P: Serialize,
     {
+        self.ensure_open()?;
         let id = self.next_request_id;
         self.next_request_id = self
             .next_request_id
@@ -480,7 +541,13 @@ impl AppServerClient {
         Ok(id)
     }
 
-    fn read_response(&mut self, method: &'static str, id: u64) -> Result<Value> {
+    fn read_response(
+        &mut self,
+        method: &'static str,
+        id: u64,
+        approval_scope: Option<ApprovalScope<'_>>,
+        mut on_approval: Option<&mut dyn FnMut(ApprovalRequest) -> Result<Value>>,
+    ) -> Result<Value> {
         loop {
             let text = self.websocket.read_text()?;
             let message = serde_json::from_str::<ServerMessage>(&text)
@@ -503,18 +570,101 @@ impl AppServerClient {
                 }
                 ServerMessage::Response(_) => {}
                 ServerMessage::Request(request) => {
-                    self.send_error_response(
-                        request.id,
-                        -32601,
-                        format!(
-                            "unsupported app-server request during {method}: {}",
-                            request.method
-                        ),
-                    )?;
+                    if let Some(approval) = ApprovalRequest::from_server_request(&request) {
+                        if approval_scope.is_some_and(|scope| approval.matches_scope(scope)) {
+                            let Some(on_approval) = on_approval.as_deref_mut() else {
+                                self.enqueue_approval(approval)?;
+                                continue;
+                            };
+                            let id = approval.id.clone();
+                            let result = match on_approval(approval) {
+                                Ok(result) => result,
+                                Err(err) => {
+                                    self.send_error_response(
+                                        id,
+                                        -32000,
+                                        format!("approval failed: {err:#}"),
+                                    )?;
+                                    return Err(err);
+                                }
+                            };
+                            self.send_success_response(id, result)?;
+                        } else {
+                            self.enqueue_approval(approval)?;
+                        }
+                    } else {
+                        self.send_error_response(
+                            request.id,
+                            -32601,
+                            format!(
+                                "unsupported app-server request during {method}: {}",
+                                request.method
+                            ),
+                        )?;
+                    }
                 }
                 ServerMessage::Notification { .. } => {}
             }
         }
+    }
+
+    fn handle_queued_approvals(
+        &mut self,
+        scope: ApprovalScope<'_>,
+        on_approval: &mut impl FnMut(ApprovalRequest) -> Result<Value>,
+    ) -> Result<()> {
+        while let Some(approval) = self.pop_queued_approval(scope) {
+            let id = approval.id.clone();
+            let result = match on_approval(approval) {
+                Ok(result) => result,
+                Err(err) => {
+                    self.send_error_response(id, -32000, format!("approval failed: {err:#}"))?;
+                    return Err(err);
+                }
+            };
+            self.send_success_response(id, result)?;
+        }
+        Ok(())
+    }
+
+    fn enqueue_approval(&mut self, approval: ApprovalRequest) -> Result<()> {
+        if self.queued_approvals.len() >= MAX_QUEUED_APPROVALS {
+            return self.close_with_reason(format!(
+                "approval queue is full (limit {MAX_QUEUED_APPROVALS})"
+            ));
+        }
+        self.queued_approvals.push_back(approval);
+        Ok(())
+    }
+
+    fn pop_queued_approval(&mut self, scope: ApprovalScope<'_>) -> Option<ApprovalRequest> {
+        let mut retained = VecDeque::new();
+        let mut found = None;
+        while let Some(approval) = self.queued_approvals.pop_front() {
+            if found.is_none() && approval.matches_scope(scope) {
+                found = Some(approval);
+                break;
+            }
+            retained.push_back(approval);
+        }
+        retained.append(&mut self.queued_approvals);
+        self.queued_approvals = retained;
+        found
+    }
+
+    fn close_with_reason<T>(&mut self, reason: String) -> Result<T> {
+        if self.closed_reason.is_none() {
+            self.closed_reason = Some(reason.clone());
+            let _ = self.websocket.shutdown();
+        }
+        anyhow::bail!("app-server client is closed: {reason}");
+    }
+
+    fn ensure_open(&self) -> Result<()> {
+        if let Some(reason) = self.closed_reason.as_deref() {
+            anyhow::bail!("app-server client is closed: {reason}");
+        }
+        Ok(())
     }
 
     fn collect_turn_start<F>(
@@ -635,24 +785,28 @@ impl AppServerClient {
                 }
                 ServerMessage::Response(_) => {}
                 ServerMessage::Request(request) => {
-                    if is_approval_request_method(&request.method) {
-                        let approval = ApprovalRequest {
-                            id: request.id.clone(),
-                            method: request.method,
-                            params: request.params.unwrap_or(Value::Null),
+                    if let Some(approval) = ApprovalRequest::from_server_request(&request) {
+                        let scope = ApprovalScope {
+                            thread_id,
+                            turn_id: turn_id.as_deref(),
                         };
+                        if !approval.matches_scope(scope) {
+                            self.enqueue_approval(approval)?;
+                            continue;
+                        }
+                        let id = approval.id.clone();
                         let result = match on_approval(approval) {
                             Ok(result) => result,
                             Err(err) => {
                                 self.send_error_response(
-                                    request.id,
+                                    id,
                                     -32000,
                                     format!("approval failed: {err:#}"),
                                 )?;
                                 return Err(err);
                             }
                         };
-                        self.send_success_response(request.id, result)?;
+                        self.send_success_response(id, result)?;
                     } else {
                         self.send_error_response(
                             request.id,
@@ -685,6 +839,32 @@ impl AppServerClient {
         self.websocket.send_text(
             &serde_json::to_string(&response).context("encode app-server error response")?,
         )
+    }
+}
+
+impl ApprovalRequest {
+    fn from_server_request(request: &protocol::ServerRequest) -> Option<Self> {
+        if !is_approval_request_method(&request.method) {
+            return None;
+        }
+        Some(Self {
+            id: request.id.clone(),
+            method: request.method.clone(),
+            params: request.params.clone().unwrap_or(Value::Null),
+        })
+    }
+
+    fn matches_scope(&self, scope: ApprovalScope<'_>) -> bool {
+        if self.params.get("threadId").and_then(Value::as_str) != Some(scope.thread_id) {
+            return false;
+        }
+        match (
+            scope.turn_id,
+            self.params.get("turnId").and_then(Value::as_str),
+        ) {
+            (Some(expected), Some(actual)) => actual == expected,
+            _ => true,
+        }
     }
 }
 
@@ -791,7 +971,10 @@ fn request_params_match_thread(
     if params.get("threadId").and_then(Value::as_str) != Some(thread_id) {
         return false;
     }
-    turn_id.is_none_or(|turn_id| params.get("turnId").and_then(Value::as_str) == Some(turn_id))
+    match (turn_id, params.get("turnId").and_then(Value::as_str)) {
+        (Some(expected), Some(actual)) => actual == expected,
+        _ => true,
+    }
 }
 
 fn notification_delta<'a>(
@@ -1320,6 +1503,18 @@ fn source_kind(source: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::io::ErrorKind;
+    use std::io::Read;
+    use std::io::Write;
+    use std::net::TcpListener;
+    use std::net::TcpStream;
+    use std::sync::mpsc;
+    use std::thread;
+
+    use anyhow::Context as _;
+    use base64::Engine as _;
+    use sha1::Digest as _;
+
     use super::*;
 
     #[test]
@@ -1390,6 +1585,346 @@ mod tests {
             }
             other => panic!("expected server request, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn sync_response_wait_handles_approval_request() {
+        let (listener, url) = listen_ws_url();
+        let (approval_tx, approval_rx) = mpsc::channel();
+        let server = thread::spawn(move || -> Result<()> {
+            let mut stream = accept_client_websocket(listener)?;
+            let steer_request = serde_json::from_str::<Value>(&read_client_text(&mut stream)?)?;
+            assert_eq!(
+                steer_request.get("method").and_then(Value::as_str),
+                Some("turn/steer")
+            );
+            let request_id = steer_request.get("id").cloned().unwrap();
+
+            write_server_text(
+                &mut stream,
+                &json!({
+                    "id": "approval-1",
+                    "method": "item/commandExecution/requestApproval",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "command": "true"
+                    }
+                })
+                .to_string(),
+            )?;
+
+            let approval_response = serde_json::from_str::<Value>(&read_client_text(&mut stream)?)?;
+            approval_tx.send(approval_response).unwrap();
+            write_server_text(
+                &mut stream,
+                &json!({
+                    "id": request_id,
+                    "result": {"turnId": "turn-1"}
+                })
+                .to_string(),
+            )?;
+            Ok(())
+        });
+
+        let mut client = AppServerClient::connect(&url, Duration::from_secs(2)).unwrap();
+        let steered = client
+            .turn_steer_with_approval("thread-1", "turn-1", "continue".to_string(), |approval| {
+                assert_eq!(approval.id, json!("approval-1"));
+                Ok(json!({"decision": "approved"}))
+            })
+            .unwrap();
+
+        assert_eq!(steered.turn_id, "turn-1");
+        let approval_response = approval_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(approval_response.get("id"), Some(&json!("approval-1")));
+        assert_eq!(
+            approval_response
+                .pointer("/result/decision")
+                .and_then(Value::as_str),
+            Some("approved")
+        );
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn sync_response_wait_handles_thread_scoped_approval_during_turn_steer() {
+        let (listener, url) = listen_ws_url();
+        let (approval_tx, approval_rx) = mpsc::channel();
+        let server = thread::spawn(move || -> Result<()> {
+            let mut stream = accept_client_websocket(listener)?;
+            let steer_request = serde_json::from_str::<Value>(&read_client_text(&mut stream)?)?;
+            assert_eq!(
+                steer_request.get("method").and_then(Value::as_str),
+                Some("turn/steer")
+            );
+            let request_id = steer_request.get("id").cloned().unwrap();
+
+            write_server_text(
+                &mut stream,
+                &json!({
+                    "id": "approval-thread",
+                    "method": "item/commandExecution/requestApproval",
+                    "params": {
+                        "threadId": "thread-1",
+                        "command": "true"
+                    }
+                })
+                .to_string(),
+            )?;
+
+            let approval_response = serde_json::from_str::<Value>(&read_client_text(&mut stream)?)?;
+            approval_tx.send(approval_response).unwrap();
+            write_server_text(
+                &mut stream,
+                &json!({
+                    "id": request_id,
+                    "result": {"turnId": "turn-1"}
+                })
+                .to_string(),
+            )?;
+            Ok(())
+        });
+
+        let mut client = AppServerClient::connect(&url, Duration::from_secs(2)).unwrap();
+        let steered = client
+            .turn_steer_with_approval("thread-1", "turn-1", "continue".to_string(), |approval| {
+                assert_eq!(approval.id, json!("approval-thread"));
+                assert_eq!(approval.params.get("turnId"), None);
+                Ok(json!({"decision": "approved"}))
+            })
+            .unwrap();
+
+        assert_eq!(steered.turn_id, "turn-1");
+        let approval_response = approval_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(approval_response.get("id"), Some(&json!("approval-thread")));
+        assert_eq!(
+            approval_response
+                .pointer("/result/decision")
+                .and_then(Value::as_str),
+            Some("approved")
+        );
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn sync_response_wait_queues_cross_thread_approval() {
+        let (listener, url) = listen_ws_url();
+        let (queued_response_tx, queued_response_rx) = mpsc::channel();
+        let server = thread::spawn(move || -> Result<()> {
+            let mut stream = accept_client_websocket(listener)?;
+            let steer_request = serde_json::from_str::<Value>(&read_client_text(&mut stream)?)?;
+            assert_eq!(
+                steer_request.get("method").and_then(Value::as_str),
+                Some("turn/steer")
+            );
+            let request_id = steer_request.get("id").cloned().unwrap();
+
+            write_server_text(
+                &mut stream,
+                &json!({
+                    "id": "approval-b",
+                    "method": "item/commandExecution/requestApproval",
+                    "params": {
+                        "threadId": "thread-b",
+                        "turnId": "turn-b",
+                        "command": "false"
+                    }
+                })
+                .to_string(),
+            )?;
+            stream.set_read_timeout(Some(Duration::from_millis(200)))?;
+            let cross_thread_response = read_client_text_optional(&mut stream)?;
+            anyhow::ensure!(
+                cross_thread_response.is_none(),
+                "cross-thread approval was answered during turn/steer: {cross_thread_response:?}"
+            );
+            stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+
+            write_server_text(
+                &mut stream,
+                &json!({
+                    "id": "approval-a",
+                    "method": "item/commandExecution/requestApproval",
+                    "params": {
+                        "threadId": "thread-a",
+                        "turnId": "turn-a",
+                        "command": "true"
+                    }
+                })
+                .to_string(),
+            )?;
+            let approval_a_response =
+                serde_json::from_str::<Value>(&read_client_text(&mut stream)?)?;
+            assert_eq!(approval_a_response.get("id"), Some(&json!("approval-a")));
+
+            write_server_text(
+                &mut stream,
+                &json!({
+                    "id": request_id,
+                    "result": {"turnId": "turn-a"}
+                })
+                .to_string(),
+            )?;
+
+            let approval_b_response =
+                serde_json::from_str::<Value>(&read_client_text(&mut stream)?)?;
+            queued_response_tx.send(approval_b_response).unwrap();
+            Ok(())
+        });
+
+        let mut client = AppServerClient::connect(&url, Duration::from_secs(2)).unwrap();
+        let mut handled_ids = Vec::new();
+        let steered = client
+            .turn_steer_with_approval("thread-a", "turn-a", "continue".to_string(), |approval| {
+                handled_ids.push(approval.id.clone());
+                Ok(json!({"decision": "approved-a"}))
+            })
+            .unwrap();
+        assert_eq!(steered.turn_id, "turn-a");
+        assert_eq!(handled_ids, vec![json!("approval-a")]);
+
+        let mut drained_ids = Vec::new();
+        let drained = client
+            .drain_thread_events(
+                "thread-b",
+                Some("turn-b"),
+                1,
+                |event| {
+                    if let ParsedServerEvent::ApprovalRequest(approval) = event {
+                        drained_ids.push(approval.id);
+                    }
+                    Ok(())
+                },
+                |approval| {
+                    assert_eq!(approval.id, json!("approval-b"));
+                    Ok(Some(json!({"decision": "approved-b"})))
+                },
+            )
+            .unwrap();
+
+        assert_eq!(drained, 1);
+        assert_eq!(drained_ids, vec![json!("approval-b")]);
+        let queued_response = queued_response_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(queued_response.get("id"), Some(&json!("approval-b")));
+        assert_eq!(
+            queued_response
+                .pointer("/result/decision")
+                .and_then(Value::as_str),
+            Some("approved-b")
+        );
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn sync_response_wait_queues_approval_request_without_rejecting() {
+        let (listener, url) = listen_ws_url();
+        let (extra_tx, extra_rx) = mpsc::channel();
+        let server = thread::spawn(move || -> Result<()> {
+            let mut stream = accept_client_websocket(listener)?;
+            let list_request = serde_json::from_str::<Value>(&read_client_text(&mut stream)?)?;
+            assert_eq!(
+                list_request.get("method").and_then(Value::as_str),
+                Some("thread/list")
+            );
+            let request_id = list_request.get("id").cloned().unwrap();
+
+            write_server_text(
+                &mut stream,
+                &json!({
+                    "id": "approval-queued",
+                    "method": "item/commandExecution/requestApproval",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "command": "true"
+                    }
+                })
+                .to_string(),
+            )?;
+            write_server_text(
+                &mut stream,
+                &json!({
+                    "id": request_id,
+                    "result": {
+                        "data": [],
+                        "nextCursor": null,
+                        "backwardsCursor": null
+                    }
+                })
+                .to_string(),
+            )?;
+
+            stream.set_read_timeout(Some(Duration::from_millis(200)))?;
+            extra_tx
+                .send(read_client_text_optional(&mut stream)?)
+                .unwrap();
+            Ok(())
+        });
+
+        let mut client = AppServerClient::connect(&url, Duration::from_secs(2)).unwrap();
+        let info = client.thread_list_probe().unwrap();
+        drop(client);
+
+        assert_eq!(info.thread_count, 0);
+        assert_eq!(extra_rx.recv_timeout(Duration::from_secs(2)).unwrap(), None);
+        server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn queued_approval_limit_disconnects_without_approval_response() {
+        let (listener, url) = listen_ws_url();
+        let (response_tx, response_rx) = mpsc::channel();
+        let server = thread::spawn(move || -> Result<()> {
+            let mut stream = accept_client_websocket(listener)?;
+            let list_request = serde_json::from_str::<Value>(&read_client_text(&mut stream)?)?;
+            assert_eq!(
+                list_request.get("method").and_then(Value::as_str),
+                Some("thread/list")
+            );
+
+            for index in 0..=MAX_QUEUED_APPROVALS {
+                write_server_text(
+                    &mut stream,
+                    &json!({
+                        "id": format!("approval-{index}"),
+                        "method": "item/commandExecution/requestApproval",
+                        "params": {
+                            "threadId": "thread-overflow",
+                            "turnId": "turn-overflow",
+                            "command": "true"
+                        }
+                    })
+                    .to_string(),
+                )?;
+            }
+
+            stream.set_read_timeout(Some(Duration::from_millis(200)))?;
+            response_tx
+                .send(read_client_text_optional(&mut stream)?)
+                .unwrap();
+            Ok(())
+        });
+
+        let mut client = AppServerClient::connect(&url, Duration::from_secs(2)).unwrap();
+        let err = client.thread_list_probe().unwrap_err();
+
+        assert!(
+            format!("{err:#}").contains("approval queue is full"),
+            "unexpected error: {err:#}"
+        );
+        let retry_err = client.thread_list_probe().unwrap_err();
+        assert!(
+            format!("{retry_err:#}").contains("app-server client is closed"),
+            "unexpected retry error: {retry_err:#}"
+        );
+        assert_eq!(
+            response_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            None
+        );
+        server.join().unwrap().unwrap();
     }
 
     #[test]
@@ -1672,5 +2207,117 @@ mod tests {
                 "Plan update".to_string()
             )))
         );
+    }
+
+    fn listen_ws_url() -> (TcpListener, String) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        (listener, format!("ws://127.0.0.1:{port}"))
+    }
+
+    fn accept_client_websocket(listener: TcpListener) -> Result<TcpStream> {
+        let (mut stream, _addr) = listener.accept().context("accept app-server client")?;
+        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+        let request = read_http_head(&mut stream)?;
+        let key = request
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("sec-websocket-key")
+                    .then(|| value.trim())
+            })
+            .context("missing websocket key")?;
+        let response = format!(
+            "HTTP/1.1 101 Switching Protocols\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Accept: {}\r\n\
+             \r\n",
+            websocket_accept(key)
+        );
+        stream.write_all(response.as_bytes())?;
+        Ok(stream)
+    }
+
+    fn read_http_head(stream: &mut TcpStream) -> Result<String> {
+        let mut bytes = Vec::new();
+        loop {
+            let mut byte = [0_u8; 1];
+            stream.read_exact(&mut byte)?;
+            bytes.push(byte[0]);
+            if bytes.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        String::from_utf8(bytes).context("decode websocket request")
+    }
+
+    fn websocket_accept(key: &str) -> String {
+        let mut hasher = sha1::Sha1::new();
+        hasher.update(key.as_bytes());
+        hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+        base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
+    }
+
+    fn write_server_text(stream: &mut TcpStream, text: &str) -> Result<()> {
+        let payload = text.as_bytes();
+        let mut frame = vec![0x81];
+        match payload.len() {
+            len if len < 126 => frame.push(len as u8),
+            len if len <= u16::MAX as usize => {
+                frame.push(126);
+                frame.extend_from_slice(&(len as u16).to_be_bytes());
+            }
+            len => {
+                frame.push(127);
+                frame.extend_from_slice(&(len as u64).to_be_bytes());
+            }
+        }
+        frame.extend_from_slice(payload);
+        stream.write_all(&frame)?;
+        Ok(())
+    }
+
+    fn read_client_text(stream: &mut TcpStream) -> Result<String> {
+        read_client_text_optional(stream)?.context("timed out waiting for client websocket text")
+    }
+
+    fn read_client_text_optional(stream: &mut TcpStream) -> Result<Option<String>> {
+        let mut header = [0_u8; 2];
+        match stream.read_exact(&mut header) {
+            Ok(()) => {}
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    ErrorKind::UnexpectedEof | ErrorKind::TimedOut | ErrorKind::WouldBlock
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(err) => return Err(err).context("read websocket frame header"),
+        }
+        anyhow::ensure!(header[0] & 0x0f == 0x1, "expected websocket text frame");
+        anyhow::ensure!(header[1] & 0x80 != 0, "expected masked client frame");
+        let mut len = u64::from(header[1] & 0x7f);
+        if len == 126 {
+            let mut extended = [0_u8; 2];
+            stream.read_exact(&mut extended)?;
+            len = u64::from(u16::from_be_bytes(extended));
+        } else if len == 127 {
+            let mut extended = [0_u8; 8];
+            stream.read_exact(&mut extended)?;
+            len = u64::from_be_bytes(extended);
+        }
+        let mut mask = [0_u8; 4];
+        stream.read_exact(&mut mask)?;
+        let mut payload = vec![0_u8; len as usize];
+        stream.read_exact(&mut payload)?;
+        for (index, byte) in payload.iter_mut().enumerate() {
+            *byte ^= mask[index % mask.len()];
+        }
+        String::from_utf8(payload)
+            .map(Some)
+            .context("decode websocket text")
     }
 }

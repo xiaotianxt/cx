@@ -2411,7 +2411,13 @@ fn run_codex_turn(
         );
     }
     if let Some(active_turn_id) = client.active_turn_id(&thread_id)? {
-        let steered = client.turn_steer(&thread_id, &active_turn_id, prompt)?;
+        let steered =
+            client.turn_steer_with_approval(&thread_id, &active_turn_id, prompt, |approval| {
+                let Some(notifier) = notifier else {
+                    anyhow::bail!("app-server requested approval but Telegram is unavailable");
+                };
+                handle_app_server_approval(paths, state, notifier, route, approval, timeout_secs)
+            })?;
         return Ok(CodexTurnOutput {
             assistant_text: format!("Sent to active Codex turn {}.", steered.turn_id),
             streamed_to_telegram: false,

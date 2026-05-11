@@ -1,5 +1,7 @@
 mod app_server;
+mod approval;
 mod auth;
+mod broker;
 mod channel;
 mod cli;
 mod completion;
@@ -12,6 +14,7 @@ mod output;
 mod paths;
 mod protocol_export;
 mod rate_limit;
+mod router;
 mod run;
 mod selector;
 mod serve;
@@ -19,10 +22,13 @@ mod service;
 mod session;
 mod slot;
 mod stats;
+mod subscription;
 mod target;
+mod thread_directory;
 mod thread_resolver;
 mod transfer;
 mod usage;
+mod worker_pool;
 
 use std::process::ExitCode;
 

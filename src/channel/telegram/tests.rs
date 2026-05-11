@@ -144,6 +144,51 @@ fn release_reports_missing_binding() {
 }
 
 #[test]
+fn resolved_resume_cwd_uses_rebound_session_cwd_before_snapshot_cwd() {
+    let paths = temp_paths("resolved-resume-cwd");
+    let channel_id = ChannelId::parse("telegram:42").unwrap();
+    let session = session::create_session(
+        &paths,
+        session::CreateSessionRequest {
+            session_id: Some(SessionId::parse("sess_manual").unwrap()),
+            channel_id: channel_id.clone(),
+        },
+    )
+    .unwrap()
+    .session;
+    session::bind_app_thread(
+        &paths,
+        session::BindAppThreadRequest {
+            session_id: session.session_id.clone(),
+            app_thread: session::AppThreadBinding {
+                thread_id: "thread-new".to_string(),
+                codex_session_id: None,
+                cwd: "/repo/new".to_string(),
+                title: None,
+                slot: None,
+                generation: 0,
+                path: None,
+                updated_at_unix: 10,
+            },
+        },
+    )
+    .unwrap();
+    let mut binding = manual_binding(42, None);
+    binding.channel_id = channel_id;
+    binding.app_thread_id = Some("thread-old".to_string());
+    binding.app_thread_cwd = Some("/repo/old".to_string());
+
+    assert_eq!(
+        resolved_resume_cwd(&paths, &binding, "thread-new").as_deref(),
+        Some("/repo/new")
+    );
+    assert_eq!(
+        resolved_resume_cwd(&paths, &binding, "thread-other").as_deref(),
+        Some("/repo/old")
+    );
+}
+
+#[test]
 fn bind_command_trusts_matching_secret_for_unknown_chat() {
     let state = TelegramState::empty();
     let trusted = BTreeSet::new();
@@ -261,6 +306,7 @@ fn app_server_threads_are_watchable_even_when_not_loaded() {
         status: "notLoaded".to_string(),
         created_at_unix: 1,
         updated_at_unix: 2,
+        broker_subscriber_count: None,
     });
 
     assert!(entry.watchable);
@@ -501,6 +547,7 @@ fn status_panel_state_throttles_active_edit_across_drains() {
 
     assert!(!restored.flush(&target, false).unwrap());
     assert_eq!(target.sent.borrow().len(), 1);
+    assert!(target.sent.borrow()[0].contains("Working"));
     assert!(target.edited.borrow().is_empty());
 }
 

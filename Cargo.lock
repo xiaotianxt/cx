@@ -242,6 +242,7 @@ dependencies = [
  "clap",
  "crossterm",
  "libc",
+ "mio",
  "portable-pty",
  "reqwest",
  "rusqlite",

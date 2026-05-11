@@ -127,6 +127,8 @@ pub(super) struct ThreadSummary {
     pub updated_at: i64,
     #[serde(default)]
     pub turns: Vec<Value>,
+    #[serde(default)]
+    pub broker_subscriber_count: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]

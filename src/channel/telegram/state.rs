@@ -261,6 +261,7 @@ impl TelegramState {
                 session_id: binding.session_id.clone(),
                 app_thread: AppThreadBinding {
                     thread_id: app_thread.thread_id.clone(),
+                    codex_session_id: None,
                     cwd: app_thread.cwd.clone(),
                     title: app_thread.title.clone(),
                     slot: None,

@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::Context;
@@ -23,9 +24,32 @@ const INTERACTIVE_SOURCE_KINDS: &[&str] = &["cli", "vscode"];
 pub(crate) struct ThreadResolverScope {
     pub(crate) cwd: PathBuf,
     pub(crate) channel_id: Option<ChannelId>,
-    pub(crate) explicit_thread_id: Option<String>,
+    pub(crate) explicit_resume_id: Option<ExplicitResumeId>,
     pub(crate) slot: Option<String>,
     pub(crate) generation: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExplicitResumeId {
+    CxSession(SessionId),
+    AppThreadOrCodexSession(String),
+}
+
+impl ExplicitResumeId {
+    pub(crate) fn parse(raw: impl Into<String>) -> Self {
+        let raw = raw.into();
+        match SessionId::parse(raw.clone()) {
+            Ok(session_id) => Self::CxSession(session_id),
+            Err(_) => Self::AppThreadOrCodexSession(raw),
+        }
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        match self {
+            Self::CxSession(session_id) => session_id.as_str(),
+            Self::AppThreadOrCodexSession(id) => id,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,36 +108,71 @@ pub(crate) fn resolve_app_thread<C: ThreadResolverClient>(
     scope: ThreadResolverScope,
 ) -> Result<ThreadResolverOutcome> {
     let cwd = workspace_string(&scope.cwd);
+    let default_terminal_channel = scope.channel_id.is_none();
     let channel_id = match scope.channel_id {
         Some(ref channel_id) => channel_id.clone(),
         None => ChannelId::parse("terminal")?,
     };
 
-    if let Some(thread_id) = scope.explicit_thread_id.as_deref() {
-        return resolve_explicit_thread(paths, client, &scope, &channel_id, &cwd, thread_id);
+    if let Some(explicit_resume_id) = scope.explicit_resume_id.as_ref() {
+        return resolve_explicit_resume(
+            paths,
+            client,
+            &scope,
+            &channel_id,
+            &cwd,
+            explicit_resume_id,
+            default_terminal_channel,
+        );
     }
 
-    if let Some(session) = session::find_session_by_channel(paths, &channel_id)? {
+    let mut cwd_threads = None;
+    if let Some(session) = find_channel_session(paths, &channel_id, &cwd, default_terminal_channel)?
+    {
+        if !session_allows_auto_attach(client, &mut cwd_threads, &cwd, &session)? {
+            return start_new_thread(
+                paths,
+                client,
+                &scope,
+                &channel_id,
+                &cwd,
+                default_terminal_channel,
+            );
+        }
         if let Some(outcome) = attach_session_thread(paths, client, &scope, &session, &cwd, None)? {
             return Ok(outcome);
         }
     }
 
     if let Some(session) = session::find_session_by_app_thread_cwd(paths, &cwd)? {
+        if !session_allows_auto_attach(client, &mut cwd_threads, &cwd, &session)? {
+            return start_new_thread(
+                paths,
+                client,
+                &scope,
+                &channel_id,
+                &cwd,
+                default_terminal_channel,
+            );
+        }
         if let Some(outcome) = attach_session_thread(paths, client, &scope, &session, &cwd, None)? {
             return Ok(outcome);
         }
     }
 
-    let page = client.thread_list_filtered(ThreadListFilter {
-        limit: 50,
-        cwd: Some(&cwd),
-        archived: Some(false),
-        source_kinds: Some(INTERACTIVE_SOURCE_KINDS),
-        use_state_db_only: false,
-    })?;
-    if let Some(summary) = select_best_thread(page.threads) {
-        let session = ensure_session(paths, &channel_id)?;
+    let threads = take_or_fetch_cwd_threads(client, &mut cwd_threads, &cwd)?;
+    if let Some(summary) = select_best_thread(threads) {
+        if !summary_allows_auto_attach(&summary) {
+            return start_new_thread(
+                paths,
+                client,
+                &scope,
+                &channel_id,
+                &cwd,
+                default_terminal_channel,
+            );
+        }
+        let session = ensure_session(paths, &channel_id, &cwd, default_terminal_channel)?;
         let _session = bind_summary(
             paths,
             session.session_id.clone(),
@@ -129,7 +188,25 @@ pub(crate) fn resolve_app_thread<C: ThreadResolverClient>(
         });
     }
 
-    let started = client.thread_start(Some(&cwd))?;
+    start_new_thread(
+        paths,
+        client,
+        &scope,
+        &channel_id,
+        &cwd,
+        default_terminal_channel,
+    )
+}
+
+fn start_new_thread(
+    paths: &ManagerPaths,
+    client: &mut impl ThreadResolverClient,
+    scope: &ThreadResolverScope,
+    channel_id: &ChannelId,
+    cwd: &str,
+    default_terminal_channel: bool,
+) -> Result<ThreadResolverOutcome> {
+    let started = client.thread_start(Some(cwd))?;
     let read = client
         .thread_read(&started.upstream_thread_id, false)
         .with_context(|| {
@@ -138,31 +215,150 @@ pub(crate) fn resolve_app_thread<C: ThreadResolverClient>(
                 started.upstream_thread_id
             )
         })?;
-    let session = ensure_session(paths, &channel_id)?;
+    let session = ensure_session(paths, channel_id, cwd, default_terminal_channel)?;
     let _session = bind_summary(
         paths,
         session.session_id.clone(),
         &read.summary,
-        &scope,
-        Some(&cwd),
+        scope,
+        Some(cwd),
     )?;
     Ok(ThreadResolverOutcome {
-        decision: ThreadResolverDecision::StartNew { cwd },
+        decision: ThreadResolverDecision::StartNew {
+            cwd: cwd.to_string(),
+        },
         thread_id: Some(read.summary.upstream_thread_id),
     })
 }
 
-fn resolve_explicit_thread(
+fn session_allows_auto_attach(
+    client: &mut impl ThreadResolverClient,
+    cwd_threads: &mut Option<Vec<AppThreadSummary>>,
+    cwd: &str,
+    session: &session::SessionRecord,
+) -> Result<bool> {
+    let Some(app_thread) = session.app_thread.as_ref() else {
+        return Ok(true);
+    };
+    auto_attach_allowed_for_thread(client, cwd_threads, cwd, &app_thread.thread_id)
+}
+
+fn auto_attach_allowed_for_thread(
+    client: &mut impl ThreadResolverClient,
+    cwd_threads: &mut Option<Vec<AppThreadSummary>>,
+    cwd: &str,
+    thread_id: &str,
+) -> Result<bool> {
+    let threads = fetch_cwd_threads(client, cwd_threads, cwd)?;
+    Ok(threads
+        .iter()
+        .find(|summary| summary.upstream_thread_id == thread_id)
+        .is_none_or(summary_allows_auto_attach))
+}
+
+fn take_or_fetch_cwd_threads(
+    client: &mut impl ThreadResolverClient,
+    cwd_threads: &mut Option<Vec<AppThreadSummary>>,
+    cwd: &str,
+) -> Result<Vec<AppThreadSummary>> {
+    if cwd_threads.is_none() {
+        *cwd_threads = Some(list_cwd_threads(client, cwd)?);
+    }
+    Ok(cwd_threads.take().unwrap_or_default())
+}
+
+fn fetch_cwd_threads<'a>(
+    client: &mut impl ThreadResolverClient,
+    cwd_threads: &'a mut Option<Vec<AppThreadSummary>>,
+    cwd: &str,
+) -> Result<&'a [AppThreadSummary]> {
+    if cwd_threads.is_none() {
+        *cwd_threads = Some(list_cwd_threads(client, cwd)?);
+    }
+    Ok(cwd_threads.as_deref().unwrap_or(&[]))
+}
+
+fn list_cwd_threads(
+    client: &mut impl ThreadResolverClient,
+    cwd: &str,
+) -> Result<Vec<AppThreadSummary>> {
+    Ok(client
+        .thread_list_filtered(ThreadListFilter {
+            limit: 50,
+            cwd: Some(cwd),
+            archived: Some(false),
+            source_kinds: Some(INTERACTIVE_SOURCE_KINDS),
+            use_state_db_only: false,
+        })?
+        .threads)
+}
+
+fn summary_allows_auto_attach(summary: &AppThreadSummary) -> bool {
+    summary.broker_subscriber_count.unwrap_or(0) == 0
+}
+
+fn resolve_explicit_resume(
     paths: &ManagerPaths,
     client: &mut impl ThreadResolverClient,
     scope: &ThreadResolverScope,
     channel_id: &ChannelId,
     cwd: &str,
-    thread_id: &str,
+    explicit_resume_id: &ExplicitResumeId,
+    default_terminal_channel: bool,
 ) -> Result<ThreadResolverOutcome> {
-    match client.thread_read(thread_id, false) {
+    match explicit_resume_id {
+        ExplicitResumeId::CxSession(session_id) => {
+            if !paths.serve_session_file(session_id.as_str()).exists() {
+                return resolve_explicit_app_or_codex_id(
+                    paths,
+                    client,
+                    scope,
+                    channel_id,
+                    cwd,
+                    session_id.as_str(),
+                    default_terminal_channel,
+                );
+            }
+            let session = session::show_session(paths, session_id)?;
+            if let Some(outcome) = attach_session_thread(paths, client, scope, &session, cwd, None)?
+            {
+                return Ok(outcome);
+            }
+            Ok(ThreadResolverOutcome {
+                decision: ThreadResolverDecision::Refuse {
+                    reason: format!(
+                        "cx session {session_id} has no readable or resumable app-server thread"
+                    ),
+                },
+                thread_id: None,
+            })
+        }
+        ExplicitResumeId::AppThreadOrCodexSession(thread_or_session_id) => {
+            resolve_explicit_app_or_codex_id(
+                paths,
+                client,
+                scope,
+                channel_id,
+                cwd,
+                thread_or_session_id,
+                default_terminal_channel,
+            )
+        }
+    }
+}
+
+fn resolve_explicit_app_or_codex_id(
+    paths: &ManagerPaths,
+    client: &mut impl ThreadResolverClient,
+    scope: &ThreadResolverScope,
+    channel_id: &ChannelId,
+    cwd: &str,
+    thread_or_session_id: &str,
+    default_terminal_channel: bool,
+) -> Result<ThreadResolverOutcome> {
+    match client.thread_read(thread_or_session_id, false) {
         Ok(read) => {
-            let session = ensure_session(paths, channel_id)?;
+            let session = ensure_session(paths, channel_id, cwd, default_terminal_channel)?;
             let _session = bind_summary(
                 paths,
                 session.session_id.clone(),
@@ -178,27 +374,34 @@ fn resolve_explicit_thread(
             })
         }
         Err(read_err) => {
-            let session = session::find_session_by_app_thread_id(paths, thread_id)?
-                .or_else(|| {
-                    session::find_session_by_channel(paths, channel_id)
-                        .ok()
-                        .flatten()
-                })
-                .or_else(|| {
-                    session::find_session_by_app_thread_cwd(paths, cwd)
-                        .ok()
-                        .flatten()
-                });
+            let (session, requested_thread_id) = if let Some(session) =
+                session::find_session_by_app_thread_id(paths, thread_or_session_id)?
+            {
+                (Some(session), Some(thread_or_session_id))
+            } else if let Some(session) =
+                session::find_session_by_app_thread_codex_session_id(paths, thread_or_session_id)?
+            {
+                (Some(session), None)
+            } else if let Some(session) =
+                find_channel_session(paths, channel_id, cwd, default_terminal_channel)?
+            {
+                (Some(session), Some(thread_or_session_id))
+            } else {
+                (
+                    session::find_session_by_app_thread_cwd(paths, cwd)?,
+                    Some(thread_or_session_id),
+                )
+            };
             if let Some(session) = session {
                 if let Some(outcome) =
-                    attach_session_thread(paths, client, scope, &session, cwd, Some(thread_id))?
+                    attach_session_thread(paths, client, scope, &session, cwd, requested_thread_id)?
                 {
                     return Ok(outcome);
                 }
             }
             Ok(ThreadResolverOutcome {
                 decision: ThreadResolverDecision::Refuse {
-                    reason: format!("explicit thread {thread_id} is not readable and no resumable path is bound: {read_err:#}"),
+                    reason: format!("explicit app thread or Codex session {thread_or_session_id} is not readable and no resumable path is bound: {read_err:#}"),
                 },
                 thread_id: None,
             })
@@ -242,8 +445,25 @@ fn attach_session_thread(
     }))
 }
 
-fn ensure_session(paths: &ManagerPaths, channel_id: &ChannelId) -> Result<session::SessionRecord> {
-    if let Some(session) = session::find_session_by_channel(paths, channel_id)? {
+fn find_channel_session(
+    paths: &ManagerPaths,
+    channel_id: &ChannelId,
+    cwd: &str,
+    default_terminal_channel: bool,
+) -> Result<Option<session::SessionRecord>> {
+    if default_terminal_channel {
+        return session::find_session_by_channel_and_app_thread_cwd(paths, channel_id, cwd);
+    }
+    session::find_session_by_channel(paths, channel_id)
+}
+
+fn ensure_session(
+    paths: &ManagerPaths,
+    channel_id: &ChannelId,
+    cwd: &str,
+    default_terminal_channel: bool,
+) -> Result<session::SessionRecord> {
+    if let Some(session) = find_channel_session(paths, channel_id, cwd, default_terminal_channel)? {
         return Ok(session);
     }
     Ok(session::create_session(
@@ -269,9 +489,11 @@ fn bind_summary(
             session_id,
             app_thread: AppThreadBinding {
                 thread_id: summary.upstream_thread_id.clone(),
+                codex_session_id: summary.session_id.clone(),
                 cwd: cwd_override.unwrap_or(&summary.cwd).to_string(),
                 title: summary.title.clone(),
-                slot: scope.slot.clone(),
+                slot: slot_from_thread_path(paths, summary.path.as_deref())
+                    .or_else(|| real_slot(scope.slot.clone())),
                 generation: scope.generation,
                 path: summary.path.clone(),
                 updated_at_unix: summary.updated_at_unix.max(0) as u64,
@@ -282,6 +504,21 @@ fn bind_summary(
 
 fn workspace_string(cwd: &std::path::Path) -> String {
     cwd.to_string_lossy().to_string()
+}
+
+fn real_slot(slot: Option<String>) -> Option<String> {
+    slot.filter(|slot| slot != "broker")
+}
+
+fn slot_from_thread_path(paths: &ManagerPaths, path: Option<&str>) -> Option<String> {
+    let path = Path::new(path?);
+    let relative = path.strip_prefix(&paths.slots_dir).ok()?;
+    let mut components = relative.components();
+    let slot = components.next()?.as_os_str().to_str()?;
+    let home = components.next()?.as_os_str().to_str()?;
+    (home == "home")
+        .then(|| slot.to_string())
+        .and_then(|slot| real_slot(Some(slot)))
 }
 
 pub(crate) fn select_best_thread(threads: Vec<AppThreadSummary>) -> Option<AppThreadSummary> {
@@ -316,6 +553,18 @@ mod tests {
         summary_with_path(id, cwd, status, updated_at_unix, None)
     }
 
+    fn summary_with_subscribers(
+        id: &str,
+        cwd: &str,
+        status: &str,
+        updated_at_unix: i64,
+        broker_subscriber_count: usize,
+    ) -> AppThreadSummary {
+        let mut summary = summary(id, cwd, status, updated_at_unix);
+        summary.broker_subscriber_count = Some(broker_subscriber_count);
+        summary
+    }
+
     fn summary_with_path(
         id: &str,
         cwd: &str,
@@ -336,6 +585,7 @@ mod tests {
             active: status == "active",
             created_at_unix: 0,
             updated_at_unix,
+            broker_subscriber_count: None,
         }
     }
 
@@ -345,6 +595,7 @@ mod tests {
         listed: Vec<AppThreadSummary>,
         started: Option<StartedThread>,
         resume_result: Option<AppThreadSummary>,
+        read_calls: Vec<String>,
         resume_calls: Vec<(String, Option<String>, Option<String>, bool)>,
     }
 
@@ -369,6 +620,7 @@ mod tests {
         }
 
         fn thread_read(&mut self, thread_id: &str, _include_turns: bool) -> Result<AppThreadRead> {
+            self.read_calls.push(thread_id.to_string());
             self.readable
                 .get(thread_id)
                 .cloned()
@@ -448,6 +700,213 @@ mod tests {
     }
 
     #[test]
+    fn auto_resume_skips_bound_thread_with_subscribers() {
+        let paths = temp_paths("skip-subscribed-bound");
+        let channel_id = ChannelId::parse("terminal").unwrap();
+        let session = session::create_session(
+            &paths,
+            CreateSessionRequest {
+                session_id: None,
+                channel_id: channel_id.clone(),
+            },
+        )
+        .unwrap()
+        .session;
+        session::bind_app_thread(
+            &paths,
+            BindAppThreadRequest {
+                session_id: session.session_id,
+                app_thread: AppThreadBinding {
+                    thread_id: "thread-1".to_string(),
+                    codex_session_id: None,
+                    cwd: "/tmp/project".to_string(),
+                    title: None,
+                    slot: Some("slot-a".to_string()),
+                    generation: 1,
+                    path: Some("/tmp/thread-1.jsonl".to_string()),
+                    updated_at_unix: 10,
+                },
+            },
+        )
+        .unwrap();
+        let mut readable = BTreeMap::new();
+        readable.insert(
+            "started".to_string(),
+            summary("started", "/tmp/project", "idle", 20),
+        );
+        let mut client = FakeResolverClient {
+            readable,
+            listed: vec![summary_with_subscribers(
+                "thread-1",
+                "/tmp/project",
+                "active",
+                10,
+                1,
+            )],
+            ..FakeResolverClient::default()
+        };
+
+        let outcome = resolve_app_thread(
+            &paths,
+            &mut client,
+            ThreadResolverScope {
+                cwd: PathBuf::from("/tmp/project"),
+                channel_id: Some(channel_id),
+                explicit_resume_id: None,
+                slot: Some("slot-b".to_string()),
+                generation: 2,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.decision,
+            ThreadResolverDecision::StartNew {
+                cwd: "/tmp/project".to_string()
+            }
+        );
+        assert_eq!(client.read_calls, vec!["started"]);
+    }
+
+    #[test]
+    fn auto_resume_allows_bound_thread_without_subscribers() {
+        let paths = temp_paths("allow-unsubscribed-bound");
+        let channel_id = ChannelId::parse("terminal").unwrap();
+        let session = session::create_session(
+            &paths,
+            CreateSessionRequest {
+                session_id: None,
+                channel_id: channel_id.clone(),
+            },
+        )
+        .unwrap()
+        .session;
+        session::bind_app_thread(
+            &paths,
+            BindAppThreadRequest {
+                session_id: session.session_id,
+                app_thread: AppThreadBinding {
+                    thread_id: "thread-1".to_string(),
+                    codex_session_id: None,
+                    cwd: "/tmp/project".to_string(),
+                    title: None,
+                    slot: Some("slot-a".to_string()),
+                    generation: 1,
+                    path: Some("/tmp/thread-1.jsonl".to_string()),
+                    updated_at_unix: 10,
+                },
+            },
+        )
+        .unwrap();
+        let mut readable = BTreeMap::new();
+        readable.insert(
+            "thread-1".to_string(),
+            summary("thread-1", "/tmp/project", "idle", 10),
+        );
+        let mut client = FakeResolverClient {
+            readable,
+            listed: vec![summary_with_subscribers(
+                "thread-1",
+                "/tmp/project",
+                "idle",
+                10,
+                0,
+            )],
+            ..FakeResolverClient::default()
+        };
+
+        let outcome = resolve_app_thread(
+            &paths,
+            &mut client,
+            ThreadResolverScope {
+                cwd: PathBuf::from("/tmp/project"),
+                channel_id: Some(channel_id),
+                explicit_resume_id: None,
+                slot: Some("slot-b".to_string()),
+                generation: 2,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.decision,
+            ThreadResolverDecision::AttachExisting {
+                thread_id: "thread-1".to_string()
+            }
+        );
+        assert_eq!(client.read_calls, vec!["thread-1"]);
+    }
+
+    #[test]
+    fn auto_resume_skips_best_thread_with_subscribers() {
+        let paths = temp_paths("skip-subscribed-list");
+        let mut readable = BTreeMap::new();
+        readable.insert(
+            "started".to_string(),
+            summary("started", "/tmp/project", "idle", 20),
+        );
+        let mut client = FakeResolverClient {
+            readable,
+            listed: vec![summary_with_subscribers(
+                "thread-1",
+                "/tmp/project",
+                "active",
+                10,
+                1,
+            )],
+            ..FakeResolverClient::default()
+        };
+
+        let outcome = resolve_app_thread(
+            &paths,
+            &mut client,
+            ThreadResolverScope {
+                cwd: PathBuf::from("/tmp/project"),
+                channel_id: None,
+                explicit_resume_id: None,
+                slot: Some("slot-b".to_string()),
+                generation: 2,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.decision,
+            ThreadResolverDecision::StartNew {
+                cwd: "/tmp/project".to_string()
+            }
+        );
+        assert_eq!(client.read_calls, vec!["started"]);
+    }
+
+    #[test]
+    fn broker_registration_is_not_persisted_as_slot() {
+        assert_eq!(real_slot(Some("broker".to_string())), None);
+        assert_eq!(
+            real_slot(Some("dia4".to_string())),
+            Some("dia4".to_string())
+        );
+    }
+
+    #[test]
+    fn slot_from_thread_path_prefers_rollout_path_slot() {
+        let paths = temp_paths("slot-from-thread-path");
+        let rollout_path = paths
+            .slot_home("dia1")
+            .join("sessions/2026/05/08/rollout-thread.jsonl");
+        let unrelated_path = paths
+            .base_codex_home
+            .join("sessions/2026/05/08/rollout-thread.jsonl");
+
+        assert_eq!(
+            slot_from_thread_path(&paths, rollout_path.to_str()),
+            Some(String::from("dia1"))
+        );
+        assert_eq!(slot_from_thread_path(&paths, unrelated_path.to_str()), None);
+        assert_eq!(slot_from_thread_path(&paths, None), None);
+    }
+
+    #[test]
     fn explicit_thread_falls_back_to_bound_path_resume_and_rebinds_session() {
         let paths = temp_paths("explicit-path-resume");
         let channel_id = ChannelId::parse("terminal").unwrap();
@@ -466,6 +925,7 @@ mod tests {
                 session_id: session.session_id.clone(),
                 app_thread: AppThreadBinding {
                     thread_id: "old-thread".to_string(),
+                    codex_session_id: None,
                     cwd: "/tmp/project".to_string(),
                     title: Some("old".to_string()),
                     slot: Some("slot-a".to_string()),
@@ -493,7 +953,9 @@ mod tests {
             ThreadResolverScope {
                 cwd: PathBuf::from("/tmp/project"),
                 channel_id: Some(channel_id),
-                explicit_thread_id: Some("old-thread".to_string()),
+                explicit_resume_id: Some(ExplicitResumeId::AppThreadOrCodexSession(
+                    "old-thread".to_string(),
+                )),
                 slot: Some("slot-b".to_string()),
                 generation: 2,
             },
@@ -524,6 +986,263 @@ mod tests {
     }
 
     #[test]
+    fn explicit_cx_session_id_uses_bound_thread_not_session_id_as_thread() {
+        let paths = temp_paths("explicit-cx-session");
+        let channel_id = ChannelId::parse("terminal").unwrap();
+        let session = session::create_session(
+            &paths,
+            CreateSessionRequest {
+                session_id: None,
+                channel_id: channel_id.clone(),
+            },
+        )
+        .unwrap()
+        .session;
+        session::bind_app_thread(
+            &paths,
+            BindAppThreadRequest {
+                session_id: session.session_id.clone(),
+                app_thread: AppThreadBinding {
+                    thread_id: "thread-1".to_string(),
+                    codex_session_id: Some("codex-session-1".to_string()),
+                    cwd: "/tmp/project".to_string(),
+                    title: Some("bound".to_string()),
+                    slot: Some("slot-a".to_string()),
+                    generation: 1,
+                    path: Some("/tmp/threads/thread-1.jsonl".to_string()),
+                    updated_at_unix: 10,
+                },
+            },
+        )
+        .unwrap();
+        let mut readable = BTreeMap::new();
+        readable.insert(
+            "thread-1".to_string(),
+            summary("thread-1", "/tmp/project", "idle", 20),
+        );
+        let mut client = FakeResolverClient {
+            readable,
+            ..FakeResolverClient::default()
+        };
+
+        let outcome = resolve_app_thread(
+            &paths,
+            &mut client,
+            ThreadResolverScope {
+                cwd: PathBuf::from("/tmp/project"),
+                channel_id: Some(channel_id),
+                explicit_resume_id: Some(ExplicitResumeId::CxSession(session.session_id.clone())),
+                slot: Some("slot-b".to_string()),
+                generation: 2,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.decision,
+            ThreadResolverDecision::AttachExisting {
+                thread_id: "thread-1".to_string()
+            }
+        );
+        assert_eq!(client.read_calls, vec!["thread-1"]);
+    }
+
+    #[test]
+    fn explicit_codex_session_id_uses_bound_app_thread_id_for_resume() {
+        let paths = temp_paths("explicit-codex-session");
+        let channel_id = ChannelId::parse("terminal").unwrap();
+        let session = session::create_session(
+            &paths,
+            CreateSessionRequest {
+                session_id: None,
+                channel_id: channel_id.clone(),
+            },
+        )
+        .unwrap()
+        .session;
+        session::bind_app_thread(
+            &paths,
+            BindAppThreadRequest {
+                session_id: session.session_id.clone(),
+                app_thread: AppThreadBinding {
+                    thread_id: "thread-1".to_string(),
+                    codex_session_id: Some("codex-session-1".to_string()),
+                    cwd: "/tmp/project".to_string(),
+                    title: Some("bound".to_string()),
+                    slot: Some("slot-a".to_string()),
+                    generation: 1,
+                    path: Some("/tmp/threads/thread-1.jsonl".to_string()),
+                    updated_at_unix: 10,
+                },
+            },
+        )
+        .unwrap();
+        let mut readable = BTreeMap::new();
+        readable.insert(
+            "thread-1".to_string(),
+            summary("thread-1", "/tmp/project", "idle", 20),
+        );
+        let mut client = FakeResolverClient {
+            readable,
+            ..FakeResolverClient::default()
+        };
+
+        let outcome = resolve_app_thread(
+            &paths,
+            &mut client,
+            ThreadResolverScope {
+                cwd: PathBuf::from("/tmp/project"),
+                channel_id: Some(channel_id),
+                explicit_resume_id: Some(ExplicitResumeId::AppThreadOrCodexSession(
+                    "codex-session-1".to_string(),
+                )),
+                slot: Some("slot-b".to_string()),
+                generation: 2,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.decision,
+            ThreadResolverDecision::AttachExisting {
+                thread_id: "thread-1".to_string()
+            }
+        );
+        assert_eq!(client.read_calls, vec!["codex-session-1", "thread-1"]);
+        assert!(client.resume_calls.is_empty());
+    }
+
+    #[test]
+    fn explicit_sess_like_codex_session_id_falls_back_when_no_cx_session_exists() {
+        let paths = temp_paths("explicit-sess-like-codex-session");
+        let channel_id = ChannelId::parse("terminal").unwrap();
+        let session = session::create_session(
+            &paths,
+            CreateSessionRequest {
+                session_id: None,
+                channel_id: channel_id.clone(),
+            },
+        )
+        .unwrap()
+        .session;
+        session::bind_app_thread(
+            &paths,
+            BindAppThreadRequest {
+                session_id: session.session_id.clone(),
+                app_thread: AppThreadBinding {
+                    thread_id: "thread-1".to_string(),
+                    codex_session_id: Some("sess_upstream".to_string()),
+                    cwd: "/tmp/project".to_string(),
+                    title: Some("bound".to_string()),
+                    slot: Some("slot-a".to_string()),
+                    generation: 1,
+                    path: Some("/tmp/threads/thread-1.jsonl".to_string()),
+                    updated_at_unix: 10,
+                },
+            },
+        )
+        .unwrap();
+        let mut readable = BTreeMap::new();
+        readable.insert(
+            "thread-1".to_string(),
+            summary("thread-1", "/tmp/project", "idle", 20),
+        );
+        let mut client = FakeResolverClient {
+            readable,
+            ..FakeResolverClient::default()
+        };
+
+        let outcome = resolve_app_thread(
+            &paths,
+            &mut client,
+            ThreadResolverScope {
+                cwd: PathBuf::from("/tmp/project"),
+                channel_id: Some(channel_id),
+                explicit_resume_id: Some(ExplicitResumeId::parse("sess_upstream")),
+                slot: Some("slot-b".to_string()),
+                generation: 2,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.decision,
+            ThreadResolverDecision::AttachExisting {
+                thread_id: "thread-1".to_string()
+            }
+        );
+        assert_eq!(client.read_calls, vec!["sess_upstream", "thread-1"]);
+    }
+
+    #[test]
+    fn default_terminal_channel_does_not_attach_other_cwd_session() {
+        let paths = temp_paths("terminal-cwd");
+        let channel_id = ChannelId::parse("terminal").unwrap();
+        let session = session::create_session(
+            &paths,
+            CreateSessionRequest {
+                session_id: None,
+                channel_id,
+            },
+        )
+        .unwrap()
+        .session;
+        session::bind_app_thread(
+            &paths,
+            BindAppThreadRequest {
+                session_id: session.session_id,
+                app_thread: AppThreadBinding {
+                    thread_id: "repo-a-thread".to_string(),
+                    codex_session_id: None,
+                    cwd: "/tmp/repo-a".to_string(),
+                    title: Some("repo-a".to_string()),
+                    slot: Some("slot-a".to_string()),
+                    generation: 1,
+                    path: Some("/tmp/repo-a.jsonl".to_string()),
+                    updated_at_unix: 10,
+                },
+            },
+        )
+        .unwrap();
+        let mut readable = BTreeMap::new();
+        readable.insert(
+            "started".to_string(),
+            summary_with_path(
+                "started",
+                "/tmp/repo-b",
+                "idle",
+                20,
+                Some("/tmp/repo-b.jsonl"),
+            ),
+        );
+        let mut client = FakeResolverClient {
+            readable,
+            ..FakeResolverClient::default()
+        };
+
+        let outcome = resolve_app_thread(
+            &paths,
+            &mut client,
+            ThreadResolverScope {
+                cwd: PathBuf::from("/tmp/repo-b"),
+                channel_id: None,
+                explicit_resume_id: None,
+                slot: Some("slot-b".to_string()),
+                generation: 2,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome.decision,
+            ThreadResolverDecision::StartNew {
+                cwd: "/tmp/repo-b".to_string()
+            }
+        );
+        assert_eq!(client.read_calls, vec!["started"]);
+    }
+
+    #[test]
     fn explicit_readable_thread_rebinds_current_path_without_path_resume() {
         let paths = temp_paths("explicit-readable-rebind");
         let channel_id = ChannelId::parse("terminal").unwrap();
@@ -542,6 +1261,7 @@ mod tests {
                 session_id: session.session_id.clone(),
                 app_thread: AppThreadBinding {
                     thread_id: "thread-1".to_string(),
+                    codex_session_id: None,
                     cwd: "/tmp/project".to_string(),
                     title: Some("old".to_string()),
                     slot: Some("slot-a".to_string()),
@@ -574,7 +1294,9 @@ mod tests {
             ThreadResolverScope {
                 cwd: PathBuf::from("/tmp/project"),
                 channel_id: Some(channel_id),
-                explicit_thread_id: Some("thread-1".to_string()),
+                explicit_resume_id: Some(ExplicitResumeId::AppThreadOrCodexSession(
+                    "thread-1".to_string(),
+                )),
                 slot: Some("slot-b".to_string()),
                 generation: 2,
             },

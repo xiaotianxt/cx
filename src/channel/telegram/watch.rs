@@ -451,6 +451,11 @@ impl<'a> TelegramWatchSink<'a> {
         }
     }
 
+    pub(super) fn begin_pending_turn(&mut self) -> Result<()> {
+        self.seal_activity_cell()?;
+        self.start_status_turn(true)
+    }
+
     fn ensure_status_started(&mut self, force: bool) -> Result<()> {
         self.status.ensure_active();
         if flush_status_panel(

@@ -59,6 +59,7 @@ pub(crate) struct AppThreadSummary {
     pub active: bool,
     pub created_at_unix: i64,
     pub updated_at_unix: i64,
+    pub broker_subscriber_count: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -719,6 +720,7 @@ pub(crate) fn parse_server_event(
             if method == "turn/started" || method == "task/started" =>
         {
             started_turn_id(&params, thread_id)
+                .filter(|started| turn_id.is_none_or(|expected| *started == expected))
                 .map(|_| ParsedServerEvent::Stream(AppStreamEvent::TurnStarted))
         }
         ServerMessage::Notification { method, params }
@@ -737,7 +739,8 @@ pub(crate) fn parse_server_event(
         }
         ServerMessage::Notification { method, params }
             if method == "item/reasoning/summaryTextDelta"
-                || method == "item/reasoning/textDelta" =>
+                || method == "item/reasoning/textDelta"
+                || method == "item/plan/delta" =>
         {
             notification_text_delta(&params, thread_id, turn_id)
                 .map(AppStreamEvent::ReasoningDelta)
@@ -1279,6 +1282,7 @@ impl From<protocol::ThreadSummary> for AppThreadSummary {
             status,
             created_at_unix: thread.created_at,
             updated_at_unix: thread.updated_at,
+            broker_subscriber_count: thread.broker_subscriber_count,
         }
     }
 }
@@ -1352,6 +1356,7 @@ mod tests {
             created_at: 10,
             updated_at: 20,
             turns: Vec::new(),
+            broker_subscriber_count: Some(2),
         };
 
         let summary = AppThreadSummary::from(thread);
@@ -1360,6 +1365,7 @@ mod tests {
         assert_eq!(summary.source, "custom");
         assert_eq!(summary.status, "active");
         assert!(summary.active);
+        assert_eq!(summary.broker_subscriber_count, Some(2));
     }
 
     #[test]
@@ -1627,5 +1633,44 @@ mod tests {
 
         assert_eq!(started_turn_id(&params, "thread-1"), Some("turn-1"));
         assert_eq!(started_turn_id(&params, "other-thread"), None);
+    }
+
+    #[test]
+    fn parse_server_event_filters_started_by_expected_turn() {
+        let message = json!({
+            "method": "turn/started",
+            "params": {
+                "threadId": "thread-1",
+                "turn": {"id": "turn-2"}
+            }
+        });
+
+        assert_eq!(
+            parse_server_event(&message, "thread-1", Some("turn-1")),
+            None
+        );
+        assert_eq!(
+            parse_server_event(&message, "thread-1", Some("turn-2")),
+            Some(ParsedServerEvent::Stream(AppStreamEvent::TurnStarted))
+        );
+    }
+
+    #[test]
+    fn parse_server_event_reads_plan_delta() {
+        let message = json!({
+            "method": "item/plan/delta",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "delta": "Plan update"
+            }
+        });
+
+        assert_eq!(
+            parse_server_event(&message, "thread-1", Some("turn-1")),
+            Some(ParsedServerEvent::Stream(AppStreamEvent::ReasoningDelta(
+                "Plan update".to_string()
+            )))
+        );
     }
 }

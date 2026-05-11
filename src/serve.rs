@@ -43,6 +43,8 @@ struct ListenUrl {
 #[serde(rename_all = "camelCase")]
 struct ServeStateFile {
     schema_version: u64,
+    #[serde(default)]
+    kind: ServeEndpointKind,
     pid: u32,
     slot: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -54,16 +56,35 @@ struct ServeStateFile {
     started_at_unix: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum ServeEndpointKind {
+    #[default]
+    AppServer,
+    Broker,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ReadyAppServer {
+    pub(crate) kind: ServeEndpointKind,
     pub(crate) listen_url: String,
     pub(crate) slot: String,
     pub(crate) codex_home: Option<String>,
     pub(crate) target: Option<String>,
 }
 
+impl ReadyAppServer {
+    pub(crate) fn app_slot(&self) -> Option<String> {
+        match self.kind {
+            ServeEndpointKind::AppServer => Some(self.slot.clone()),
+            ServeEndpointKind::Broker => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ServeRegistration {
+    pub(crate) kind: ServeEndpointKind,
     pub(crate) pid: u32,
     pub(crate) slot: String,
     pub(crate) codex_home: Option<String>,
@@ -275,6 +296,7 @@ pub fn start(args: ServeStartArgs) -> Result<()> {
 
     let state = ServeStateFile {
         schema_version: SERVE_STATE_SCHEMA_VERSION,
+        kind: ServeEndpointKind::AppServer,
         pid: child.id(),
         slot,
         codex_home,
@@ -357,6 +379,7 @@ pub fn stop(args: ServeStopArgs) -> Result<()> {
         return print_stop(report, args.json);
     }
 
+    ensure_stoppable_by_serve(&state)?;
     send_signal(state.pid, Signal::Terminate)?;
     let mut stopped = wait_for_stopped(&state, args.wait_timeout);
     let mut forced = false;
@@ -385,6 +408,17 @@ pub fn stop(args: ServeStopArgs) -> Result<()> {
         anyhow::bail!("codex app-server did not stop within --wait-timeout");
     }
     Ok(())
+}
+
+fn ensure_stoppable_by_serve(state: &ServeStateFile) -> Result<()> {
+    match state.kind {
+        ServeEndpointKind::AppServer => Ok(()),
+        ServeEndpointKind::Broker => {
+            anyhow::bail!(
+                "serve endpoint is owned by cx service; use `cx service stop` to stop the background service"
+            )
+        }
+    }
 }
 
 pub fn probe(args: ServeProbeArgs) -> Result<()> {
@@ -491,6 +525,7 @@ pub(crate) fn ready_app_server(paths: &ManagerPaths) -> Result<ReadyAppServer> {
         anyhow::bail!("serve state is stale: {}", state_file.display());
     }
     Ok(ReadyAppServer {
+        kind: state.kind,
         listen_url: state.listen_url,
         slot: state.slot,
         codex_home: state.codex_home,
@@ -504,6 +539,7 @@ pub(crate) fn registered_app_server(paths: &ManagerPaths) -> Result<ReadyAppServ
         .with_context(|| format!("serve state not found: {}", state_file.display()))?;
     LoopbackWsUrl::parse(&state.listen_url)?;
     Ok(ReadyAppServer {
+        kind: state.kind,
         listen_url: state.listen_url,
         slot: state.slot,
         codex_home: state.codex_home,
@@ -519,6 +555,7 @@ pub(crate) fn register_app_server(
         paths,
         &ServeStateFile {
             schema_version: SERVE_STATE_SCHEMA_VERSION,
+            kind: registration.kind,
             pid: registration.pid,
             slot: registration.slot,
             codex_home: registration.codex_home,
@@ -528,10 +565,6 @@ pub(crate) fn register_app_server(
             started_at_unix: unix_now()?,
         },
     )
-}
-
-pub(crate) fn unregister_app_server(paths: &ManagerPaths, pid: u32) -> Result<bool> {
-    remove_state_if_current(paths, pid)
 }
 
 fn wait_for_ready(
@@ -624,7 +657,14 @@ fn probe_ready(readyz_url: &str) -> bool {
 }
 
 fn state_is_ready(state: &ServeStateFile) -> bool {
-    process_looks_like_app_server(state.pid).unwrap_or(false) && probe_ready(&state.readyz_url)
+    state_process_is_alive(state) && probe_ready(&state.readyz_url)
+}
+
+fn state_process_is_alive(state: &ServeStateFile) -> bool {
+    match state.kind {
+        ServeEndpointKind::AppServer => process_looks_like_app_server(state.pid).unwrap_or(false),
+        ServeEndpointKind::Broker => process_exists(state.pid).unwrap_or(false),
+    }
 }
 
 fn wait_for_stopped(state: &ServeStateFile, timeout_secs: f32) -> bool {
@@ -700,8 +740,25 @@ fn process_looks_like_app_server(pid: u32) -> Result<bool> {
     Ok(command.contains("app-server"))
 }
 
+#[cfg(unix)]
+fn process_exists(pid: u32) -> Result<bool> {
+    let status = Command::new("ps")
+        .arg("-p")
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .with_context(|| format!("check pid {pid}"))?;
+    Ok(status.success())
+}
+
 #[cfg(not(unix))]
 fn process_looks_like_app_server(_pid: u32) -> Result<bool> {
+    Ok(true)
+}
+
+#[cfg(not(unix))]
+fn process_exists(_pid: u32) -> Result<bool> {
     Ok(true)
 }
 
@@ -933,6 +990,7 @@ mod tests {
         let paths = temp_paths("state");
         let state = ServeStateFile {
             schema_version: SERVE_STATE_SCHEMA_VERSION,
+            kind: ServeEndpointKind::AppServer,
             pid: 123,
             slot: String::from("bus1"),
             codex_home: Some(String::from("/tmp/codex-home")),
@@ -954,10 +1012,63 @@ mod tests {
     }
 
     #[test]
+    fn legacy_state_defaults_to_app_server_kind() {
+        let state = serde_json::from_value::<ServeStateFile>(serde_json::json!({
+            "schemaVersion": SERVE_STATE_SCHEMA_VERSION,
+            "pid": 123,
+            "slot": "bus1",
+            "listenUrl": "ws://127.0.0.1:17654",
+            "readyzUrl": "http://127.0.0.1:17654/readyz",
+            "startedAtUnix": 1_800_000_000_u64
+        }))
+        .unwrap();
+
+        assert_eq!(state.kind, ServeEndpointKind::AppServer);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broker_state_uses_pid_existence_for_process_check() {
+        let state = ServeStateFile {
+            schema_version: SERVE_STATE_SCHEMA_VERSION,
+            kind: ServeEndpointKind::Broker,
+            pid: std::process::id(),
+            slot: String::from("broker"),
+            codex_home: None,
+            target: None,
+            listen_url: String::from("ws://127.0.0.1:17654"),
+            readyz_url: String::from("http://127.0.0.1:17654/readyz"),
+            started_at_unix: 1_800_000_000,
+        };
+
+        assert!(state_process_is_alive(&state));
+    }
+
+    #[test]
+    fn serve_stop_rejects_service_broker_state() {
+        let state = ServeStateFile {
+            schema_version: SERVE_STATE_SCHEMA_VERSION,
+            kind: ServeEndpointKind::Broker,
+            pid: std::process::id(),
+            slot: String::from("broker"),
+            codex_home: None,
+            target: None,
+            listen_url: String::from("ws://127.0.0.1:17654"),
+            readyz_url: String::from("http://127.0.0.1:17654/readyz"),
+            started_at_unix: 1_800_000_000,
+        };
+
+        let err = ensure_stoppable_by_serve(&state).unwrap_err();
+
+        assert!(format!("{err:#}").contains("cx service stop"));
+    }
+
+    #[test]
     fn registered_app_server_reads_recorded_listen_url_without_probe() {
         let paths = temp_paths("registered");
         let state = ServeStateFile {
             schema_version: SERVE_STATE_SCHEMA_VERSION,
+            kind: ServeEndpointKind::AppServer,
             pid: u32::MAX,
             slot: String::from("bus1"),
             codex_home: None,
@@ -982,6 +1093,7 @@ mod tests {
         let paths = temp_paths("mode");
         let state = ServeStateFile {
             schema_version: SERVE_STATE_SCHEMA_VERSION,
+            kind: ServeEndpointKind::AppServer,
             pid: 123,
             slot: String::from("bus1"),
             codex_home: None,
@@ -1014,6 +1126,7 @@ mod tests {
         let paths = temp_paths("stop-stale");
         let state = ServeStateFile {
             schema_version: SERVE_STATE_SCHEMA_VERSION,
+            kind: ServeEndpointKind::AppServer,
             pid: u32::MAX,
             slot: String::from("bus1"),
             codex_home: None,

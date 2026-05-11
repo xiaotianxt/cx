@@ -63,6 +63,8 @@ pub struct ChannelLease {
 #[serde(rename_all = "camelCase")]
 pub struct AppThreadBinding {
     pub thread_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_session_id: Option<String>,
     pub cwd: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
@@ -446,6 +448,27 @@ pub fn find_session_by_channel(
         }))
 }
 
+pub fn find_session_by_channel_and_app_thread_cwd(
+    paths: &ManagerPaths,
+    channel_id: &ChannelId,
+    cwd: &str,
+) -> Result<Option<SessionRecord>> {
+    Ok(list_sessions(paths)?
+        .into_iter()
+        .filter(|session| {
+            (&session.primary_channel_id == channel_id || &session.current_channel_id == channel_id)
+                && session
+                    .app_thread
+                    .as_ref()
+                    .is_some_and(|app_thread| app_thread.cwd == cwd)
+        })
+        .max_by(|left, right| {
+            left.updated_at_unix
+                .cmp(&right.updated_at_unix)
+                .then_with(|| left.session_id.cmp(&right.session_id))
+        }))
+}
+
 pub fn find_session_by_app_thread_cwd(
     paths: &ManagerPaths,
     cwd: &str,
@@ -476,6 +499,26 @@ pub fn find_session_by_app_thread_id(
                 .app_thread
                 .as_ref()
                 .is_some_and(|app_thread| app_thread.thread_id == thread_id)
+        })
+        .max_by(|left, right| {
+            left.updated_at_unix
+                .cmp(&right.updated_at_unix)
+                .then_with(|| left.session_id.cmp(&right.session_id))
+        }))
+}
+
+pub fn find_session_by_app_thread_codex_session_id(
+    paths: &ManagerPaths,
+    codex_session_id: &str,
+) -> Result<Option<SessionRecord>> {
+    Ok(list_sessions(paths)?
+        .into_iter()
+        .filter(|session| {
+            session
+                .app_thread
+                .as_ref()
+                .and_then(|app_thread| app_thread.codex_session_id.as_deref())
+                == Some(codex_session_id)
         })
         .max_by(|left, right| {
             left.updated_at_unix

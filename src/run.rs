@@ -17,9 +17,11 @@ use crate::paths;
 use crate::paths::ManagerPaths;
 use crate::selector;
 use crate::serve;
+use crate::serve::ServeEndpointKind;
 use crate::slot;
 use crate::target::TargetSpec;
 use crate::thread_resolver;
+use crate::thread_resolver::ExplicitResumeId;
 use crate::thread_resolver::ThreadResolverDecision;
 use crate::thread_resolver::ThreadResolverScope;
 
@@ -65,6 +67,13 @@ pub(crate) struct CodexCommandSpec {
     pub(crate) args: Vec<OsString>,
     pub(crate) slot: String,
     pub(crate) target_name: Option<String>,
+    pub(crate) launch_context: CodexLaunchContext,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CodexLaunchContext {
+    Slot,
+    ServiceBroker,
 }
 
 impl CodexCommandSpec {
@@ -109,19 +118,23 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
 
     let clean_tui_launch = options.codex_args.is_empty();
     let workspace = resolve_workspace_from_args(&options.codex_args)?;
-    let explicit_session_id = explicit_resume_session_id(&options.codex_args);
+    let requested_resume_id = explicit_resume_id(&options.codex_args);
     match remote_attach_spec(
         &paths,
         real_codex.clone(),
         &options.codex_args,
         &workspace,
-        explicit_session_id,
+        requested_resume_id,
         clean_tui_launch,
     ) {
         Ok(Some(spec)) => {
             warn_remote_ignores_local_selection(&options, &spec);
-            let resumed_session_id = explicit_resume_session_id(&spec.args);
-            print_launch(&spec, resumed_session_id.as_deref(), options.quiet);
+            let resumed_id = explicit_resume_id(&spec.args);
+            print_launch(
+                &spec,
+                resumed_id.as_ref().map(ExplicitResumeId::as_str),
+                options.quiet,
+            );
             if let Err(err) = supervise_remote_tui(&paths, spec) {
                 warn_remote_fallback(&err);
             } else {
@@ -266,6 +279,7 @@ pub(crate) fn build_slot_command_spec(
         args,
         slot: selected_slot.to_string(),
         target_name,
+        launch_context: CodexLaunchContext::Slot,
     })
 }
 
@@ -283,21 +297,28 @@ fn exec_slot_codex(
         target,
         options.codex_args,
     )?;
-    let resumed_session_id = explicit_resume_session_id(&spec.args);
-    print_launch(&spec, resumed_session_id.as_deref(), options.quiet);
+    let resumed_id = explicit_resume_id(&spec.args);
+    print_launch(
+        &spec,
+        resumed_id.as_ref().map(ExplicitResumeId::as_str),
+        options.quiet,
+    );
     exec(spec.into_command())
 }
 
-fn print_launch(spec: &CodexCommandSpec, resumed_session_id: Option<&str>, quiet: bool) {
+fn print_launch(spec: &CodexCommandSpec, resumed_id: Option<&str>, quiet: bool) {
     if quiet {
         return;
     }
-    eprintln!("codex slot: {}", spec.slot());
+    match spec.launch_context {
+        CodexLaunchContext::Slot => eprintln!("codex slot: {}", spec.slot()),
+        CodexLaunchContext::ServiceBroker => eprintln!("codex service: broker"),
+    }
     if let Some(target) = spec.target_name() {
         eprintln!("codex target: {target}");
     }
-    if let Some(session_id) = resumed_session_id {
-        eprintln!("codex resume: {session_id}");
+    if let Some(resumed_id) = resumed_id {
+        eprintln!("codex resume: {resumed_id}");
     }
 }
 
@@ -309,11 +330,21 @@ fn warn_remote_ignores_local_selection(options: &RunOptions, spec: &CodexCommand
     if options.quiet {
         return;
     }
-    if let Some(slot) = options.slot.as_deref().filter(|slot| *slot != spec.slot()) {
-        eprintln!(
-            "cx warning: --slot {slot} ignored because service remote is using slot {}",
-            spec.slot()
-        );
+    if let Some(slot) = options.slot.as_deref() {
+        match spec.launch_context {
+            CodexLaunchContext::Slot if slot != spec.slot() => {
+                eprintln!(
+                    "cx warning: --slot {slot} ignored because service remote is using slot {}",
+                    spec.slot()
+                );
+            }
+            CodexLaunchContext::ServiceBroker => {
+                eprintln!(
+                    "cx warning: --slot {slot} ignored because service remote is using broker"
+                );
+            }
+            _ => {}
+        }
     }
     if let Some(target) = options
         .target
@@ -365,7 +396,7 @@ fn preload_remote_thread(paths: &ManagerPaths, spec: &CodexCommandSpec) -> Resul
     let Some(app_server_url) = remote_arg_value(&spec.args, "--remote") else {
         return Ok(());
     };
-    let Some(thread_id) = remote_resume_thread_id(&spec.args) else {
+    let Some(resume_id) = remote_resume_id(&spec.args) else {
         return Ok(());
     };
     let workspace = resolve_workspace_from_args(&spec.args)?;
@@ -379,8 +410,8 @@ fn preload_remote_thread(paths: &ManagerPaths, spec: &CodexCommandSpec) -> Resul
         ThreadResolverScope {
             cwd: workspace,
             channel_id: None,
-            explicit_thread_id: Some(thread_id.to_string()),
-            slot: Some(server.slot),
+            explicit_resume_id: Some(resume_id),
+            slot: server.app_slot(),
             generation: 0,
         },
     )?;
@@ -408,7 +439,7 @@ fn remote_arg_value<'a>(args: &'a [OsString], name: &str) -> Option<&'a str> {
     None
 }
 
-fn remote_resume_thread_id(args: &[OsString]) -> Option<&str> {
+fn remote_resume_id(args: &[OsString]) -> Option<ExplicitResumeId> {
     let mut index = 0;
     while index < args.len() {
         let arg = args[index].to_string_lossy();
@@ -420,7 +451,10 @@ fn remote_resume_thread_id(args: &[OsString]) -> Option<&str> {
             continue;
         }
         if arg == "resume" {
-            return args.get(index + 1).and_then(|value| value.to_str());
+            return args
+                .get(index + 1)
+                .and_then(|value| value.to_str())
+                .map(ExplicitResumeId::parse);
         }
         index += 1;
     }
@@ -432,13 +466,16 @@ fn remote_attach_spec(
     real_codex: PathBuf,
     base_args: &[OsString],
     workspace: &Path,
-    explicit_thread_id: Option<String>,
+    explicit_resume_id: Option<ExplicitResumeId>,
     clean_tui_launch: bool,
 ) -> Result<Option<CodexCommandSpec>> {
-    if explicit_thread_id.is_none() && !clean_tui_launch {
+    if explicit_resume_id.is_none() && !clean_tui_launch {
         return Ok(None);
     }
     let server = serve::ready_app_server(paths).context("cx service app-server is not ready")?;
+    if !remote_attach_supports_resume(server.kind, explicit_resume_id.as_ref()) {
+        return Ok(None);
+    }
 
     let mut client =
         AppServerClient::connect(&server.listen_url, std::time::Duration::from_secs(5))
@@ -447,8 +484,8 @@ fn remote_attach_spec(
     let scope = ThreadResolverScope {
         cwd: workspace.to_path_buf(),
         channel_id: None,
-        explicit_thread_id,
-        slot: Some(server.slot.clone()),
+        explicit_resume_id,
+        slot: server.app_slot(),
         generation: 0,
     };
     let outcome = thread_resolver::resolve_app_thread(paths, &mut client, scope)?;
@@ -460,19 +497,44 @@ fn remote_attach_spec(
         ThreadResolverDecision::Refuse { reason } => anyhow::bail!("{reason}"),
     };
 
-    let codex_home = server
-        .codex_home
-        .as_deref()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| paths.slot_home(&server.slot));
+    let (codex_home, slot, launch_context) = remote_launch_home(paths, &server);
     Ok(Some(CodexCommandSpec {
         program: real_codex,
         codex_home,
         envs: BTreeMap::new(),
         args: remote_tui_args(base_args, &server.listen_url, workspace, &thread_id),
-        slot: server.slot,
+        slot,
         target_name: server.target,
+        launch_context,
     }))
+}
+
+fn remote_attach_supports_resume(
+    server_kind: ServeEndpointKind,
+    explicit_resume_id: Option<&ExplicitResumeId>,
+) -> bool {
+    explicit_resume_id.is_none() || server_kind == ServeEndpointKind::Broker
+}
+
+fn remote_launch_home(
+    paths: &ManagerPaths,
+    server: &serve::ReadyAppServer,
+) -> (PathBuf, String, CodexLaunchContext) {
+    match server.kind {
+        ServeEndpointKind::AppServer => {
+            let codex_home = server
+                .codex_home
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| paths.slot_home(&server.slot));
+            (codex_home, server.slot.clone(), CodexLaunchContext::Slot)
+        }
+        ServeEndpointKind::Broker => (
+            paths.base_codex_home.clone(),
+            String::from("service-broker"),
+            CodexLaunchContext::ServiceBroker,
+        ),
+    }
 }
 
 fn remote_tui_args(
@@ -696,7 +758,7 @@ pub(crate) fn resolve_workspace_from_args(args: &[OsString]) -> Result<PathBuf> 
     resolve_workspace(workspace)
 }
 
-pub(crate) fn explicit_resume_session_id(args: &[OsString]) -> Option<String> {
+pub(crate) fn explicit_resume_id(args: &[OsString]) -> Option<ExplicitResumeId> {
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
@@ -719,7 +781,7 @@ pub(crate) fn explicit_resume_session_id(args: &[OsString]) -> Option<String> {
             return args
                 .get(index + 1)
                 .filter(|value| !value.to_string_lossy().starts_with('-'))
-                .map(|value| value.to_string_lossy().to_string());
+                .map(|value| ExplicitResumeId::parse(value.to_string_lossy().to_string()));
         }
         return None;
     }
@@ -833,6 +895,11 @@ fn next_os_value(
 mod tests {
     use super::*;
 
+    fn test_paths(name: &str) -> ManagerPaths {
+        let root = std::env::temp_dir().join(format!("cx-run-test-{name}-{}", std::process::id()));
+        ManagerPaths::from_roots(root.join("codex"), root.join("profile-manager"))
+    }
+
     #[test]
     fn slot_flag_is_removed_from_forwarded_args() {
         let options = parse_run_args(vec![
@@ -919,7 +986,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_resume_session_id_skips_root_overrides() {
+    fn explicit_resume_id_skips_root_overrides() {
         let args = vec![
             OsString::from("-c"),
             OsString::from("model=\"gpt-5.5\""),
@@ -928,8 +995,10 @@ mod tests {
         ];
 
         assert_eq!(
-            explicit_resume_session_id(&args),
-            Some(String::from("019dfdd3-debc-7da2-88fc-b15b73f5e138"))
+            explicit_resume_id(&args),
+            Some(ExplicitResumeId::AppThreadOrCodexSession(String::from(
+                "019dfdd3-debc-7da2-88fc-b15b73f5e138"
+            )))
         );
     }
 
@@ -980,7 +1049,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_resume_thread_id_skips_root_options() {
+    fn remote_resume_id_skips_root_options() {
         let args = vec![
             OsString::from("--remote"),
             OsString::from("ws://127.0.0.1:17654"),
@@ -994,7 +1063,69 @@ mod tests {
             remote_arg_value(&args, "--remote"),
             Some("ws://127.0.0.1:17654")
         );
-        assert_eq!(remote_resume_thread_id(&args), Some("thread-1"));
+        assert_eq!(
+            remote_resume_id(&args),
+            Some(ExplicitResumeId::AppThreadOrCodexSession(
+                "thread-1".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn broker_remote_launch_uses_base_home_not_broker_slot_home() {
+        let paths = test_paths("broker-home");
+        let server = serve::ReadyAppServer {
+            kind: ServeEndpointKind::Broker,
+            listen_url: String::from("ws://127.0.0.1:17654"),
+            slot: String::from("broker"),
+            codex_home: None,
+            target: None,
+        };
+
+        let (codex_home, slot, launch_context) = remote_launch_home(&paths, &server);
+
+        assert_eq!(codex_home, paths.base_codex_home);
+        assert_ne!(codex_home, paths.slot_home("broker"));
+        assert_eq!(slot, "service-broker");
+        assert_eq!(launch_context, CodexLaunchContext::ServiceBroker);
+        assert_eq!(server.app_slot(), None);
+    }
+
+    #[test]
+    fn app_server_remote_launch_uses_recorded_slot_home() {
+        let paths = test_paths("app-server-home");
+        let server = serve::ReadyAppServer {
+            kind: ServeEndpointKind::AppServer,
+            listen_url: String::from("ws://127.0.0.1:17654"),
+            slot: String::from("dia4"),
+            codex_home: None,
+            target: None,
+        };
+
+        let (codex_home, slot, launch_context) = remote_launch_home(&paths, &server);
+
+        assert_eq!(codex_home, paths.slot_home("dia4"));
+        assert_eq!(slot, "dia4");
+        assert_eq!(launch_context, CodexLaunchContext::Slot);
+        assert_eq!(server.app_slot(), Some(String::from("dia4")));
+    }
+
+    #[test]
+    fn explicit_resume_requires_broker_remote() {
+        let resume_id = ExplicitResumeId::AppThreadOrCodexSession(String::from("thread-1"));
+
+        assert!(!remote_attach_supports_resume(
+            ServeEndpointKind::AppServer,
+            Some(&resume_id)
+        ));
+        assert!(remote_attach_supports_resume(
+            ServeEndpointKind::Broker,
+            Some(&resume_id)
+        ));
+        assert!(remote_attach_supports_resume(
+            ServeEndpointKind::AppServer,
+            None
+        ));
     }
 
     #[test]

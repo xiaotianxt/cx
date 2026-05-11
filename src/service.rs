@@ -1,21 +1,19 @@
-use std::collections::BTreeSet;
+//! Background service supervisor.
+//!
+//! The service owns the stable broker endpoint and channel adapter children.
+//! Raw Codex app-server workers are managed behind the broker, not exposed as
+//! the service control surface.
+
 use std::fs;
 use std::fs::File;
 use std::fs::OpenOptions;
-use std::io::BufRead;
-use std::io::BufReader;
 use std::io::Read;
-use std::io::Seek;
-use std::io::SeekFrom;
 use std::io::Write;
-use std::net::TcpListener;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Child;
 use std::process::Command;
 use std::process::Stdio;
-use std::sync::Arc;
-use std::sync::RwLock;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -27,8 +25,7 @@ use anyhow::Result;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::app_server::AppServerClient;
-use crate::app_server::AppServerProxy;
+use crate::broker::AppServerBroker;
 use crate::cli::ServiceInstallArgs;
 use crate::cli::ServiceLogsArgs;
 use crate::cli::ServiceRunArgs;
@@ -41,15 +38,9 @@ use crate::cli::ServiceTokenCommand;
 use crate::cli::ServiceTokenName;
 use crate::cli::ServiceUninstallArgs;
 use crate::paths::ManagerPaths;
-use crate::rate_limit;
 use crate::run;
-use crate::selector;
 use crate::serve;
-use crate::session;
-use crate::session::AppThreadBinding;
-use crate::session::BindAppThreadRequest;
-use crate::slot;
-use crate::target;
+use crate::worker_pool::WorkerPoolConfig;
 
 const SERVICE_STATE_SCHEMA_VERSION: u64 = 1;
 const SERVICE_TOKEN_SCHEMA_VERSION: u64 = 1;
@@ -60,6 +51,8 @@ const LAUNCHD_LABEL: &str = "dev.xiaotian.cx.service";
 struct ServiceStateFile {
     schema_version: u64,
     pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    process_group_id: Option<u32>,
     started_at_unix: u64,
     log_file: String,
     children: Vec<ServiceChildState>,
@@ -138,29 +131,6 @@ struct ManagedChild {
     last_exit: Option<String>,
 }
 
-struct AppServerSupervisor {
-    stable_listen_url: String,
-    stable_readyz_url: String,
-    upstream_url: Arc<RwLock<String>>,
-    proxy_handle: thread::JoinHandle<()>,
-    child: ManagedChild,
-    current_slot: String,
-    current_target: Option<String>,
-    generation: u64,
-    rotation_scan_offset: u64,
-    rotation_turn_state: rate_limit::TurnSideEffectState,
-    cooldown_slots: BTreeSet<String>,
-    rotation_pending: bool,
-}
-
-struct AppServerGeneration {
-    child: ManagedChild,
-    slot: String,
-    codex_home: PathBuf,
-    target: Option<String>,
-    upstream_listen_url: String,
-}
-
 pub fn start(args: ServiceStartArgs) -> Result<()> {
     let paths = ManagerPaths::new(args.spec.manager_dir.clone())?;
     fs::create_dir_all(paths.service_dir())
@@ -170,7 +140,7 @@ pub fn start(args: ServiceStartArgs) -> Result<()> {
 
     let state_file = paths.service_state_file();
     if let Some(state) = read_state_if_exists(&state_file)? {
-        if process_exists(state.pid) {
+        if service_state_is_current(&state) {
             return print_start(
                 ServiceStartReport {
                     schema_version: SERVICE_STATE_SCHEMA_VERSION,
@@ -199,9 +169,9 @@ pub fn start(args: ServiceStartArgs) -> Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone().context("clone service log")?))
         .stderr(Stdio::from(log));
-    let child = command.spawn().context("spawn cx service supervisor")?;
+    let mut child = command.spawn().context("spawn cx service supervisor")?;
 
-    let state = wait_for_service_state(&state_file, child.id(), Duration::from_secs(5))?;
+    let state = wait_for_service_state(&state_file, &mut child, Duration::from_secs(5))?;
     print_start(
         ServiceStartReport {
             schema_version: SERVICE_STATE_SCHEMA_VERSION,
@@ -225,8 +195,29 @@ pub fn run(args: ServiceRunArgs) -> Result<()> {
     validate_spec(&args.spec)?;
 
     log_line(&paths, "cx service supervisor starting")?;
+    let supervisor_process_group_id = configure_supervisor_process_group(&paths)?;
     let supervisor_started_at = unix_now()?;
-    let mut app_server = AppServerSupervisor::start(&args.spec, &paths)?;
+    let app_server = AppServerBroker::start(
+        paths.clone(),
+        &args.spec.listen,
+        WorkerPoolConfig {
+            codex_bin: args.spec.codex_bin.clone(),
+            slot: args.spec.slot.clone(),
+            target: args.spec.target.clone(),
+        },
+    )?;
+    serve::register_app_server(
+        &paths,
+        serve::ServeRegistration {
+            kind: serve::ServeEndpointKind::Broker,
+            pid: std::process::id(),
+            slot: String::from("broker"),
+            codex_home: None,
+            target: args.spec.target.clone(),
+            listen_url: app_server.listen_url().to_string(),
+            readyz_url: app_server.readyz_url().to_string(),
+        },
+    )?;
     let mut telegram = if args.spec.no_telegram {
         None
     } else {
@@ -238,24 +229,14 @@ pub fn run(args: ServiceRunArgs) -> Result<()> {
         service_state(
             &paths,
             supervisor_started_at,
-            &app_server.child,
+            supervisor_process_group_id,
+            &app_server,
             telegram.as_ref(),
         )?,
     )?;
     loop {
-        if let Some(status) = app_server
-            .child
-            .child
-            .try_wait()
-            .context("poll app-server child")?
-        {
-            app_server.child.last_exit = Some(status.to_string());
-            app_server.child.restarts += 1;
-            log_line(
-                &paths,
-                &format!("app-server generation exited with {status}; restarting"),
-            )?;
-            app_server.restart(&args.spec, &paths)?;
+        if let Err(err) = app_server.poll_workers() {
+            log_line(&paths, &format!("broker worker poll failed: {err:#}"))?;
         }
 
         if let Some(child) = telegram.as_mut() {
@@ -271,19 +252,13 @@ pub fn run(args: ServiceRunArgs) -> Result<()> {
             }
         }
 
-        if let Err(err) = app_server.observe_rotation(&args.spec, &paths) {
-            log_line(
-                &paths,
-                &format!("app-server rotation check failed: {err:#}"),
-            )?;
-        }
-
         write_service_state(
             &paths,
             service_state(
                 &paths,
                 supervisor_started_at,
-                &app_server.child,
+                supervisor_process_group_id,
+                &app_server,
                 telegram.as_ref(),
             )?,
         )?;
@@ -313,20 +288,14 @@ pub fn stop(args: ServiceStopArgs) -> Result<()> {
         );
     };
 
-    for child in &state.children {
-        let _ = send_signal(child.pid, Signal::Terminate);
-    }
-    let _ = send_signal(state.pid, Signal::Terminate);
+    signal_service(&state, Signal::Terminate);
 
-    let mut stopped = wait_for_pids_stopped(&state, args.wait_timeout);
+    let mut stopped = wait_for_service_stopped(&state, args.wait_timeout);
     let mut forced = false;
     if !stopped && args.force {
-        for child in &state.children {
-            let _ = send_signal(child.pid, Signal::Kill);
-        }
-        let _ = send_signal(state.pid, Signal::Kill);
+        signal_service(&state, Signal::Kill);
         forced = true;
-        stopped = wait_for_pids_stopped(&state, args.wait_timeout);
+        stopped = wait_for_service_stopped(&state, args.wait_timeout);
     }
 
     let cleaned = if stopped && state_file.exists() {
@@ -357,7 +326,7 @@ pub fn status(args: ServiceStatusArgs) -> Result<()> {
     let state_file = paths.service_state_file();
     let state = read_state_if_exists(&state_file)?;
     let status = match state.as_ref() {
-        Some(state) if process_exists(state.pid) => "running",
+        Some(state) if service_state_is_current(state) => "running",
         Some(_) => "stale",
         None => "missing",
     };
@@ -512,561 +481,6 @@ fn resolve_launchable_command_path(path: &Path) -> Result<PathBuf> {
     );
 }
 
-impl AppServerSupervisor {
-    fn start(spec: &ServiceSpecArgs, paths: &ManagerPaths) -> Result<Self> {
-        let stable = ServiceListenUrl::parse(&spec.listen)?.resolve()?;
-        let stable_listen_url = stable.websocket_url();
-        let stable_readyz_url = stable.readyz_url();
-        let upstream_url = Arc::new(RwLock::new(String::new()));
-        let generation = start_app_server_generation(spec, paths, None, 0)?;
-        replace_proxy_upstream(&upstream_url, &generation.upstream_listen_url)?;
-        let AppServerGeneration {
-            child,
-            slot,
-            codex_home,
-            target,
-            upstream_listen_url: _,
-        } = generation;
-
-        let proxy = AppServerProxy::new_dynamic(
-            stable_listen_url.clone(),
-            Arc::clone(&upstream_url),
-            paths.serve_dir().join("events").join("default.jsonl"),
-        );
-        let proxy_handle = proxy.spawn().context("spawn stable app-server proxy")?;
-        serve::register_app_server(
-            paths,
-            serve::ServeRegistration {
-                pid: child.child.id(),
-                slot: slot.clone(),
-                codex_home: Some(codex_home.display().to_string()),
-                target: target.clone(),
-                listen_url: stable_listen_url.clone(),
-                readyz_url: stable_readyz_url.clone(),
-            },
-        )?;
-        log_line(
-            paths,
-            &format!(
-                "app-server supervisor ready listen={stable_listen_url} generation=0 pid={}",
-                child.child.id()
-            ),
-        )?;
-
-        Ok(Self {
-            stable_listen_url,
-            stable_readyz_url,
-            upstream_url,
-            proxy_handle,
-            child,
-            current_slot: slot,
-            current_target: target,
-            generation: 0,
-            rotation_scan_offset: proxy_event_log_len(paths).unwrap_or(0),
-            rotation_turn_state: rate_limit::TurnSideEffectState::default(),
-            cooldown_slots: BTreeSet::new(),
-            rotation_pending: false,
-        })
-    }
-
-    fn restart(&mut self, spec: &ServiceSpecArgs, paths: &ManagerPaths) -> Result<()> {
-        let _ = serve::unregister_app_server(paths, self.child.child.id());
-        self.generation = self
-            .generation
-            .checked_add(1)
-            .context("app-server generation overflow")?;
-        let mut generation = start_app_server_generation(spec, paths, None, self.generation)?;
-        if let Err(err) = restore_sessions_on_generation(paths, &generation, self.generation) {
-            let _ = generation.child.child.kill();
-            let _ = generation.child.child.wait();
-            return Err(err);
-        }
-        replace_proxy_upstream(&self.upstream_url, &generation.upstream_listen_url)?;
-        let AppServerGeneration {
-            child,
-            slot,
-            codex_home,
-            target,
-            upstream_listen_url: _,
-        } = generation;
-        self.child = child;
-        self.current_slot = slot;
-        self.current_target = target;
-        serve::register_app_server(
-            paths,
-            serve::ServeRegistration {
-                pid: self.child.child.id(),
-                slot: self.current_slot.clone(),
-                codex_home: Some(codex_home.display().to_string()),
-                target: self.current_target.clone(),
-                listen_url: self.stable_listen_url.clone(),
-                readyz_url: self.stable_readyz_url.clone(),
-            },
-        )?;
-        let _ = self.proxy_handle.thread().id();
-        log_line(
-            paths,
-            &format!(
-                "app-server generation ready listen={} generation={} pid={}",
-                self.stable_listen_url,
-                self.generation,
-                self.child.child.id()
-            ),
-        )
-    }
-
-    fn observe_rotation(&mut self, spec: &ServiceSpecArgs, paths: &ManagerPaths) -> Result<()> {
-        if self.rotation_pending && !self.has_active_app_threads(paths) {
-            log_line(
-                paths,
-                "app-server rotation pending from unsafe limit signal; rotating at idle boundary",
-            )?;
-            self.rotate_after_limit(spec, paths)?;
-            return Ok(());
-        }
-
-        let Some(signal) = self.scan_rate_limit_signal(paths)? else {
-            return Ok(());
-        };
-        self.cooldown_slots.insert(self.current_slot.clone());
-        if signal.safe_to_continue {
-            log_line(
-                paths,
-                "app-server rate-limit signal detected at safe boundary; rotating generation",
-            )?;
-            self.rotate_after_limit(spec, paths)?;
-        } else {
-            self.rotation_pending = true;
-            log_line(
-                paths,
-                "app-server rate-limit signal detected during active work; rotation deferred until idle boundary",
-            )?;
-        }
-        Ok(())
-    }
-
-    fn scan_rate_limit_signal(
-        &mut self,
-        paths: &ManagerPaths,
-    ) -> Result<Option<rate_limit::StreamRateLimitSignal>> {
-        let path = proxy_event_log_path(paths);
-        let mut file = match File::open(&path) {
-            Ok(file) => file,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(err) => return Err(err).with_context(|| format!("open {}", path.display())),
-        };
-        let file_len = file
-            .metadata()
-            .with_context(|| format!("stat {}", path.display()))?
-            .len();
-        if self.rotation_scan_offset > file_len {
-            self.rotation_scan_offset = 0;
-            self.rotation_turn_state = rate_limit::TurnSideEffectState::default();
-        }
-        file.seek(SeekFrom::Start(self.rotation_scan_offset))
-            .with_context(|| format!("seek {}", path.display()))?;
-        let mut reader = BufReader::new(file);
-        let mut line = String::new();
-        let mut signal = None;
-        loop {
-            let bytes = reader
-                .read_line(&mut line)
-                .with_context(|| format!("read {}", path.display()))?;
-            if bytes == 0 {
-                break;
-            }
-            self.rotation_scan_offset = self
-                .rotation_scan_offset
-                .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
-            if let Some(observed) =
-                rate_limit::inspect_stream_fragment(&line, &mut self.rotation_turn_state)
-            {
-                signal = Some(observed);
-            }
-            line.clear();
-        }
-        Ok(signal)
-    }
-
-    fn has_active_app_threads(&self, paths: &ManagerPaths) -> bool {
-        let Ok(upstream_url) = self
-            .upstream_url
-            .read()
-            .map(|value| value.clone())
-            .map_err(|_| anyhow::anyhow!("proxy upstream lock poisoned"))
-        else {
-            return false;
-        };
-        if upstream_url.is_empty() {
-            return false;
-        }
-        let Ok(sessions) = session::list_sessions(paths) else {
-            return false;
-        };
-        let app_threads = sessions
-            .into_iter()
-            .filter_map(|session| session.app_thread)
-            .collect::<Vec<_>>();
-        if app_threads.is_empty() {
-            return false;
-        }
-        let Ok(mut client) = AppServerClient::connect(&upstream_url, Duration::from_secs(2)) else {
-            return false;
-        };
-        if client
-            .initialize("cx-service", env!("CARGO_PKG_VERSION"))
-            .is_err()
-        {
-            return false;
-        }
-        app_threads.into_iter().any(|app_thread| {
-            client
-                .thread_read(&app_thread.thread_id, false)
-                .is_ok_and(|read| read.summary.active || read.summary.active_turn_id.is_some())
-        })
-    }
-
-    fn rotate_after_limit(&mut self, spec: &ServiceSpecArgs, paths: &ManagerPaths) -> Result<()> {
-        let Some(slot) = self.next_rotation_slot(spec, paths)? else {
-            log_line(
-                paths,
-                "app-server rotation skipped: no alternate usable slot is available",
-            )?;
-            self.rotation_pending = false;
-            return Ok(());
-        };
-        self.rotate_to_slot(spec, paths, &slot)?;
-        self.mark_rotation_log_consumed(paths);
-        self.rotation_pending = false;
-        Ok(())
-    }
-
-    fn mark_rotation_log_consumed(&mut self, paths: &ManagerPaths) {
-        self.rotation_scan_offset = proxy_event_log_len(paths).unwrap_or(self.rotation_scan_offset);
-        self.rotation_turn_state = rate_limit::TurnSideEffectState::default();
-    }
-
-    fn next_rotation_slot(
-        &mut self,
-        spec: &ServiceSpecArgs,
-        paths: &ManagerPaths,
-    ) -> Result<Option<String>> {
-        if spec.slot.is_some() {
-            return Ok(None);
-        }
-        let candidates = if let Some(target_name) = spec.target.as_deref() {
-            target::load_target(paths, target_name)?.slots_or_rotation(paths)?
-        } else {
-            slot::load_rotation(paths)?
-        };
-        if candidates.len() <= 1 {
-            return Ok(None);
-        }
-        let results = selector::query_slots(paths, &candidates, run::usage_timeout())?;
-        let mut excluded = self.cooldown_slots.clone();
-        excluded.insert(self.current_slot.clone());
-        if let Some(selected) = selector::choose_result_excluding(&results, &excluded) {
-            return Ok(Some(selected.slot.clone()));
-        }
-
-        self.cooldown_slots.clear();
-        let excluded = BTreeSet::from([self.current_slot.clone()]);
-        Ok(
-            selector::choose_result_excluding(&results, &excluded)
-                .map(|result| result.slot.clone()),
-        )
-    }
-
-    fn rotate_to_slot(
-        &mut self,
-        spec: &ServiceSpecArgs,
-        paths: &ManagerPaths,
-        next_slot: &str,
-    ) -> Result<()> {
-        let next_generation = self
-            .generation
-            .checked_add(1)
-            .context("app-server generation overflow")?;
-        let mut generation =
-            start_app_server_generation(spec, paths, Some(next_slot), next_generation)?;
-        if let Err(err) = restore_sessions_on_generation(paths, &generation, next_generation) {
-            let _ = generation.child.child.kill();
-            let _ = generation.child.child.wait();
-            return Err(err);
-        }
-        replace_proxy_upstream(&self.upstream_url, &generation.upstream_listen_url)?;
-
-        let AppServerGeneration {
-            child,
-            slot,
-            codex_home,
-            target,
-            upstream_listen_url: _,
-        } = generation;
-        let old_slot = self.current_slot.clone();
-        let mut old_child = std::mem::replace(&mut self.child, child);
-        let old_pid = old_child.child.id();
-        self.current_slot = slot;
-        self.current_target = target;
-        self.generation = next_generation;
-        serve::register_app_server(
-            paths,
-            serve::ServeRegistration {
-                pid: self.child.child.id(),
-                slot: self.current_slot.clone(),
-                codex_home: Some(codex_home.display().to_string()),
-                target: self.current_target.clone(),
-                listen_url: self.stable_listen_url.clone(),
-                readyz_url: self.stable_readyz_url.clone(),
-            },
-        )?;
-        let _ = serve::unregister_app_server(paths, old_pid);
-        let _ = send_signal(old_pid, Signal::Terminate);
-        let _ = old_child.child.wait();
-        log_line(
-            paths,
-            &format!(
-                "app-server generation rotated old_slot={old_slot} new_slot={} generation={} pid={}",
-                self.current_slot,
-                self.generation,
-                self.child.child.id()
-            ),
-        )
-    }
-}
-
-fn start_app_server_generation(
-    spec: &ServiceSpecArgs,
-    paths: &ManagerPaths,
-    slot_override: Option<&str>,
-    generation: u64,
-) -> Result<AppServerGeneration> {
-    let runtime = run::select_runtime(
-        paths,
-        slot_override.or(spec.slot.as_deref()),
-        spec.target.as_deref(),
-        false,
-    )?;
-    let real_codex = run::resolve_codex_bin(spec.codex_bin.as_deref())?;
-    let upstream = ServiceListenUrl {
-        host: String::from("127.0.0.1"),
-        port: 0,
-    }
-    .resolve()?;
-    let upstream_listen_url = upstream.websocket_url();
-
-    let spec_command = run::build_slot_command_spec(
-        paths,
-        real_codex,
-        &runtime.slot,
-        runtime.target.as_ref(),
-        vec![
-            "app-server".into(),
-            "--listen".into(),
-            upstream_listen_url.clone().into(),
-        ],
-    )?;
-    let slot = spec_command.slot().to_string();
-    let codex_home = spec_command.codex_home.clone();
-    let target = spec_command.target_name().map(str::to_string);
-    let mut command = spec_command.into_command();
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    let mut child = command
-        .spawn()
-        .context("spawn codex app-server generation")?;
-    if let Err(err) =
-        wait_for_app_server_ready(&upstream.readyz_url(), Duration::from_secs(15), &mut child)
-    {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(err);
-    }
-    log_line(
-        paths,
-        &format!(
-            "app-server generation={generation} slot={slot} target={} upstream={upstream_listen_url} pid={}",
-            target.as_deref().unwrap_or("<none>"),
-            child.id()
-        ),
-    )?;
-    Ok(AppServerGeneration {
-        child: ManagedChild {
-            name: "app-server",
-            child,
-            started_at_unix: unix_now()?,
-            restarts: generation,
-            last_exit: None,
-        },
-        slot,
-        codex_home,
-        target,
-        upstream_listen_url,
-    })
-}
-
-fn replace_proxy_upstream(upstream_url: &Arc<RwLock<String>>, next_url: &str) -> Result<()> {
-    let mut stored = upstream_url
-        .write()
-        .map_err(|_| anyhow::anyhow!("proxy upstream lock poisoned"))?;
-    *stored = next_url.to_string();
-    Ok(())
-}
-
-fn restore_sessions_on_generation(
-    paths: &ManagerPaths,
-    generation: &AppServerGeneration,
-    generation_index: u64,
-) -> Result<usize> {
-    let sessions = session::list_sessions(paths)?;
-    let bindings = sessions
-        .into_iter()
-        .filter_map(|session| {
-            session
-                .app_thread
-                .clone()
-                .map(|app_thread| (session, app_thread))
-        })
-        .collect::<Vec<_>>();
-    if bindings.is_empty() {
-        return Ok(0);
-    }
-
-    let mut client =
-        AppServerClient::connect(&generation.upstream_listen_url, Duration::from_secs(5))
-            .with_context(|| {
-                format!(
-                    "connect new app-server generation {}",
-                    generation.upstream_listen_url
-                )
-            })?;
-    client.initialize("cx-service", env!("CARGO_PKG_VERSION"))?;
-
-    let mut restored = 0_usize;
-    for (session, app_thread) in bindings {
-        let Some(path) = app_thread.path.as_deref() else {
-            continue;
-        };
-        let read = match client.thread_read(&app_thread.thread_id, false) {
-            Ok(read) => read,
-            Err(_) => client
-                .thread_resume_with_path(
-                    &app_thread.thread_id,
-                    Some(path),
-                    Some(&app_thread.cwd),
-                    true,
-                )
-                .with_context(|| {
-                    format!(
-                        "resume app-server thread {} from path {} on slot {}",
-                        app_thread.thread_id, path, generation.slot
-                    )
-                })?,
-        };
-        session::bind_app_thread(
-            paths,
-            BindAppThreadRequest {
-                session_id: session.session_id,
-                app_thread: AppThreadBinding {
-                    thread_id: read.summary.upstream_thread_id.clone(),
-                    cwd: if read.summary.cwd.is_empty() {
-                        app_thread.cwd
-                    } else {
-                        read.summary.cwd.clone()
-                    },
-                    title: read.summary.title.clone().or(app_thread.title),
-                    slot: Some(generation.slot.clone()),
-                    generation: generation_index,
-                    path: read.summary.path.clone().or_else(|| Some(path.to_string())),
-                    updated_at_unix: read.summary.updated_at_unix.max(0) as u64,
-                },
-            },
-        )?;
-        restored += 1;
-    }
-    Ok(restored)
-}
-
-fn proxy_event_log_path(paths: &ManagerPaths) -> PathBuf {
-    paths.serve_dir().join("events").join("default.jsonl")
-}
-
-fn proxy_event_log_len(paths: &ManagerPaths) -> Result<u64> {
-    Ok(fs::metadata(proxy_event_log_path(paths))?.len())
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ServiceListenUrl {
-    host: String,
-    port: u16,
-}
-
-impl ServiceListenUrl {
-    fn parse(raw: &str) -> Result<Self> {
-        let Some(rest) = raw.strip_prefix("ws://") else {
-            anyhow::bail!("service --listen only supports ws:// loopback URLs");
-        };
-        if rest.contains('/') {
-            anyhow::bail!("service --listen must not include a path");
-        }
-        let Some((host, port)) = rest.rsplit_once(':') else {
-            anyhow::bail!("service --listen requires host:port");
-        };
-        if !matches!(host, "127.0.0.1" | "localhost") {
-            anyhow::bail!("service --listen must bind a loopback host");
-        }
-        let port = port
-            .parse::<u16>()
-            .with_context(|| format!("invalid service --listen port: {port}"))?;
-        Ok(Self {
-            host: host.to_string(),
-            port,
-        })
-    }
-
-    fn resolve(self) -> Result<Self> {
-        if self.port != 0 {
-            return Ok(self);
-        }
-        let listener = TcpListener::bind(("127.0.0.1", 0)).context("reserve loopback port")?;
-        let port = listener.local_addr().context("read reserved port")?.port();
-        drop(listener);
-        Ok(Self { port, ..self })
-    }
-
-    fn websocket_url(&self) -> String {
-        format!("ws://{}:{}", self.host, self.port)
-    }
-
-    fn readyz_url(&self) -> String {
-        format!("http://{}:{}/readyz", self.host, self.port)
-    }
-}
-
-fn wait_for_app_server_ready(readyz_url: &str, timeout: Duration, child: &mut Child) -> Result<()> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_millis(500))
-        .build()
-        .context("build app-server readyz client")?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(status) = child.try_wait().context("poll codex app-server")? {
-            anyhow::bail!("codex app-server exited before ready with {status}");
-        }
-        if let Ok(response) = client.get(readyz_url).send() {
-            if response.status().is_success() {
-                return Ok(());
-            }
-        }
-        if Instant::now() >= deadline {
-            anyhow::bail!("timed out waiting for codex app-server ready endpoint {readyz_url}");
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-}
-
 fn start_telegram_child(spec: &ServiceSpecArgs, paths: &ManagerPaths) -> Result<ManagedChild> {
     let mut command = cx_command()?;
     command.arg("channel").arg("telegram").arg("run");
@@ -1141,20 +555,37 @@ fn telegram_token(spec: &ServiceSpecArgs, paths: &ManagerPaths) -> Result<Option
 fn service_state(
     paths: &ManagerPaths,
     supervisor_started_at: u64,
-    serve: &ManagedChild,
+    supervisor_process_group_id: Option<u32>,
+    broker: &AppServerBroker,
     telegram: Option<&ManagedChild>,
 ) -> Result<ServiceStateFile> {
-    let mut children = vec![child_state(serve)?];
+    let mut children = broker_child_states(broker)?;
     if let Some(telegram) = telegram {
         children.push(child_state(telegram)?);
     }
     Ok(ServiceStateFile {
         schema_version: SERVICE_STATE_SCHEMA_VERSION,
         pid: std::process::id(),
+        process_group_id: supervisor_process_group_id,
         started_at_unix: supervisor_started_at,
         log_file: paths.service_log_file().display().to_string(),
         children,
     })
+}
+
+fn broker_child_states(broker: &AppServerBroker) -> Result<Vec<ServiceChildState>> {
+    Ok(broker
+        .worker_records()?
+        .into_iter()
+        .map(|worker| ServiceChildState {
+            name: format!("worker:{}", worker.slot),
+            pid: worker.pid,
+            started_at_unix: worker.started_at_unix,
+            restarts: worker.generation,
+            last_exit: (worker.status != crate::worker_pool::WorkerStatus::Ready)
+                .then(|| format!("{:?}", worker.status)),
+        })
+        .collect())
 }
 
 fn child_state(child: &ManagedChild) -> Result<ServiceChildState> {
@@ -1169,27 +600,31 @@ fn child_state(child: &ManagedChild) -> Result<ServiceChildState> {
 
 fn wait_for_service_state(
     path: &Path,
-    supervisor_pid: u32,
+    supervisor: &mut Child,
     timeout: Duration,
 ) -> Result<Option<ServiceStateFile>> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if let Some(state) = read_state_if_exists(path)? {
-            if state.pid == supervisor_pid {
+            if state.pid == supervisor.id() {
                 return Ok(Some(state));
             }
+        }
+        if let Some(status) = supervisor
+            .try_wait()
+            .context("poll cx service supervisor during startup")?
+        {
+            anyhow::bail!("cx service supervisor exited before writing state: {status}");
         }
         thread::sleep(Duration::from_millis(100));
     }
     Ok(None)
 }
 
-fn wait_for_pids_stopped(state: &ServiceStateFile, timeout_secs: f32) -> bool {
+fn wait_for_service_stopped(state: &ServiceStateFile, timeout_secs: f32) -> bool {
     let deadline = Instant::now() + Duration::from_secs_f32(timeout_secs);
     loop {
-        let service_alive = process_exists(state.pid);
-        let child_alive = state.children.iter().any(|child| process_exists(child.pid));
-        if !service_alive && !child_alive {
+        if service_stopped(state) {
             return true;
         }
         if Instant::now() >= deadline {
@@ -1197,6 +632,15 @@ fn wait_for_pids_stopped(state: &ServiceStateFile, timeout_secs: f32) -> bool {
         }
         thread::sleep(Duration::from_millis(100));
     }
+}
+
+fn service_stopped(state: &ServiceStateFile) -> bool {
+    if let Some(process_group_id) = verified_service_process_group(state) {
+        return !process_group_exists(process_group_id);
+    }
+    let service_alive = service_state_is_current(state);
+    let child_alive = state.children.iter().any(|child| process_exists(child.pid));
+    !service_alive && !child_alive
 }
 
 fn write_service_state(paths: &ManagerPaths, state: ServiceStateFile) -> Result<()> {
@@ -1359,6 +803,9 @@ fn print_stop(report: ServiceStopReport, json: bool) -> Result<()> {
 
 fn print_service_state(service: ServiceStateFile) {
     println!("pid: {}", service.pid);
+    if let Some(process_group_id) = service.process_group_id {
+        println!("process_group_id: {process_group_id}");
+    }
     println!("started_at_unix: {}", service.started_at_unix);
     for child in service.children {
         println!(
@@ -1393,6 +840,35 @@ fn log_line(paths: &ManagerPaths, message: &str) -> Result<()> {
         .open(paths.service_log_file())
         .with_context(|| format!("open {}", paths.service_log_file().display()))?;
     writeln!(log, "[{}] {message}", unix_now()?).context("write service log")
+}
+
+fn configure_supervisor_process_group(paths: &ManagerPaths) -> Result<Option<u32>> {
+    #[cfg(unix)]
+    {
+        let pid = std::process::id();
+        if current_process_group_id() == Some(pid) {
+            return Ok(Some(pid));
+        }
+        // SAFETY: setpgid is called for the current process before the service
+        // supervisor starts children. No borrowed Rust state crosses the call.
+        let set_result = unsafe { libc::setpgid(0, 0) };
+        if set_result == 0 && current_process_group_id() == Some(pid) {
+            return Ok(Some(pid));
+        }
+        let err = std::io::Error::last_os_error();
+        log_line(
+            paths,
+            &format!(
+                "service supervisor could not create isolated process group; stop will use recorded pid snapshot only: {err}"
+            ),
+        )?;
+        Ok(None)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = paths;
+        Ok(None)
+    }
 }
 
 fn cx_command() -> Result<Command> {
@@ -1617,6 +1093,14 @@ impl Signal {
             Self::Kill => "-KILL",
         }
     }
+
+    #[cfg(unix)]
+    fn signo(self) -> libc::c_int {
+        match self {
+            Self::Terminate => libc::SIGTERM,
+            Self::Kill => libc::SIGKILL,
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -1639,6 +1123,68 @@ fn send_signal(_pid: u32, _signal: Signal) -> Result<()> {
     anyhow::bail!("cx service stop is only supported on Unix platforms");
 }
 
+fn signal_service(state: &ServiceStateFile, signal: Signal) {
+    if let Some(process_group_id) = verified_service_process_group(state) {
+        if current_process_group_id() != Some(process_group_id) {
+            let _ = send_signal_to_process_group(process_group_id, signal);
+        }
+    }
+    for child in &state.children {
+        let _ = send_signal(child.pid, signal);
+    }
+    let _ = send_signal(state.pid, signal);
+}
+
+fn service_state_is_current(state: &ServiceStateFile) -> bool {
+    if let Some(process_group_id) = verified_service_process_group(state) {
+        return process_group_exists(process_group_id);
+    }
+    legacy_service_process_is_current(state.pid)
+}
+
+#[cfg(unix)]
+fn legacy_service_process_is_current(pid: u32) -> bool {
+    process_exists(pid) && process_looks_like_service_supervisor(pid)
+}
+
+#[cfg(not(unix))]
+fn legacy_service_process_is_current(pid: u32) -> bool {
+    process_exists(pid)
+}
+
+fn verified_service_process_group(state: &ServiceStateFile) -> Option<u32> {
+    let process_group_id = state.process_group_id?;
+    if pid_process_group_id(state.pid) != Some(process_group_id) {
+        return None;
+    }
+    if !process_looks_like_service_supervisor(state.pid) {
+        return None;
+    }
+    Some(process_group_id)
+}
+
+#[cfg(unix)]
+fn send_signal_to_process_group(process_group_id: u32, signal: Signal) -> Result<()> {
+    let pgid = i32::try_from(process_group_id)
+        .with_context(|| format!("invalid process group id {process_group_id}"))?;
+    if pgid <= 0 {
+        anyhow::bail!("invalid process group id {process_group_id}");
+    }
+    // SAFETY: kill is invoked with a negative process group id and a fixed
+    // signal number. It does not alias Rust memory.
+    let result = unsafe { libc::kill(-pgid, signal.signo()) };
+    if result == 0 {
+        return Ok(());
+    }
+    Err(std::io::Error::last_os_error())
+        .with_context(|| format!("send signal to process group {process_group_id}"))
+}
+
+#[cfg(not(unix))]
+fn send_signal_to_process_group(_process_group_id: u32, _signal: Signal) -> Result<()> {
+    anyhow::bail!("cx service stop is only supported on Unix platforms");
+}
+
 #[cfg(unix)]
 fn process_exists(pid: u32) -> bool {
     Command::new("ps")
@@ -1653,6 +1199,80 @@ fn process_exists(pid: u32) -> bool {
 #[cfg(not(unix))]
 fn process_exists(_pid: u32) -> bool {
     true
+}
+
+#[cfg(unix)]
+fn pid_process_group_id(pid: u32) -> Option<u32> {
+    let pid = i32::try_from(pid).ok()?;
+    // SAFETY: getpgid reads process metadata for the supplied pid and does not
+    // access Rust memory.
+    let pgid = unsafe { libc::getpgid(pid) };
+    if pgid < 0 {
+        return None;
+    }
+    u32::try_from(pgid).ok()
+}
+
+#[cfg(not(unix))]
+fn pid_process_group_id(_pid: u32) -> Option<u32> {
+    None
+}
+
+#[cfg(unix)]
+fn process_looks_like_service_supervisor(pid: u32) -> bool {
+    let Ok(output) = Command::new("ps")
+        .arg("-p")
+        .arg(pid.to_string())
+        .arg("-o")
+        .arg("command=")
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let command = String::from_utf8_lossy(&output.stdout);
+    command.contains("service") && command.contains("run")
+}
+
+#[cfg(not(unix))]
+fn process_looks_like_service_supervisor(_pid: u32) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn process_group_exists(process_group_id: u32) -> bool {
+    let Ok(pgid) = i32::try_from(process_group_id) else {
+        return false;
+    };
+    if pgid <= 0 {
+        return false;
+    }
+    // SAFETY: kill with signal 0 probes process group existence without
+    // delivering a signal and does not touch Rust memory.
+    let result = unsafe { libc::kill(-pgid, 0) };
+    if result == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn process_group_exists(_process_group_id: u32) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn current_process_group_id() -> Option<u32> {
+    // SAFETY: getpgrp takes no arguments and has no Rust memory effects.
+    let pgid = unsafe { libc::getpgrp() };
+    u32::try_from(pgid).ok()
+}
+
+#[cfg(not(unix))]
+fn current_process_group_id() -> Option<u32> {
+    None
 }
 
 fn unix_now() -> Result<u64> {
@@ -1733,6 +1353,22 @@ mod tests {
             .windows(2)
             .find_map(|window| (window[0] == "--codex-bin").then(|| window[1].clone()));
         assert_eq!(codex_bin, Some(String::from("/opt/homebrew/bin/codex")));
+    }
+
+    #[test]
+    fn legacy_service_state_defaults_process_group_to_none() {
+        let state = serde_json::from_str::<ServiceStateFile>(
+            r#"{
+                "schemaVersion": 1,
+                "pid": 123,
+                "startedAtUnix": 10,
+                "logFile": "/tmp/cx.log",
+                "children": []
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(state.process_group_id, None);
     }
 
     #[test]

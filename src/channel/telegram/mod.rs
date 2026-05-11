@@ -524,8 +524,10 @@ fn drain_watched_app_server_binding(
         ThreadResolverScope {
             cwd: resolver_cwd,
             channel_id: Some(binding.channel_id.clone()),
-            explicit_thread_id: Some(thread_id.to_string()),
-            slot: Some(server.slot),
+            explicit_resume_id: Some(thread_resolver::ExplicitResumeId::AppThreadOrCodexSession(
+                thread_id.to_string(),
+            )),
+            slot: server.app_slot(),
             generation: 0,
         },
     )?;
@@ -2361,10 +2363,11 @@ fn run_codex_turn(
         .map(PathBuf::from)
         .or_else(|| std::env::current_dir().ok())
         .context("resolve cwd for Telegram app-server thread")?;
-    let explicit_thread_id = binding_snapshot
+    let explicit_resume_id = binding_snapshot
         .app_thread_id
         .clone()
-        .or_else(|| session_app_thread.map(|app_thread| app_thread.thread_id));
+        .or_else(|| session_app_thread.map(|app_thread| app_thread.thread_id))
+        .map(thread_resolver::ExplicitResumeId::AppThreadOrCodexSession);
     let resolve_start = Instant::now();
     let outcome = thread_resolver::resolve_app_thread(
         paths,
@@ -2372,7 +2375,7 @@ fn run_codex_turn(
         ThreadResolverScope {
             cwd: resolver_cwd,
             channel_id: Some(binding_snapshot.channel_id.clone()),
-            explicit_thread_id,
+            explicit_resume_id,
             slot: None,
             generation: 0,
         },
@@ -2392,8 +2395,9 @@ fn run_codex_turn(
             elapsed_ms(resolve_start)
         );
     }
+    let resume_cwd = resolved_resume_cwd(paths, &binding_snapshot, &thread_id);
     let resume_start = Instant::now();
-    let resumed = client.thread_resume(&thread_id, binding_snapshot.app_thread_cwd.as_deref());
+    let resumed = client.thread_resume(&thread_id, resume_cwd.as_deref());
     if let Err(err) = resumed {
         eprintln!("app-server thread/resume before Telegram turn failed: {err:#}");
     }
@@ -2416,9 +2420,12 @@ fn run_codex_turn(
     let mut sink = notifier.map(|notifier| {
         TelegramWatchSink::new_best_effort(notifier, route.clone(), None, None, None)
     });
+    if let Some(sink) = sink.as_mut() {
+        sink.begin_pending_turn()?;
+    }
     let turn_start = Instant::now();
     let mut first_event_seen = false;
-    let turn = client.turn_start_stream(
+    let turn_result = client.turn_start_stream(
         &thread_id,
         prompt,
         |event| {
@@ -2442,7 +2449,17 @@ fn run_codex_turn(
             };
             handle_app_server_approval(paths, state, notifier, route, approval, timeout_secs)
         },
-    )?;
+    );
+    let turn = match turn_result {
+        Ok(turn) => turn,
+        Err(err) => {
+            if let Some(sink) = sink.as_mut() {
+                let _ = sink.turn_completed(None, TelegramTurnTerminal::Interrupted);
+                let _ = sink.flush_pending();
+            }
+            return Err(err);
+        }
+    };
     if trace_timings {
         eprintln!(
                 "telegram timing route={} thread_id={} phase=turn_complete first_event={} elapsed_ms={}",
@@ -2470,6 +2487,19 @@ fn run_codex_turn(
         assistant_text: turn.assistant_text,
         streamed_to_telegram: sink.is_some_and(|sink| sink.assistant_completed_text_sent()),
     })
+}
+
+fn resolved_resume_cwd(
+    paths: &ManagerPaths,
+    binding: &TelegramBinding,
+    thread_id: &str,
+) -> Option<String> {
+    session::show_session(paths, &binding.session_id)
+        .ok()
+        .and_then(|session| session.app_thread)
+        .filter(|app_thread| app_thread.thread_id == thread_id)
+        .map(|app_thread| app_thread.cwd)
+        .or_else(|| binding.app_thread_cwd.clone())
 }
 
 fn sync_binding_from_session(

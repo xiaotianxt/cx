@@ -102,12 +102,14 @@ struct PendingWorkerRequest {
     client_request_id: Value,
     thread_id: Option<String>,
     turn_reservation: Option<TurnReservation>,
+    replay_pending_approvals: bool,
 }
 
 #[derive(Debug, Clone)]
 struct WorkerRequestContext {
     thread_id: Option<String>,
     turn_reservation: Option<TurnReservation>,
+    replay_pending_approvals: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -979,6 +981,7 @@ impl WorkerLink {
                     client_request_id,
                     thread_id: context.thread_id,
                     turn_reservation: context.turn_reservation,
+                    replay_pending_approvals: context.replay_pending_approvals,
                 },
             );
         let text = serde_json::to_string(&request).context("encode worker message")?;
@@ -1142,9 +1145,30 @@ fn handle_worker_response(
         }
     }
     response["id"] = pending.client_request_id;
-    state
+    let sent = state
         .subscriptions
         .send_client(pending.client_id, serde_json::to_string(&response)?)?;
+    if sent && !is_error && pending.replay_pending_approvals {
+        if let Some(thread_id) = pending.thread_id.as_deref() {
+            replay_pending_approvals_to_client(state, pending.client_id, thread_id)?;
+        }
+    }
+    Ok(())
+}
+
+fn replay_pending_approvals_to_client(
+    state: &Arc<BrokerShared>,
+    client_id: ClientId,
+    thread_id: &str,
+) -> Result<()> {
+    state
+        .subscriptions
+        .mark_approval_ready(client_id, thread_id)?;
+    for request in state.approvals.pending_requests_for_thread(thread_id)? {
+        let _sent = state
+            .subscriptions
+            .send_client(client_id, serde_json::to_string(&request)?)?;
+    }
     Ok(())
 }
 
@@ -1181,7 +1205,7 @@ fn mark_pending_turn_started_from_response(
 fn handle_worker_request(
     state: &Arc<BrokerShared>,
     link: &Arc<WorkerLink>,
-    mut request: Value,
+    request: Value,
 ) -> Result<()> {
     let method = request
         .get("method")
@@ -1199,18 +1223,24 @@ fn handle_worker_request(
 
     let thread_id = router::message_thread_id(&request);
     let worker_request_id = request.get("id").cloned().unwrap_or(Value::Null);
-    let approval =
-        state
-            .approvals
-            .register(link.worker_id.clone(), worker_request_id, thread_id.clone())?;
+    let approval = state.approvals.register(
+        link.worker_id.clone(),
+        worker_request_id,
+        thread_id.clone(),
+        request,
+    )?;
     let broker_approval_id = approval.broker_approval_id.clone();
-    request["id"] = Value::String(broker_approval_id.clone());
-    let text = serde_json::to_string(&request)?;
-    let sent = match thread_id.as_deref() {
-        Some(thread_id) => state.subscriptions.fan_out_thread(thread_id, text)?,
+    let text = serde_json::to_string(&approval.request)?;
+    let subscribers = match thread_id.as_deref() {
+        Some(thread_id) => {
+            let delivery = state
+                .subscriptions
+                .fan_out_thread_approvals(thread_id, text)?;
+            delivery.subscribers
+        }
         None => 0,
     };
-    if sent == 0 {
+    if subscribers == 0 {
         state.approvals.cancel(&broker_approval_id)?;
         let id = approval.worker_request_id;
         link.send_raw(error_response(
@@ -1422,7 +1452,23 @@ fn handle_client_request(
                 .subscriptions
                 .send_client(client_id, serde_json::to_string(&response)?)?;
         }
-        BrokerRoute::ThreadRead { thread_id } | BrokerRoute::WorkerByThread { thread_id } => {
+        BrokerRoute::ThreadRead { thread_id } => {
+            state
+                .subscriptions
+                .subscribe_pending_approvals(client_id, &thread_id)?;
+            let assignment = state.choose_worker_for_thread(&thread_id)?;
+            state.send_worker_request(
+                assignment.worker,
+                client_id,
+                message,
+                WorkerRequestContext {
+                    thread_id: Some(thread_id),
+                    turn_reservation: None,
+                    replay_pending_approvals: true,
+                },
+            )?;
+        }
+        BrokerRoute::WorkerByThread { thread_id } => {
             state.subscriptions.subscribe(client_id, &thread_id)?;
             let assignment = state.choose_worker_for_thread(&thread_id)?;
             state.send_worker_request(
@@ -1432,11 +1478,14 @@ fn handle_client_request(
                 WorkerRequestContext {
                     thread_id: Some(thread_id),
                     turn_reservation: None,
+                    replay_pending_approvals: false,
                 },
             )?;
         }
         BrokerRoute::ThreadResume { thread_id } => {
-            state.subscriptions.subscribe(client_id, &thread_id)?;
+            state
+                .subscriptions
+                .subscribe_pending_approvals(client_id, &thread_id)?;
             let assignment = state.choose_worker_for_thread(&thread_id)?;
             let request = if state
                 .resume_should_use_loaded_owner(&assignment.worker.worker_id, &thread_id)?
@@ -1452,6 +1501,7 @@ fn handle_client_request(
                 WorkerRequestContext {
                     thread_id: Some(thread_id),
                     turn_reservation: None,
+                    replay_pending_approvals: true,
                 },
             )?;
         }
@@ -1465,6 +1515,7 @@ fn handle_client_request(
                 WorkerRequestContext {
                     thread_id: Some(thread_id),
                     turn_reservation: assignment.turn_reservation,
+                    replay_pending_approvals: false,
                 },
             )?;
         }
@@ -1488,6 +1539,7 @@ fn handle_client_request(
                 WorkerRequestContext {
                     thread_id: Some(thread_id),
                     turn_reservation: None,
+                    replay_pending_approvals: false,
                 },
             )?;
         }
@@ -1500,6 +1552,7 @@ fn handle_client_request(
                 WorkerRequestContext {
                     thread_id: None,
                     turn_reservation: None,
+                    replay_pending_approvals: false,
                 },
             )?;
         }
@@ -2799,6 +2852,7 @@ mod tests {
             WorkerRequestContext {
                 thread_id: Some(String::from("thread-1")),
                 turn_reservation: None,
+                replay_pending_approvals: false,
             },
         )
         .unwrap();
@@ -2850,6 +2904,7 @@ mod tests {
                 WorkerRequestContext {
                     thread_id: None,
                     turn_reservation: None,
+                    replay_pending_approvals: false,
                 },
             )
             .unwrap();
@@ -2949,6 +3004,153 @@ mod tests {
         assert!(worker_rx.recv_timeout(Duration::from_millis(150)).is_err());
         link.close();
         server.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn pending_approval_replays_after_thread_attach_response() {
+        let state = test_state();
+        let link = test_link(WorkerId::new("dia4", 1));
+        let original_client = ClientId::new(1);
+        let resumed_client = ClientId::new(2);
+        let (original_tx, original_rx) = mpsc::channel();
+        let (resumed_tx, resumed_rx) = mpsc::channel();
+        state
+            .subscriptions
+            .register_client(original_client, ClientSink::new(original_tx))
+            .unwrap();
+        state
+            .subscriptions
+            .register_client(resumed_client, ClientSink::new(resumed_tx))
+            .unwrap();
+        state
+            .subscriptions
+            .subscribe(original_client, "thread-1")
+            .unwrap();
+        state
+            .subscriptions
+            .subscribe_pending_approvals(resumed_client, "thread-1")
+            .unwrap();
+
+        handle_worker_request(
+            &state,
+            &link,
+            json!({
+                "id": 77,
+                "method": "item/commandExecution/requestApproval",
+                "params": {"threadId": "thread-1", "turnId": "turn-1", "command": "true"}
+            }),
+        )
+        .unwrap();
+        let original_approval =
+            serde_json::from_str::<Value>(&recv_client_text(&original_rx)).unwrap();
+        let approval_id = original_approval.get("id").cloned().unwrap();
+        assert!(resumed_rx.try_recv().is_err());
+
+        link.pending.lock().unwrap().insert(
+            5,
+            PendingWorkerRequest {
+                client_id: resumed_client,
+                client_request_id: json!("thread-read"),
+                thread_id: Some(String::from("thread-1")),
+                turn_reservation: None,
+                replay_pending_approvals: true,
+            },
+        );
+
+        handle_worker_response(
+            &state,
+            &link,
+            json!({
+                "id": 5,
+                "result": {}
+            }),
+        )
+        .unwrap();
+
+        let read_response = serde_json::from_str::<Value>(&recv_client_text(&resumed_rx)).unwrap();
+        assert_eq!(read_response.get("id"), Some(&json!("thread-read")));
+        let replayed_approval =
+            serde_json::from_str::<Value>(&recv_client_text(&resumed_rx)).unwrap();
+        assert_eq!(replayed_approval.get("id"), Some(&approval_id));
+        assert_eq!(
+            replayed_approval.get("method").and_then(Value::as_str),
+            Some("item/commandExecution/requestApproval")
+        );
+
+        handle_worker_request(
+            &state,
+            &link,
+            json!({
+                "id": 78,
+                "method": "item/commandExecution/requestApproval",
+                "params": {"threadId": "thread-1", "turnId": "turn-1", "command": "false"}
+            }),
+        )
+        .unwrap();
+        let original_next = serde_json::from_str::<Value>(&recv_client_text(&original_rx)).unwrap();
+        let resumed_next = serde_json::from_str::<Value>(&recv_client_text(&resumed_rx)).unwrap();
+        assert_eq!(
+            original_next.get("id").and_then(Value::as_str),
+            resumed_next.get("id").and_then(Value::as_str)
+        );
+    }
+
+    #[test]
+    fn pending_attach_does_not_auto_reject_worker_approval() {
+        let state = test_state();
+        let (link, worker_rx) = test_link_with_rx(WorkerId::new("dia4", 1));
+        let client_id = ClientId::new(1);
+        let (tx, rx) = mpsc::channel();
+        state
+            .subscriptions
+            .register_client(client_id, ClientSink::new(tx))
+            .unwrap();
+        state
+            .subscriptions
+            .subscribe_pending_approvals(client_id, "thread-1")
+            .unwrap();
+
+        handle_worker_request(
+            &state,
+            &link,
+            json!({
+                "id": 77,
+                "method": "item/commandExecution/requestApproval",
+                "params": {"threadId": "thread-1", "turnId": "turn-1", "command": "true"}
+            }),
+        )
+        .unwrap();
+
+        assert!(rx.try_recv().is_err());
+        assert!(worker_rx.try_recv().is_err());
+        assert_eq!(
+            state
+                .approvals
+                .pending_requests_for_thread("thread-1")
+                .unwrap()
+                .len(),
+            1
+        );
+
+        link.pending.lock().unwrap().insert(
+            5,
+            PendingWorkerRequest {
+                client_id,
+                client_request_id: json!("thread-read"),
+                thread_id: Some(String::from("thread-1")),
+                turn_reservation: None,
+                replay_pending_approvals: true,
+            },
+        );
+        handle_worker_response(&state, &link, json!({"id": 5, "result": {}})).unwrap();
+
+        let read_response = serde_json::from_str::<Value>(&recv_client_text(&rx)).unwrap();
+        assert_eq!(read_response.get("id"), Some(&json!("thread-read")));
+        let replayed_approval = serde_json::from_str::<Value>(&recv_client_text(&rx)).unwrap();
+        assert_eq!(
+            replayed_approval.get("method").and_then(Value::as_str),
+            Some("item/commandExecution/requestApproval")
+        );
     }
 
     #[test]
@@ -3081,6 +3283,7 @@ mod tests {
                 client_request_id: json!("client-request"),
                 thread_id: Some(String::from("thread-1")),
                 turn_reservation: None,
+                replay_pending_approvals: false,
             },
         );
 
@@ -3163,6 +3366,7 @@ mod tests {
                 client_request_id: json!("client-request"),
                 thread_id: Some(String::from("thread-1")),
                 turn_reservation: None,
+                replay_pending_approvals: false,
             },
         );
 
@@ -3206,6 +3410,7 @@ mod tests {
                     worker_id: link.worker_id.clone(),
                     reservation_id: TurnReservationId::new(1),
                 }),
+                replay_pending_approvals: false,
             },
         );
 

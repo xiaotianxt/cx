@@ -122,7 +122,7 @@ struct SlotRetryState {
 
 const CANDIDATE_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 const USAGE_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
-const WORKER_START_READY_TIMEOUT: Duration = Duration::from_secs(5);
+const WORKER_START_READY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum WorkerLifecycleEvent {

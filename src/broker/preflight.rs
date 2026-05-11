@@ -311,7 +311,9 @@ fn accept_connections(
                     let _ = stream.shutdown(Shutdown::Both);
                     return Ok(AcceptOutcome::Ready);
                 }
-                if connections.len() >= limits.total {
+                if connections.len() >= limits.total
+                    && !evict_oldest_incomplete_connection(registry, connections)
+                {
                     let _ = stream.shutdown(Shutdown::Both);
                     continue;
                 }
@@ -323,12 +325,10 @@ fn accept_connections(
                     incomplete_connection_count(connections) >= limits.incomplete;
                 let mut connection = PreflightConnection::new(stream);
                 match connection.read_request(state) {
-                    Ok(PreflightProgress::Pending)
-                        if over_incomplete_limit && connection.incomplete() =>
-                    {
-                        let _ = connection.stream.shutdown(Shutdown::Both);
-                    }
                     Ok(PreflightProgress::Pending) => {
+                        if over_incomplete_limit && connection.incomplete() {
+                            let _ = evict_oldest_incomplete_connection(registry, connections);
+                        }
                         let interest = connection.interest();
                         registry
                             .register(&mut connection.stream, token, interest)
@@ -364,6 +364,26 @@ fn accept_connections(
             Err(err) => return Err(err).context("accept broker client"),
         }
     }
+}
+
+fn evict_oldest_incomplete_connection(
+    registry: &mio::Registry,
+    connections: &mut BTreeMap<Token, PreflightConnection>,
+) -> bool {
+    let token = connections
+        .iter()
+        .filter(|(_, connection)| connection.incomplete())
+        .min_by_key(|(_, connection)| connection.deadline)
+        .map(|(token, _)| *token);
+    let Some(token) = token else {
+        return false;
+    };
+    if let Some(mut connection) = connections.remove(&token) {
+        let _ = registry.deregister(&mut connection.stream);
+        let _ = connection.stream.shutdown(Shutdown::Both);
+        return true;
+    }
+    false
 }
 
 fn handle_connection_event(

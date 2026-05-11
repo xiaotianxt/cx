@@ -119,30 +119,32 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
     let clean_tui_launch = options.codex_args.is_empty();
     let workspace = resolve_workspace_from_args(&options.codex_args)?;
     let requested_resume_id = explicit_resume_id(&options.codex_args);
-    match remote_attach_spec(
-        &paths,
-        real_codex.clone(),
-        &options.codex_args,
-        &workspace,
-        requested_resume_id,
-        clean_tui_launch,
-    ) {
-        Ok(Some(spec)) => {
-            warn_remote_ignores_local_selection(&options, &spec);
-            let resumed_id = explicit_resume_id(&spec.args);
-            print_launch(
-                &spec,
-                resumed_id.as_ref().map(ExplicitResumeId::as_str),
-                options.quiet,
-            );
-            if let Err(err) = supervise_remote_tui(&paths, spec) {
-                warn_remote_fallback(&err);
-            } else {
-                return Ok(());
+    if should_try_service_remote(&options) {
+        match remote_attach_spec(
+            &paths,
+            real_codex.clone(),
+            &options.codex_args,
+            &workspace,
+            requested_resume_id,
+            clean_tui_launch,
+        ) {
+            Ok(Some(spec)) => {
+                warn_remote_ignores_local_selection(&options, &spec);
+                let resumed_id = explicit_resume_id(&spec.args);
+                print_launch(
+                    &spec,
+                    resumed_id.as_ref().map(ExplicitResumeId::as_str),
+                    options.quiet,
+                );
+                if let Err(err) = supervise_remote_tui(&paths, spec) {
+                    warn_remote_fallback(&err);
+                } else {
+                    return Ok(());
+                }
             }
+            Ok(None) => {}
+            Err(err) => warn_remote_fallback(&err),
         }
-        Ok(None) => {}
-        Err(err) => warn_remote_fallback(&err),
     }
 
     let target = crate::target::load_optional_target(&paths, options.target.as_deref())?;
@@ -324,6 +326,10 @@ fn print_launch(spec: &CodexCommandSpec, resumed_id: Option<&str>, quiet: bool) 
 
 fn warn_remote_fallback(err: &anyhow::Error) {
     eprintln!("cx warning: service remote unavailable ({err:#}); falling back to local Codex");
+}
+
+fn should_try_service_remote(options: &RunOptions) -> bool {
+    options.slot.is_none() && options.target.is_none()
 }
 
 fn warn_remote_ignores_local_selection(options: &RunOptions, spec: &CodexCommandSpec) {
@@ -626,11 +632,22 @@ pub(crate) fn resolve_codex_bin(override_path: Option<&Path>) -> Result<PathBuf>
     if let Some(path) = find_executable_on_path(Path::new("codex")) {
         return Ok(path);
     }
-    let fallback = paths::home_dir()?.join(".local/share/mise/installs/codex/0.125.0/codex");
-    if fallback.exists() {
-        return Ok(fallback);
+    for fallback in default_codex_bin_candidates()? {
+        if fallback.is_file() {
+            return Ok(fallback);
+        }
     }
     Ok(PathBuf::from("codex"))
+}
+
+fn default_codex_bin_candidates() -> Result<Vec<PathBuf>> {
+    let home = paths::home_dir()?;
+    Ok(vec![
+        PathBuf::from("/opt/homebrew/bin/codex"),
+        PathBuf::from("/usr/local/bin/codex"),
+        home.join(".local/bin/codex"),
+        home.join(".local/share/mise/installs/codex/0.125.0/codex"),
+    ])
 }
 
 pub(crate) fn find_executable_on_path(command: &Path) -> Option<PathBuf> {
@@ -931,6 +948,31 @@ mod tests {
             options.codex_args,
             vec![OsString::from("-m"), OsString::from("gpt-5.5")]
         );
+    }
+
+    #[test]
+    fn service_remote_is_skipped_for_explicit_slot() {
+        let options =
+            parse_run_args(vec![OsString::from("--slot"), OsString::from("deepseek")]).unwrap();
+
+        assert_eq!(options.slot, Some(String::from("deepseek")));
+        assert!(!should_try_service_remote(&options));
+    }
+
+    #[test]
+    fn service_remote_is_skipped_for_explicit_target() {
+        let options =
+            parse_run_args(vec![OsString::from("--target"), OsString::from("research")]).unwrap();
+
+        assert_eq!(options.target, Some(String::from("research")));
+        assert!(!should_try_service_remote(&options));
+    }
+
+    #[test]
+    fn service_remote_is_used_for_plain_launch() {
+        let options = parse_run_args(Vec::new()).unwrap();
+
+        assert!(should_try_service_remote(&options));
     }
 
     #[test]

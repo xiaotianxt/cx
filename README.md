@@ -17,8 +17,8 @@ live usage.
 - `cx add` / `cx login` / `cx remove`: manage isolated Codex slots.
 - `cx select`: print the best slot name for scripts.
 - `cx desktop`: launch Codex Desktop through a selected slot.
-- `cx --target <name>`: use a named target-specific slot group for local
-  fallback; when service remote is active, the service target wins.
+- `cx --slot <name>` / `cx --target <name>`: force a local launch through that
+  slot or target, bypassing the service broker.
 - `cx serve start` / `cx serve stop`: manage a foreground loopback Codex
   app-server through a selected slot.
 - `cx service start`: run the broker, worker pool, and Telegram adapter under one local
@@ -127,13 +127,14 @@ cx --slot bus1 -m gpt-5.4
 cx --target research -m gpt-5.5
 ```
 
-For a clean `cx` launch or an explicit `cx resume <session-id>`, `cx` first
-asks the service broker to resolve the thread for the current working
-directory. If the service is unavailable, local fallback preserves the old
-auto-resume behavior: clean launches inspect the latest unarchived local Codex
-session and run `codex resume <session-id>` when it is safe. Prompt-bearing
-launches, `exec`, `review`, `help`, and user-supplied remote app-server
-launches are not rewritten by cx.
+For a clean `cx` launch or an explicit `cx resume <session-id>` without
+`--slot` or `--target`, `cx` first asks the service broker to resolve the
+thread for the current working directory. If the service is unavailable, local
+fallback preserves the old auto-resume behavior: clean launches inspect the
+latest unarchived local Codex session and run `codex resume <session-id>` when
+it is safe. Prompt-bearing launches, explicit slot or target launches, `exec`,
+`review`, `help`, and user-supplied remote app-server launches are not
+rewritten by cx.
 
 By default, `cx` tries to attach the local TUI to the cx service broker:
 

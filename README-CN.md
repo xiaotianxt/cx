@@ -13,8 +13,8 @@ cx 是一个本地 Codex 入口：负责启动 Codex、处理 stdin pipe、管�
 - `cx stats`：从本地 `state_5.sqlite` 汇总 Codex token 消耗。
 - `cx add` / `cx login` / `cx remove`：管理独立 slot。
 - `cx desktop`：通过选中的 slot 启动 Codex Desktop。
-- `cx --target <name>`：本地 fallback 时使用命名 target 的 slot 组和覆盖策略；service
-  remote 可用时以 service 的 target 为准。
+- `cx --slot <name>` / `cx --target <name>`：强制本地使用指定 slot 或 target
+  启动，绕过 service broker。
 - `cx serve start` / `cx serve stop`：通过选中的 slot 管理前台 loopback Codex
   app-server。
 - `cx service start`：用一个本地后台 supervisor 同时运行 broker、worker pool 和 Telegram adapter。
@@ -108,11 +108,12 @@ cx --slot bus1 -m gpt-5.4
 cx --target research -m gpt-5.5
 ```
 
-干净的 `cx` 启动或显式 `cx resume <session-id>` 会先交给 service broker
-解析当前工作目录对应的 thread。如果 service 不可用，本地 fallback 会保留原来的
-auto-resume 行为：干净启动会检查当前工作目录下最新的、未归档的 Codex session，
-并在安全时执行 `codex resume <session-id>`。带 prompt 的启动、`exec`、`review`、
-`help`，以及用户自己传入的 remote app-server 启动，不会被 cx 改写。
+没有 `--slot` 或 `--target` 的干净 `cx` 启动，或显式 `cx resume <session-id>`，
+会先交给 service broker 解析当前工作目录对应的 thread。如果 service 不可用，本地
+fallback 会保留原来的 auto-resume 行为：干净启动会检查当前工作目录下最新的、未归档的
+Codex session，并在安全时执行 `codex resume <session-id>`。带 prompt 的启动、显式
+slot/target 启动、`exec`、`review`、`help`，以及用户自己传入的 remote app-server
+启动，不会被 cx 改写。
 
 默认情况下，`cx` 会把本地 TUI 接到 cx service broker：
 

@@ -6,7 +6,7 @@ cx 是一个本地 Codex 入口：负责启动 Codex、处理 stdin pipe、管�
 
 它把这几件事合成一个命令：
 
-- `cx`：优先连接到 cx service app-server；如果 service 不可用，就 fallback 到本地最佳
+- `cx`：优先连接到 cx service broker；如果 service 不可用，就 fallback 到本地最佳
   slot 启动 Codex。
 - `cat file | cx "总结一下"`：把 stdin 包成上下文后进入 Codex TUI。
 - `cx status`：并发查看所有 slot 的真实用量。
@@ -17,7 +17,7 @@ cx 是一个本地 Codex 入口：负责启动 Codex、处理 stdin pipe、管�
   remote 可用时以 service 的 target 为准。
 - `cx serve start` / `cx serve stop`：通过选中的 slot 管理前台 loopback Codex
   app-server。
-- `cx service start`：用一个本地后台 supervisor 同时运行 app-server 和 Telegram adapter。
+- `cx service start`：用一个本地后台 supervisor 同时运行 broker、worker pool 和 Telegram adapter。
 - `cx serve daemon` / `cx serve ping`：运行并检查本地 cx control socket。
 - `cx channel telegram run`：把 allowlist 里的 Telegram chat 接入 cx session 和 lease。
 - `cx protocol export`：导出与当前 Codex binary 匹配的 App Server schema 和 TypeScript
@@ -108,13 +108,13 @@ cx --slot bus1 -m gpt-5.4
 cx --target research -m gpt-5.5
 ```
 
-干净的 `cx` 启动或显式 `cx resume <session-id>` 会先交给 service app-server
+干净的 `cx` 启动或显式 `cx resume <session-id>` 会先交给 service broker
 解析当前工作目录对应的 thread。如果 service 不可用，本地 fallback 会保留原来的
 auto-resume 行为：干净启动会检查当前工作目录下最新的、未归档的 Codex session，
 并在安全时执行 `codex resume <session-id>`。带 prompt 的启动、`exec`、`review`、
 `help`，以及用户自己传入的 remote app-server 启动，不会被 cx 改写。
 
-默认情况下，`cx` 会把本地 TUI 接到 cx service app-server：
+默认情况下，`cx` 会把本地 TUI 接到 cx service broker：
 
 ```bash
 cx service start --no-telegram
@@ -122,8 +122,8 @@ cx
 cx resume <session-id>
 ```
 
-service 负责 slot 选择、session restore 和 app-server rotation。前台 `cx` 进程会启动
-真正的 Codex TUI，让它作为 remote client 连接 service。如果 service app-server 不存在、
+service broker 负责全局 thread 路由，并调度 slot workers。前台 `cx` 进程会启动
+真正的 Codex TUI，让它作为 remote client 连接 service。如果 service broker 不存在、
 状态过期，或不能解析目标 thread，`cx` 会打印 warning，然后 fallback 到本地 slot 启动。
 
 stdin pipe：
@@ -310,12 +310,8 @@ id，写入 `serve/sessions/<session-id>.json`，并向 `serve/events.ndjson` �
 `session-created` 事件。`cx serve lease acquire` 会记录当前持有 session 的 channel，
 递增 `leaseEpoch`，返回 lease token，并追加 lease event。如果 session 已经有 active
 lease，新的 acquire 默认失败，只有显式 `--steal` 才会抢占。`cx serve event list`
-会通过同一个 control socket 读取 journal。这是未来 adapter 的入口，但现在还不负责
-turn 或 approval broker。
-
-这只是未来 daemon/control-plane 层的本地基础能力。Telegram、WeChat、远程 terminal 等
-adapter 最终都应该接入 cx，而不是直接拿 raw Codex app-server WebSocket；这样 cx 才能
-统一负责 slot 轮转、lease、approval routing 和审计状态。
+会通过同一个 control socket 读取 journal。后台 service 会把这些状态和 cx 自己的
+app-server broker 结合起来使用；adapter 接入 cx，而不是直接拿 raw slot worker。
 
 ## Background Service
 
@@ -329,12 +325,12 @@ cx service logs
 cx service stop
 ```
 
-`cx service start` 默认会启动 Telegram。它先启动 `cx serve start`，等待 app-server
-state 就绪，然后启动 `cx channel telegram run`。如果只想后台跑 app-server，用
-`--no-telegram`。token 先通过 `cx service token set telegram` provision 一次；cx 从
-stdin 读取 token，并用私有文件权限写到 `<profile-manager>/service/tokens.json`。运行命令和
-launchd plist 都不携带 token；supervisor 只把 token 注入 Telegram 子进程。临时运行时，已有的
-`TELEGRAM_BOT_TOKEN` 环境变量也可以直接使用。
+`cx service start` 默认会启动 Telegram。它会启动一个稳定的本地 broker WebSocket，为选中的
+slot 启动 app-server worker，把 broker URL 写入 `serve/default.json`，然后启动
+`cx channel telegram run`。如果只想后台跑 broker，用 `--no-telegram`。token 先通过
+`cx service token set telegram` provision 一次；cx 从 stdin 读取 token，并用私有文件权限写到
+`<profile-manager>/service/tokens.json`。运行命令和 launchd plist 都不携带 token；supervisor
+只把 token 注入 Telegram 子进程。临时运行时，已有的 `TELEGRAM_BOT_TOKEN` 环境变量也可以直接使用。
 
 macOS 登录自启可以安装 launchd agent：
 

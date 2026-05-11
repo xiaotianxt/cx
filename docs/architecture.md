@@ -70,11 +70,11 @@ It intentionally ignores `credits.has_credits=false` as an exhaustion signal.
 ## Remote-First Launch And Local Fallback
 
 For normal interactive launches, `cx` first tries to connect the real Codex TUI
-to the cx service app-server with `--remote`. The service owns slot selection,
-session restore, and app-server rotation. cx prepares the remote arguments and
+to the cx service broker with `--remote`. The service broker owns global thread
+routing and schedules slot workers. cx prepares the remote arguments and
 supervises short remote-client restarts for stale TUI exits.
 
-If the service app-server is missing, stale, or cannot resolve the target
+If the service broker is missing, stale, or cannot resolve the target
 thread, cx prints a warning and falls back to a local launch. On Unix the local
 fallback uses `exec`, so the final process is the real Codex binary with:
 
@@ -150,10 +150,9 @@ The intended staged direction is:
 1. Keep raw Codex app-server private to cx.
 2. Make process lifecycle explicit: status, stop, stale cleanup, and supervised
    restart behavior.
-3. Add a cx-owned daemon/control socket. The current socket only supports
-   `ping`, `shutdown`, and session registry commands; it exists to establish the
-   private local transport and protocol versioning before turn semantics are
-   added.
+3. Add a cx-owned daemon/control socket. The socket supports `ping`,
+   `shutdown`, and session registry commands; it establishes the private local
+   transport and protocol versioning for adapters.
 4. Persist a session registry and event journal. The current registry stores
    cx-owned `session_id`, `primary_channel_id`, `current_channel_id`,
    `lease_epoch`, optional `active_lease`, and timestamps. The journal currently
@@ -165,9 +164,11 @@ The intended staged direction is:
    adapters do not read cx-owned files directly.
 5. Add lease tokens for terminal, Telegram, WeChat, and other channel owners.
 6. Route approvals through cx-owned policy before any adapter sees them.
-7. Rotate slots by starting or moving work through cx state, not by letting
+7. Route app-server traffic through the cx broker, which keeps thread identity
+   global and treats slots as worker capacity.
+8. Rotate slots by starting or moving work through cx state, not by letting
    adapters connect directly to Codex app-server.
 
-Future channel adapters should use a cx API that carries `session_id`,
-`thread_id`, `turn_id`, and a lease token. They should not be handed the raw
+Channel adapters should use a cx API that carries `session_id`, `thread_id`,
+`turn_id`, and a lease token. They should not be handed the raw worker
 app-server address.

@@ -9,7 +9,7 @@ live usage.
 
 ## What It Does
 
-- `cx`: connect the TUI to the cx service app-server when available, otherwise
+- `cx`: connect the TUI to the cx service broker when available, otherwise
   fall back to a local Codex launch through the best slot.
 - `cat file | cx "summarize this"`: pass stdin into Codex as prompt context.
 - `cx status`: query all configured slots concurrently.
@@ -21,7 +21,7 @@ live usage.
   fallback; when service remote is active, the service target wins.
 - `cx serve start` / `cx serve stop`: manage a foreground loopback Codex
   app-server through a selected slot.
-- `cx service start`: run app-server and the Telegram adapter under one local
+- `cx service start`: run the broker, worker pool, and Telegram adapter under one local
   background supervisor.
 - `cx serve daemon` / `cx serve ping`: run and check the local cx control
   socket.
@@ -128,14 +128,14 @@ cx --target research -m gpt-5.5
 ```
 
 For a clean `cx` launch or an explicit `cx resume <session-id>`, `cx` first
-asks the service app-server to resolve the thread for the current working
+asks the service broker to resolve the thread for the current working
 directory. If the service is unavailable, local fallback preserves the old
 auto-resume behavior: clean launches inspect the latest unarchived local Codex
 session and run `codex resume <session-id>` when it is safe. Prompt-bearing
 launches, `exec`, `review`, `help`, and user-supplied remote app-server
 launches are not rewritten by cx.
 
-By default, `cx` tries to attach the local TUI to the cx service app-server:
+By default, `cx` tries to attach the local TUI to the cx service broker:
 
 ```bash
 cx service start --no-telegram
@@ -143,9 +143,9 @@ cx
 cx resume <session-id>
 ```
 
-The service owns slot selection, session restore, and app-server rotation. The
+The service broker owns global thread routing and schedules slot workers. The
 foreground `cx` process starts the real Codex TUI as a remote client. If the
-service app-server is missing, stale, or cannot resolve the requested thread,
+service broker is missing, stale, or cannot resolve the requested thread,
 `cx` prints a warning and falls back to a local slot launch.
 
 Pipe context into Codex:
@@ -339,13 +339,8 @@ session create` creates a cx-owned session id, writes
 currently owns the session, increments `leaseEpoch`, returns a lease token, and
 appends a lease event. Acquiring a session with an active lease fails unless
 `--steal` is explicit. `cx serve event list` reads the journal through the same
-control socket. This is the future adapter entry point; it does not yet broker
-turns or approvals.
-
-This is only the local foundation for a future daemon/control-plane layer.
-Telegram, WeChat, remote terminal, and other adapters must eventually talk to cx
-rather than to the raw Codex app-server WebSocket, so cx can own slot rotation,
-leases, approval routing, and audit state.
+control socket. The background service uses this state together with a cx-owned
+app-server broker so adapters talk to cx, not directly to raw slot workers.
 
 ## Background Service
 
@@ -359,9 +354,10 @@ cx service logs
 cx service stop
 ```
 
-`cx service start` defaults to Telegram. It starts `cx serve start`, waits for
-the app-server state, then starts `cx channel telegram run`. Use `--no-telegram`
-when only the background app-server is wanted. Token handling is provisioned
+`cx service start` defaults to Telegram. It starts a stable local broker
+WebSocket, launches one app-server worker per selected slot, records the broker
+URL in `serve/default.json`, then starts `cx channel telegram run`. Use
+`--no-telegram` when only the broker is wanted. Token handling is provisioned
 once with `cx service token set telegram`, which reads the token from stdin and
 stores it under `<profile-manager>/service/tokens.json` with private file
 permissions. Runtime commands and launchd plists do not carry the token; the

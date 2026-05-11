@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
+use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -217,6 +218,13 @@ fn build_desktop_launch_spec(
     if let Some(target) = target {
         envs.extend(target.env().clone());
     }
+    let sqlite_home = paths.slot_sqlite_home(selected_slot);
+    fs::create_dir_all(&sqlite_home)
+        .with_context(|| format!("create sqlite home {}", sqlite_home.display()))?;
+    envs.insert(
+        run::CODEX_SQLITE_HOME.to_string(),
+        sqlite_home.display().to_string(),
+    );
 
     Ok(DesktopLaunchSpec {
         program: app_bin,
@@ -230,7 +238,6 @@ fn build_desktop_launch_spec(
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
     use std::time::SystemTime;
     use std::time::UNIX_EPOCH;
 
@@ -286,7 +293,7 @@ mod tests {
         fs::create_dir_all(paths.slot_home("bus1")).unwrap();
         fs::write(
             paths.slot_dir("bus1").join("env.conf"),
-            "export SLOT_ONLY=\"slot\"\nexport SHARED=\"slot\"\n",
+            "export SLOT_ONLY=\"slot\"\nexport SHARED=\"slot\"\nexport CODEX_SQLITE_HOME=\"/tmp/slot-wrong\"\n",
         )
         .unwrap();
         target::save_target(
@@ -298,6 +305,7 @@ mod tests {
                 envs: vec![
                     "TARGET_ONLY=target".to_string(),
                     "SHARED=target".to_string(),
+                    "CODEX_SQLITE_HOME=/tmp/target-wrong".to_string(),
                 ],
             },
         )
@@ -317,6 +325,24 @@ mod tests {
         assert_eq!(spec.envs.get("SLOT_ONLY"), Some(&"slot".to_string()));
         assert_eq!(spec.envs.get("TARGET_ONLY"), Some(&"target".to_string()));
         assert_eq!(spec.envs.get("SHARED"), Some(&"target".to_string()));
+        assert_eq!(
+            spec.envs.get(run::CODEX_SQLITE_HOME),
+            Some(&paths.slot_sqlite_home("bus1").display().to_string())
+        );
+        assert!(paths.slot_sqlite_home("bus1").is_dir());
+        let command = spec.clone().into_command();
+        let command_sqlite_home = command
+            .get_envs()
+            .find_map(|(key, value)| {
+                (key == run::CODEX_SQLITE_HOME)
+                    .then(|| value.map(|value| value.to_string_lossy().into_owned()))
+                    .flatten()
+            })
+            .unwrap();
+        assert_eq!(
+            command_sqlite_home,
+            paths.slot_sqlite_home("bus1").display().to_string()
+        );
         assert_eq!(spec.target_name(), Some("work"));
     }
 

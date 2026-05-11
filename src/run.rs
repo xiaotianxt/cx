@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::ffi::OsString;
+use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -41,6 +42,8 @@ const BYPASS_SUBCOMMANDS: &[&str] = &[
     "features",
     "help",
 ];
+
+pub(crate) const CODEX_SQLITE_HOME: &str = "CODEX_SQLITE_HOME";
 
 #[derive(Debug, Clone, Default, PartialEq)]
 struct RunOptions {
@@ -186,8 +189,11 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
 pub fn exec_slot_login(paths: &ManagerPaths, args: LoginArgs) -> Result<()> {
     let real_codex = resolve_codex_bin(args.codex_bin.as_deref())?;
     let slot_home = paths.slot_home(&args.slot);
+    let sqlite_home = paths.slot_sqlite_home(&args.slot);
+    ensure_sqlite_home(&sqlite_home)?;
     let mut command = Command::new(real_codex);
     command.env("CODEX_HOME", slot_home);
+    command.env(CODEX_SQLITE_HOME, sqlite_home);
     command.arg("login");
     command.args(args.args);
     exec(command)
@@ -266,6 +272,7 @@ pub(crate) fn build_slot_command_spec(
         overrides.extend(target.overrides().iter().cloned());
         envs.extend(target.env().clone());
     }
+    insert_sqlite_home_env(&mut envs, paths.slot_sqlite_home(selected_slot))?;
 
     let mut args = Vec::new();
     for override_line in overrides {
@@ -503,16 +510,30 @@ fn remote_attach_spec(
         ThreadResolverDecision::Refuse { reason } => anyhow::bail!("{reason}"),
     };
 
-    let (codex_home, slot, launch_context) = remote_launch_home(paths, &server);
-    Ok(Some(CodexCommandSpec {
+    Ok(Some(build_remote_tui_command_spec(
+        paths, real_codex, &server, base_args, workspace, &thread_id,
+    )?))
+}
+
+fn build_remote_tui_command_spec(
+    paths: &ManagerPaths,
+    real_codex: PathBuf,
+    server: &serve::ReadyAppServer,
+    base_args: &[OsString],
+    workspace: &Path,
+    thread_id: &str,
+) -> Result<CodexCommandSpec> {
+    let (codex_home, slot, launch_context) = remote_launch_home(paths, server);
+    let envs = remote_tui_env(paths, launch_context, &codex_home)?;
+    Ok(CodexCommandSpec {
         program: real_codex,
         codex_home,
-        envs: BTreeMap::new(),
-        args: remote_tui_args(base_args, &server.listen_url, workspace, &thread_id),
+        envs,
+        args: remote_tui_args(base_args, &server.listen_url, workspace, thread_id),
         slot,
-        target_name: server.target,
+        target_name: server.target.clone(),
         launch_context,
-    }))
+    })
 }
 
 fn remote_attach_supports_resume(
@@ -520,6 +541,20 @@ fn remote_attach_supports_resume(
     explicit_resume_id: Option<&ExplicitResumeId>,
 ) -> bool {
     explicit_resume_id.is_none() || server_kind == ServeEndpointKind::Broker
+}
+
+fn remote_tui_env(
+    paths: &ManagerPaths,
+    launch_context: CodexLaunchContext,
+    codex_home: &Path,
+) -> Result<BTreeMap<String, String>> {
+    let sqlite_home = match launch_context {
+        CodexLaunchContext::Slot => codex_home.join("sqlite"),
+        CodexLaunchContext::ServiceBroker => paths.remote_tui_sqlite_home(),
+    };
+    let mut envs = BTreeMap::new();
+    insert_sqlite_home_env(&mut envs, sqlite_home)?;
+    Ok(envs)
 }
 
 fn remote_launch_home(
@@ -541,6 +576,20 @@ fn remote_launch_home(
             CodexLaunchContext::ServiceBroker,
         ),
     }
+}
+
+fn insert_sqlite_home_env(envs: &mut BTreeMap<String, String>, sqlite_home: PathBuf) -> Result<()> {
+    ensure_sqlite_home(&sqlite_home)?;
+    envs.insert(
+        CODEX_SQLITE_HOME.to_string(),
+        sqlite_home.display().to_string(),
+    );
+    Ok(())
+}
+
+fn ensure_sqlite_home(sqlite_home: &Path) -> Result<()> {
+    fs::create_dir_all(sqlite_home)
+        .with_context(|| format!("create sqlite home {}", sqlite_home.display()))
 }
 
 fn remote_tui_args(
@@ -910,6 +959,8 @@ fn next_os_value(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     fn test_paths(name: &str) -> ManagerPaths {
@@ -1114,6 +1165,36 @@ mod tests {
     }
 
     #[test]
+    fn slot_command_spec_injects_slot_sqlite_home() {
+        let paths = test_paths("slot-sqlite-home");
+        fs::create_dir_all(&paths.base_codex_home).unwrap();
+        fs::create_dir_all(paths.slot_home("dia4")).unwrap();
+        fs::create_dir_all(paths.slot_dir("dia4")).unwrap();
+        fs::write(
+            paths.slot_dir("dia4").join("env.conf"),
+            "CODEX_SQLITE_HOME=/tmp/wrong\n",
+        )
+        .unwrap();
+
+        let spec = build_slot_command_spec(
+            &paths,
+            PathBuf::from("/bin/codex"),
+            "dia4",
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+        let sqlite_home = spec.envs.get(CODEX_SQLITE_HOME).unwrap();
+
+        assert_eq!(PathBuf::from(sqlite_home), paths.slot_sqlite_home("dia4"));
+        assert_ne!(PathBuf::from(sqlite_home), paths.base_codex_home);
+        assert!(paths.slot_sqlite_home("dia4").is_dir());
+
+        let _ = fs::remove_dir_all(&paths.manager_dir);
+        let _ = fs::remove_dir_all(&paths.base_codex_home);
+    }
+
+    #[test]
     fn broker_remote_launch_uses_base_home_not_broker_slot_home() {
         let paths = test_paths("broker-home");
         let server = serve::ReadyAppServer {
@@ -1131,6 +1212,38 @@ mod tests {
         assert_eq!(slot, "service-broker");
         assert_eq!(launch_context, CodexLaunchContext::ServiceBroker);
         assert_eq!(server.app_slot(), None);
+    }
+
+    #[test]
+    fn broker_remote_tui_command_spec_injects_client_sqlite_home() {
+        let paths = test_paths("broker-remote-sqlite-home");
+        let server = serve::ReadyAppServer {
+            kind: ServeEndpointKind::Broker,
+            listen_url: String::from("ws://127.0.0.1:17654"),
+            slot: String::from("broker"),
+            codex_home: None,
+            target: None,
+        };
+
+        let spec = build_remote_tui_command_spec(
+            &paths,
+            PathBuf::from("/bin/codex"),
+            &server,
+            &[],
+            Path::new("/tmp/project"),
+            "thread-1",
+        )
+        .unwrap();
+        let sqlite_home = PathBuf::from(spec.envs.get(CODEX_SQLITE_HOME).unwrap());
+
+        assert_eq!(spec.codex_home, paths.base_codex_home);
+        assert_eq!(spec.slot, "service-broker");
+        assert_eq!(spec.launch_context, CodexLaunchContext::ServiceBroker);
+        assert_ne!(sqlite_home, paths.base_codex_home);
+        assert!(sqlite_home.starts_with(paths.serve_dir()));
+        assert!(sqlite_home.is_dir());
+
+        let _ = fs::remove_dir_all(&paths.manager_dir);
     }
 
     #[test]

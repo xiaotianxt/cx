@@ -7,14 +7,12 @@ pub(crate) enum SharedResourceKind {
     RegularFile,
     AppendOnlyFile,
     Directory,
-    SqliteDatabase,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SlotCreationPolicy {
     AlwaysLink,
     LinkWhenCanonicalExists,
-    RepairOnly,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,10 +38,6 @@ impl SharedResource {
             kind,
             creation_policy,
         }
-    }
-
-    pub(crate) fn name(self) -> &'static str {
-        self.name
     }
 
     pub(crate) fn kind(self) -> SharedResourceKind {
@@ -165,15 +159,5 @@ const CODEX_SLOT_SHARED_RESOURCES: &[SharedResource] = &[
         "version.json",
         SharedResourceKind::RegularFile,
         SlotCreationPolicy::LinkWhenCanonicalExists,
-    ),
-    SharedResource::new(
-        "state_5.sqlite",
-        SharedResourceKind::SqliteDatabase,
-        SlotCreationPolicy::RepairOnly,
-    ),
-    SharedResource::new(
-        "logs_2.sqlite",
-        SharedResourceKind::SqliteDatabase,
-        SlotCreationPolicy::RepairOnly,
     ),
 ];

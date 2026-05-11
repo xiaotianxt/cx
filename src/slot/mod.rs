@@ -5,8 +5,6 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use anyhow::Result;
-#[cfg(test)]
-use rusqlite::Connection;
 
 use crate::cli::AddArgs;
 use crate::cli::RemoveArgs;
@@ -16,7 +14,6 @@ use crate::paths::ManagerPaths;
 mod config;
 mod rotation;
 mod shared;
-mod sqlite;
 
 pub use config::read_config_string;
 pub use config::read_override_lines;
@@ -74,7 +71,6 @@ impl<'a> SlotMaterializer<'a> {
                         self.link_resource_if_needed(*resource)?;
                     }
                 }
-                SlotCreationPolicy::RepairOnly => {}
             }
         }
         Ok(())
@@ -82,11 +78,9 @@ impl<'a> SlotMaterializer<'a> {
 
     fn repair(&self) -> Result<()> {
         self.create_home()?;
+        self.remove_legacy_sqlite_links()?;
         for resource in self.profile.resources() {
-            match resource.kind() {
-                SharedResourceKind::SqliteDatabase => self.repair_sqlite_resource(*resource)?,
-                _ => self.repair_resource(*resource)?,
-            }
+            self.repair_resource(*resource)?;
         }
         Ok(())
     }
@@ -165,36 +159,6 @@ impl<'a> SlotMaterializer<'a> {
         Ok(())
     }
 
-    fn repair_sqlite_resource(&self, resource: SharedResource) -> Result<()> {
-        let slot_path = resource.slot_path(self.paths, self.slot);
-        let canonical_path = resource.canonical_path(self.paths);
-        if is_symlink_to(&slot_path, &canonical_path)? && canonical_path.exists() {
-            return Ok(());
-        }
-        if slot_path.exists() && !is_symlink(&slot_path) {
-            if !canonical_path.exists() {
-                fs::copy(&slot_path, &canonical_path).with_context(|| {
-                    format!(
-                        "copy {} to {}",
-                        slot_path.display(),
-                        canonical_path.display()
-                    )
-                })?;
-            } else if let Err(err) = sqlite::merge_sqlite_databases(&canonical_path, &slot_path) {
-                if std::env::var_os("CX_SLOT_DEBUG").is_some() {
-                    eprintln!(
-                        "cx: skipped sqlite merge for {}: {err:#}",
-                        slot_path.display()
-                    );
-                }
-                return Ok(());
-            }
-            remove_sqlite_family(&slot_path)?;
-        }
-        remove_sqlite_family(&slot_path)?;
-        link_if_safe(&canonical_path, &slot_path)
-    }
-
     fn audit_resource(
         &self,
         resource: SharedResource,
@@ -204,10 +168,6 @@ impl<'a> SlotMaterializer<'a> {
         let slot_path = resource.slot_path(self.paths, self.slot);
         let canonical_exists = canonical_path.exists() || is_symlink(&canonical_path);
         let slot_exists = slot_path.exists() || is_symlink(&slot_path);
-
-        if resource.kind() == SharedResourceKind::SqliteDatabase {
-            self.audit_sqlite_sidecars(resource, issues);
-        }
 
         if !canonical_exists && !slot_exists {
             return Ok(());
@@ -245,23 +205,24 @@ impl<'a> SlotMaterializer<'a> {
         Ok(())
     }
 
-    fn audit_sqlite_sidecars(&self, resource: SharedResource, issues: &mut Vec<SlotLayoutIssue>) {
-        for suffix in ["-wal", "-shm"] {
-            let sidecar = self.slot_home.join(format!("{}{suffix}", resource.name()));
-            if sidecar.exists() || is_symlink(&sidecar) {
-                issues.push(SlotLayoutIssue {
-                    path: sidecar,
-                    message: "sqlite sidecar should live beside the canonical database".to_string(),
-                });
-            }
-        }
-    }
-
     fn link_resource_if_needed(&self, resource: SharedResource) -> Result<()> {
         link_if_needed(
             &resource.canonical_path(self.paths),
             &resource.slot_path(self.paths, self.slot),
         )
+    }
+
+    fn remove_legacy_sqlite_links(&self) -> Result<()> {
+        for name in ["state_5.sqlite", "logs_2.sqlite"] {
+            for suffix in ["", "-wal", "-shm"] {
+                let path = self.slot_home.join(format!("{name}{suffix}"));
+                if is_symlink(&path) {
+                    fs::remove_file(&path)
+                        .with_context(|| format!("remove legacy sqlite link {}", path.display()))?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -498,21 +459,6 @@ fn append_file(source: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-fn remove_sqlite_family(path: &Path) -> Result<()> {
-    remove_file_if_exists(path)?;
-    remove_file_if_exists(&PathBuf::from(format!("{}-wal", path.display())))?;
-    remove_file_if_exists(&PathBuf::from(format!("{}-shm", path.display())))?;
-    Ok(())
-}
-
-fn remove_file_if_exists(path: &Path) -> Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(err).with_context(|| format!("remove {}", path.display())),
-    }
-}
-
 fn remove_path_if_exists(path: &Path) -> Result<bool> {
     let meta = match fs::symlink_metadata(path) {
         Ok(meta) => meta,
@@ -657,26 +603,29 @@ mod tests {
     }
 
     #[test]
-    fn repair_slot_layout_merges_sqlite() {
-        let paths = temp_paths("repair-sqlite");
+    fn repair_slot_layout_removes_legacy_sqlite_symlinks() {
+        let paths = temp_paths("repair-sqlite-links");
         fs::create_dir_all(&paths.base_codex_home).unwrap();
         fs::create_dir_all(paths.slot_home("dia1")).unwrap();
-
-        let canonical_db = paths.base_codex_home.join("state_5.sqlite");
-        let slot_db = paths.slot_home("dia1").join("state_5.sqlite");
-        create_test_db(&canonical_db, "base").unwrap();
-        create_test_db(&slot_db, "slot").unwrap();
+        fs::write(paths.base_codex_home.join("state_5.sqlite"), "").unwrap();
+        fs::write(paths.base_codex_home.join("logs_2.sqlite"), "").unwrap();
+        link_if_safe(
+            &paths.base_codex_home.join("state_5.sqlite"),
+            &paths.slot_home("dia1").join("state_5.sqlite"),
+        )
+        .unwrap();
+        link_if_safe(
+            &paths.base_codex_home.join("logs_2.sqlite"),
+            &paths.slot_home("dia1").join("logs_2.sqlite"),
+        )
+        .unwrap();
 
         repair_slot_layout(&paths, "dia1").unwrap();
 
-        let conn = Connection::open(&canonical_db).unwrap();
-        let count = conn
-            .query_row("SELECT COUNT(*) FROM threads", [], |row| {
-                row.get::<_, i64>(0)
-            })
-            .unwrap();
-        assert_eq!(count, 2);
-        assert!(is_symlink_to(&slot_db, &canonical_db).unwrap());
+        assert!(!paths.slot_home("dia1").join("state_5.sqlite").exists());
+        assert!(!paths.slot_home("dia1").join("logs_2.sqlite").exists());
+        assert!(paths.base_codex_home.join("state_5.sqlite").exists());
+        assert!(paths.base_codex_home.join("logs_2.sqlite").exists());
 
         let _ = fs::remove_dir_all(&paths.manager_dir);
         let _ = fs::remove_dir_all(&paths.base_codex_home);
@@ -687,17 +636,11 @@ mod tests {
         let paths = temp_paths("audit-ok");
         fs::create_dir_all(&paths.base_codex_home).unwrap();
         fs::write(paths.base_codex_home.join("history.jsonl"), "base\n").unwrap();
-        fs::write(paths.base_codex_home.join("state_5.sqlite"), "").unwrap();
         fs::create_dir_all(paths.slot_home("dia1")).unwrap();
         fs::write(paths.slot_home("dia1").join("auth.json"), "{}\n").unwrap();
         link_if_safe(
             &paths.base_codex_home.join("history.jsonl"),
             &paths.slot_home("dia1").join("history.jsonl"),
-        )
-        .unwrap();
-        link_if_safe(
-            &paths.base_codex_home.join("state_5.sqlite"),
-            &paths.slot_home("dia1").join("state_5.sqlite"),
         )
         .unwrap();
 
@@ -714,11 +657,9 @@ mod tests {
         let paths = temp_paths("audit-private");
         fs::create_dir_all(&paths.base_codex_home).unwrap();
         fs::write(paths.base_codex_home.join("history.jsonl"), "base\n").unwrap();
-        fs::write(paths.base_codex_home.join("state_5.sqlite"), "").unwrap();
         fs::create_dir_all(paths.slot_home("dia1")).unwrap();
         fs::write(paths.slot_home("dia1").join("auth.json"), "{}\n").unwrap();
         fs::write(paths.slot_home("dia1").join("history.jsonl"), "slot\n").unwrap();
-        fs::write(paths.slot_home("dia1").join("state_5.sqlite-wal"), "").unwrap();
 
         let audit = audit_slot_layout(&paths, "dia1").unwrap();
         let messages = audit
@@ -730,24 +671,8 @@ mod tests {
         assert!(messages
             .iter()
             .any(|message| message.starts_with("private copy; expected symlink")));
-        assert!(messages.contains(&"sqlite sidecar should live beside the canonical database"));
-        assert!(audit.issues.iter().any(|issue| issue
-            .path
-            .file_name()
-            .and_then(|name| name.to_str())
-            == Some("state_5.sqlite-wal")));
 
         let _ = fs::remove_dir_all(&paths.manager_dir);
         let _ = fs::remove_dir_all(&paths.base_codex_home);
-    }
-
-    fn create_test_db(path: &Path, id: &str) -> Result<()> {
-        let conn = Connection::open(path)?;
-        conn.execute(
-            "CREATE TABLE threads (id TEXT PRIMARY KEY, value TEXT NOT NULL)",
-            [],
-        )?;
-        conn.execute("INSERT INTO threads (id, value) VALUES (?1, ?2)", [id, id])?;
-        Ok(())
     }
 }

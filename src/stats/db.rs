@@ -30,13 +30,13 @@ pub(super) fn state_db_paths(
             {
                 let entry = entry?;
                 if entry.file_type()?.is_dir() {
-                    candidates.push(entry.path().join("home").join(STATE_DB));
+                    candidates.extend(slot_home_state_db_candidates(entry.path().join("home")));
                 }
             }
         }
     } else {
         for slot in slot_filters {
-            candidates.push(paths.slot_home(slot).join(STATE_DB));
+            candidates.extend(slot_state_db_candidates(paths, slot));
         }
     }
 
@@ -54,6 +54,17 @@ pub(super) fn state_db_paths(
     }
     db_paths.sort();
     Ok(db_paths)
+}
+
+fn slot_state_db_candidates(paths: &ManagerPaths, slot: &str) -> [PathBuf; 2] {
+    slot_home_state_db_candidates(paths.slot_home(slot))
+}
+
+fn slot_home_state_db_candidates(slot_home: PathBuf) -> [PathBuf; 2] {
+    [
+        slot_home.join("sqlite").join(STATE_DB),
+        slot_home.join(STATE_DB),
+    ]
 }
 
 pub(super) fn read_threads(
@@ -209,6 +220,7 @@ pub(super) fn infer_slot_from_rollout_path(rollout_path: &str, paths: &ManagerPa
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::fs;
     use std::time::SystemTime;
     use std::time::UNIX_EPOCH;
@@ -231,6 +243,58 @@ mod tests {
             targets_dir: root.join("profile-manager/targets"),
             rotation_file: root.join("profile-manager/rotation.txt"),
         }
+    }
+
+    fn slot_filter(slot: &str) -> BTreeSet<String> {
+        BTreeSet::from([slot.to_string()])
+    }
+
+    #[test]
+    fn state_db_paths_finds_slot_sqlite_home_without_filter() {
+        let paths = temp_paths("slot-sqlite-no-filter");
+        let db_path = paths.slot_sqlite_home("dia1").join(STATE_DB);
+        fs::create_dir_all(db_path.parent().unwrap()).expect("create slot sqlite home");
+        fs::write(&db_path, "").expect("write slot state db");
+
+        let db_paths = state_db_paths(&paths, &BTreeSet::new()).expect("find db paths");
+
+        assert_eq!(db_paths, vec![fs::canonicalize(&db_path).unwrap()]);
+
+        let _ = fs::remove_dir_all(&paths.manager_dir);
+        let _ = fs::remove_dir_all(&paths.base_codex_home);
+    }
+
+    #[test]
+    fn state_db_paths_finds_slot_sqlite_home_with_filter() {
+        let paths = temp_paths("slot-sqlite-filter");
+        let db_path = paths.slot_sqlite_home("dia1").join(STATE_DB);
+        fs::create_dir_all(db_path.parent().unwrap()).expect("create slot sqlite home");
+        fs::write(&db_path, "").expect("write slot state db");
+
+        let db_paths = state_db_paths(&paths, &slot_filter("dia1")).expect("find db paths");
+
+        assert_eq!(db_paths, vec![fs::canonicalize(&db_path).unwrap()]);
+
+        let _ = fs::remove_dir_all(&paths.manager_dir);
+        let _ = fs::remove_dir_all(&paths.base_codex_home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_db_paths_deduplicates_new_and_legacy_slot_paths() {
+        let paths = temp_paths("slot-sqlite-dedupe");
+        let db_path = paths.slot_sqlite_home("dia1").join(STATE_DB);
+        let legacy_path = paths.slot_home("dia1").join(STATE_DB);
+        fs::create_dir_all(db_path.parent().unwrap()).expect("create slot sqlite home");
+        fs::write(&db_path, "").expect("write slot state db");
+        std::os::unix::fs::symlink(&db_path, &legacy_path).expect("link legacy state db");
+
+        let db_paths = state_db_paths(&paths, &slot_filter("dia1")).expect("find db paths");
+
+        assert_eq!(db_paths, vec![fs::canonicalize(&db_path).unwrap()]);
+
+        let _ = fs::remove_dir_all(&paths.manager_dir);
+        let _ = fs::remove_dir_all(&paths.base_codex_home);
     }
 
     #[test]

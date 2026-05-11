@@ -50,12 +50,23 @@ impl ManagerPaths {
         self.slot_dir(slot).join("home")
     }
 
+    pub fn slot_sqlite_home(&self, slot: &str) -> PathBuf {
+        self.slot_home(slot).join("sqlite")
+    }
+
     pub fn target_file(&self, target: &str) -> PathBuf {
         self.targets_dir.join(format!("{target}.toml"))
     }
 
     pub fn serve_dir(&self) -> PathBuf {
         self.manager_dir.join("serve")
+    }
+
+    pub fn remote_tui_sqlite_home(&self) -> PathBuf {
+        self.serve_dir()
+            .join("remote-tui")
+            .join(std::process::id().to_string())
+            .join("sqlite")
     }
 
     pub fn serve_state_file(&self) -> PathBuf {

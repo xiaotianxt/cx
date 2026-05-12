@@ -190,7 +190,7 @@ prepare_local_service_refresh() {
   LOCAL_SERVICE_STATE=""
   LOCAL_SERVICE_ARGS=()
 
-  [[ "$RESTART_LOCAL_SERVICE" -eq 1 ]] || return
+  [[ "$RESTART_LOCAL_SERVICE" -eq 1 ]] || return 0
 
   plist="$(local_service_plist)"
   if [[ -f "$plist" ]]; then
@@ -210,8 +210,8 @@ prepare_local_service_refresh() {
 }
 
 refresh_local_service_after_reinstall() {
-  [[ "$RESTART_LOCAL_SERVICE" -eq 1 ]] || return
-  [[ "$LOCAL_SERVICE_SHOULD_START" -eq 1 ]] || return
+  [[ "$RESTART_LOCAL_SERVICE" -eq 1 ]] || return 0
+  [[ "$LOCAL_SERVICE_SHOULD_START" -eq 1 ]] || return 0
 
   if [[ "$LOCAL_SERVICE_LAUNCHD" -eq 1 ]]; then
     log "reinstalling and starting local launchd service"

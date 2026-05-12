@@ -730,6 +730,13 @@ impl BrokerShared {
         self.unsubscribe_worker_thread(thread_id)
     }
 
+    fn abandon_client_thread_subscription(&self, thread_id: &str) -> Result<()> {
+        // A disconnecting client can be a short-lived resolver racing a new TUI
+        // attach. Do not send thread/unsubscribe on the shared worker socket
+        // unless the client explicitly requested it or the turn has completed.
+        self.cancel_thread_approvals(thread_id)
+    }
+
     fn cancel_thread_approvals(&self, thread_id: &str) -> Result<()> {
         for approval in self.approvals.cancel_thread(thread_id)? {
             self.subscriptions
@@ -1408,7 +1415,7 @@ fn client_writer_loop(
 fn cleanup_client(state: &BrokerShared, client_id: ClientId) {
     if let Ok(empty_threads) = state.subscriptions.unregister_client(client_id) {
         for thread_id in empty_threads {
-            let _ = state.release_thread_without_subscribers(&thread_id);
+            let _ = state.abandon_client_thread_subscription(&thread_id);
         }
     }
 }
@@ -1601,7 +1608,7 @@ fn rollback_client_subscription(
 ) -> Result<()> {
     let remaining = state.subscriptions.unsubscribe(client_id, thread_id)?;
     if remaining == 0 {
-        let _ = state.release_thread_without_subscribers(thread_id);
+        let _ = state.abandon_client_thread_subscription(thread_id);
     }
     Ok(())
 }
@@ -3216,6 +3223,37 @@ mod tests {
     }
 
     #[test]
+    fn client_disconnect_does_not_unsubscribe_idle_worker_thread() {
+        let state = test_state();
+        let worker_id = WorkerId::new("dia4", 1);
+        let (link, worker_rx) = test_link_with_rx(worker_id.clone());
+        state
+            .worker_links
+            .lock()
+            .unwrap()
+            .insert(worker_id, Arc::clone(&link));
+        state
+            .directory
+            .upsert(thread(LoadedStatus::Loaded))
+            .unwrap();
+        let client_id = ClientId::new(7);
+        let (tx, _rx) = mpsc::channel();
+        state
+            .subscriptions
+            .register_client(client_id, ClientSink::new(tx))
+            .unwrap();
+        state
+            .subscriptions
+            .subscribe(client_id, "thread-1")
+            .unwrap();
+
+        cleanup_client(&state, client_id);
+
+        assert_eq!(state.subscriptions.subscriber_count("thread-1").unwrap(), 0);
+        assert!(worker_rx.try_recv().is_err());
+    }
+
+    #[test]
     fn client_disconnect_cleans_subscription_without_releasing_active_thread() {
         let state = test_state();
         let worker_id = WorkerId::new("dia4", 1);
@@ -3253,6 +3291,66 @@ mod tests {
             LoadedStatus::Active
         );
         assert!(worker_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn explicit_thread_unsubscribe_releases_idle_worker_thread() {
+        let state = test_state();
+        let worker_id = WorkerId::new("dia4", 1);
+        let (link, worker_rx) = test_link_with_rx(worker_id.clone());
+        state
+            .worker_links
+            .lock()
+            .unwrap()
+            .insert(worker_id, Arc::clone(&link));
+        state
+            .directory
+            .upsert(thread(LoadedStatus::Loaded))
+            .unwrap();
+        let client_id = ClientId::new(7);
+        let (tx, rx) = mpsc::channel();
+        state
+            .subscriptions
+            .register_client(client_id, ClientSink::new(tx))
+            .unwrap();
+        state
+            .subscriptions
+            .subscribe(client_id, "thread-1")
+            .unwrap();
+
+        handle_client_text(
+            &state,
+            client_id,
+            json!({
+                "id": "unsubscribe",
+                "method": "thread/unsubscribe",
+                "params": {"threadId": "thread-1"}
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let worker_message = match worker_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("missing worker unsubscribe")
+        {
+            WorkerOutbound::Text(text) => serde_json::from_str::<Value>(&text).unwrap(),
+            other => panic!("expected worker text message, got {other:?}"),
+        };
+        assert_eq!(
+            worker_message.get("method").and_then(Value::as_str),
+            Some("thread/unsubscribe")
+        );
+        assert_eq!(
+            worker_message
+                .get("params")
+                .and_then(|params| params.get("threadId"))
+                .and_then(Value::as_str),
+            Some("thread-1")
+        );
+        let response = serde_json::from_str::<Value>(&try_recv_client_text(&rx)).unwrap();
+        assert_eq!(response.get("id"), Some(&json!("unsubscribe")));
+        assert_eq!(state.subscriptions.subscriber_count("thread-1").unwrap(), 0);
     }
 
     #[test]

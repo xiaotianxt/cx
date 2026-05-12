@@ -60,9 +60,6 @@ fn main() -> ExitCode {
 fn entry() -> Result<()> {
     let raw_args = std::env::args_os().collect::<Vec<_>>();
     let first_arg = raw_args.get(1).and_then(|arg| arg.to_str());
-    if first_arg == Some("--") {
-        return cx::run_from_args(raw_args.into_iter().skip(2).collect());
-    }
     if !is_management_entry_arg(first_arg) {
         return cx::run_from_args(raw_args.into_iter().skip(1).collect());
     }
@@ -157,7 +154,7 @@ fn entry() -> Result<()> {
         },
         Command::Managed(_) => {
             anyhow::bail!(
-                "`cx managed` was removed; `cx` now connects to the cx service app-server by default. Start it with `cx service start --no-telegram`."
+                "`cx managed` was removed; service remote is experimental. Start the service with `cx service start --no-telegram`, then opt in with `cx --cx-service-remote`."
             );
         }
         Command::Protocol(args) => match args.command {

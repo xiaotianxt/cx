@@ -135,6 +135,22 @@ enum ThreadWorkerPolicy {
     NewTurn,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThreadSubscriptionRelease {
+    ClientAbandoned,
+    ExplicitUnsubscribe,
+    TurnCompleted,
+}
+
+impl ThreadSubscriptionRelease {
+    fn releases_worker_subscription(self) -> bool {
+        match self {
+            Self::ClientAbandoned => false,
+            Self::ExplicitUnsubscribe | Self::TurnCompleted => true,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct WorkerAssignment {
     worker: WorkerRecord,
@@ -147,17 +163,23 @@ struct BrokerListenUrl {
     port: u16,
 }
 
+#[derive(Debug)]
+struct BoundBrokerListenUrl {
+    listener: TcpListener,
+    listen_url: String,
+    readyz_url: String,
+}
+
 impl AppServerBroker {
     pub(crate) fn start(
         paths: ManagerPaths,
         listen_url: &str,
         pool_config: WorkerPoolConfig,
     ) -> Result<Self> {
-        let listen = BrokerListenUrl::parse(listen_url)?.resolve()?;
-        let stable_listen_url = listen.websocket_url();
-        let stable_readyz_url = listen.readyz_url();
-        let listener = TcpListener::bind((listen.host.as_str(), listen.port))
-            .with_context(|| format!("bind broker {}", stable_listen_url))?;
+        let listen = BrokerListenUrl::parse(listen_url)?.bind_listener()?;
+        let stable_listen_url = listen.listen_url;
+        let stable_readyz_url = listen.readyz_url;
+        let listener = listen.listener;
         listener
             .set_nonblocking(true)
             .context("set broker listener nonblocking")?;
@@ -725,16 +747,16 @@ impl BrokerShared {
         self.unsubscribe_worker_thread_on(&worker_id, thread_id)
     }
 
-    fn release_thread_without_subscribers(&self, thread_id: &str) -> Result<()> {
+    fn release_thread_subscription(
+        &self,
+        thread_id: &str,
+        reason: ThreadSubscriptionRelease,
+    ) -> Result<()> {
         self.cancel_thread_approvals(thread_id)?;
-        self.unsubscribe_worker_thread(thread_id)
-    }
-
-    fn abandon_client_thread_subscription(&self, thread_id: &str) -> Result<()> {
-        // A disconnecting client can be a short-lived resolver racing a new TUI
-        // attach. Do not send thread/unsubscribe on the shared worker socket
-        // unless the client explicitly requested it or the turn has completed.
-        self.cancel_thread_approvals(thread_id)
+        if reason.releases_worker_subscription() {
+            self.unsubscribe_worker_thread(thread_id)?;
+        }
+        Ok(())
     }
 
     fn cancel_thread_approvals(&self, thread_id: &str) -> Result<()> {
@@ -1311,7 +1333,10 @@ fn handle_worker_notification(
                     .mark_turn_completed(thread_id, turn_id.as_deref())?;
                 link.clear_rate_limit_state(thread_id, turn_id.as_deref())?;
                 if state.subscriptions.subscriber_count(thread_id)? == 0 {
-                    let _ = state.release_thread_without_subscribers(thread_id);
+                    let _ = state.release_thread_subscription(
+                        thread_id,
+                        ThreadSubscriptionRelease::TurnCompleted,
+                    );
                 }
                 state
                     .worker_pool
@@ -1415,7 +1440,10 @@ fn client_writer_loop(
 fn cleanup_client(state: &BrokerShared, client_id: ClientId) {
     if let Ok(empty_threads) = state.subscriptions.unregister_client(client_id) {
         for thread_id in empty_threads {
-            let _ = state.abandon_client_thread_subscription(&thread_id);
+            let _ = state.release_thread_subscription(
+                &thread_id,
+                ThreadSubscriptionRelease::ClientAbandoned,
+            );
         }
     }
 }
@@ -1470,7 +1498,10 @@ fn handle_client_request(
         BrokerRoute::ThreadUnsubscribe { thread_id } => {
             let remaining = state.subscriptions.unsubscribe(client_id, &thread_id)?;
             if remaining == 0 {
-                let _ = state.release_thread_without_subscribers(&thread_id);
+                let _ = state.release_thread_subscription(
+                    &thread_id,
+                    ThreadSubscriptionRelease::ExplicitUnsubscribe,
+                );
             }
             let response = success_response(id, json!({}));
             state
@@ -1608,7 +1639,8 @@ fn rollback_client_subscription(
 ) -> Result<()> {
     let remaining = state.subscriptions.unsubscribe(client_id, thread_id)?;
     if remaining == 0 {
-        let _ = state.abandon_client_thread_subscription(thread_id);
+        let _ = state
+            .release_thread_subscription(thread_id, ThreadSubscriptionRelease::ClientAbandoned);
     }
     Ok(())
 }
@@ -2264,22 +2296,31 @@ impl BrokerListenUrl {
         })
     }
 
-    fn resolve(self) -> Result<Self> {
-        if self.port != 0 {
-            return Ok(self);
+    fn bind_listener(&self) -> Result<BoundBrokerListenUrl> {
+        let bind_host = self.bind_host();
+        let listener = TcpListener::bind((bind_host, self.port))
+            .with_context(|| format!("bind broker {}", self.websocket_url()))?;
+        let addr = listener
+            .local_addr()
+            .context("read broker listener address")?;
+        let host = addr.ip().to_string();
+        let port = addr.port();
+        Ok(BoundBrokerListenUrl {
+            listener,
+            listen_url: format!("ws://{host}:{port}"),
+            readyz_url: format!("http://{host}:{port}/readyz"),
+        })
+    }
+
+    fn bind_host(&self) -> &str {
+        match self.host.as_str() {
+            "localhost" => "127.0.0.1",
+            host => host,
         }
-        let listener = TcpListener::bind(("127.0.0.1", 0)).context("reserve broker port")?;
-        let port = listener.local_addr().context("read broker port")?.port();
-        drop(listener);
-        Ok(Self { port, ..self })
     }
 
     fn websocket_url(&self) -> String {
         format!("ws://{}:{}", self.host, self.port)
-    }
-
-    fn readyz_url(&self) -> String {
-        format!("http://{}:{}/readyz", self.host, self.port)
     }
 }
 
@@ -2365,6 +2406,22 @@ mod tests {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         (listener, format!("ws://127.0.0.1:{port}"))
+    }
+
+    #[test]
+    fn broker_zero_port_bind_holds_actual_listener_port() {
+        let listen = BrokerListenUrl::parse("ws://127.0.0.1:0").unwrap();
+        let bound = listen.bind_listener().unwrap();
+        let port = bound
+            .listen_url
+            .rsplit_once(':')
+            .and_then(|(_, port)| port.parse::<u16>().ok())
+            .unwrap();
+
+        assert_ne!(port, 0);
+        assert_eq!(bound.listen_url, format!("ws://127.0.0.1:{port}"));
+        assert_eq!(bound.readyz_url, format!("http://127.0.0.1:{port}/readyz"));
+        assert!(TcpListener::bind(("127.0.0.1", port)).is_err());
     }
 
     fn accept_test_websocket(listener: TcpListener) -> Result<BrokerWebSocket> {
@@ -2815,6 +2872,13 @@ mod tests {
         assert!(should_unsubscribe_worker_thread(&thread(
             LoadedStatus::NotLoaded
         )));
+    }
+
+    #[test]
+    fn client_abandon_is_the_only_release_reason_that_keeps_worker_subscription() {
+        assert!(!ThreadSubscriptionRelease::ClientAbandoned.releases_worker_subscription());
+        assert!(ThreadSubscriptionRelease::ExplicitUnsubscribe.releases_worker_subscription());
+        assert!(ThreadSubscriptionRelease::TurnCompleted.releases_worker_subscription());
     }
 
     #[test]
@@ -3354,6 +3418,54 @@ mod tests {
     }
 
     #[test]
+    fn turn_completed_releases_idle_worker_thread_without_subscribers() {
+        let state = test_state();
+        let worker_id = WorkerId::new("dia4", 1);
+        let (link, worker_rx) = test_link_with_rx(worker_id.clone());
+        state
+            .worker_links
+            .lock()
+            .unwrap()
+            .insert(worker_id, Arc::clone(&link));
+        let mut record = thread(LoadedStatus::Active);
+        record.active_turn_id = Some(String::from("turn-1"));
+        record.active_turn_ids.insert(String::from("turn-1"));
+        state.directory.upsert(record).unwrap();
+
+        handle_worker_notification(
+            &state,
+            &link,
+            json!({
+                "method": "turn/completed",
+                "params": {"threadId": "thread-1", "turnId": "turn-1"}
+            }),
+            String::from("completed"),
+        )
+        .unwrap();
+
+        let worker_message = match worker_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("missing worker unsubscribe")
+        {
+            WorkerOutbound::Text(text) => serde_json::from_str::<Value>(&text).unwrap(),
+            other => panic!("expected worker text message, got {other:?}"),
+        };
+        assert_eq!(
+            worker_message.get("method").and_then(Value::as_str),
+            Some("thread/unsubscribe")
+        );
+        assert_eq!(
+            state
+                .directory
+                .record("thread-1")
+                .unwrap()
+                .unwrap()
+                .loaded_status,
+            LoadedStatus::Loaded
+        );
+    }
+
+    #[test]
     fn loaded_owner_resume_uses_owner_worker() {
         let selected = WorkerId::new("dia4", 1);
         let other = WorkerId::new("dia5", 1);
@@ -3508,7 +3620,17 @@ mod tests {
     #[test]
     fn worker_error_response_rolls_back_pending_thread_subscription() {
         let state = test_state();
-        let link = test_link(WorkerId::new("dia4", 1));
+        let worker_id = WorkerId::new("dia4", 1);
+        let (link, worker_rx) = test_link_with_rx(worker_id.clone());
+        state
+            .worker_links
+            .lock()
+            .unwrap()
+            .insert(worker_id, Arc::clone(&link));
+        state
+            .directory
+            .upsert(thread(LoadedStatus::Loaded))
+            .unwrap();
         let client_id = ClientId::new(7);
         let (tx, rx) = mpsc::channel();
         state
@@ -3541,6 +3663,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(state.subscriptions.subscriber_count("thread-1").unwrap(), 0);
+        assert!(worker_rx.try_recv().is_err());
         let response = serde_json::from_str::<Value>(&try_recv_client_text(&rx)).unwrap();
         assert_eq!(response.get("id"), Some(&json!("client-request")));
         assert!(response.get("error").is_some());

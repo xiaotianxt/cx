@@ -10,6 +10,13 @@ use std::time::Duration;
 
 use anyhow::Context;
 use anyhow::Result;
+use clap::builder::OsStringValueParser;
+use clap::error::ErrorKind as ClapErrorKind;
+use clap::value_parser;
+use clap::Arg;
+use clap::ArgAction;
+use clap::Command as ClapCommand;
+use clap::ValueHint;
 
 use crate::app_server::AppServerClient;
 use crate::cli::LoginArgs;
@@ -45,6 +52,87 @@ const BYPASS_SUBCOMMANDS: &[&str] = &[
 
 pub(crate) const CODEX_SQLITE_HOME: &str = "CODEX_SQLITE_HOME";
 
+const ARG_SLOT: &str = "slot";
+const ARG_TARGET: &str = "target";
+const ARG_MANAGER_DIR: &str = "manager-dir";
+const ARG_CODEX_BIN: &str = "codex-bin";
+const ARG_CX_QUIET: &str = "cx-quiet";
+const ARG_CX_DEBUG: &str = "cx-debug";
+const ARG_CX_SERVICE_REMOTE: &str = "cx-service-remote";
+const ARG_MANAGED: &str = "managed";
+const ARG_CODEX_ARGS: &str = "codex-args";
+
+pub(crate) fn launcher_command() -> ClapCommand {
+    ClapCommand::new("cx")
+        .about("Launch Codex through a local cx slot")
+        .override_usage("cx [CX_OPTIONS] [-- CODEX_ARGS]...")
+        .after_help(
+            "Codex arguments must follow `--`. Examples:\n  cx --slot dia1 -- resume THREAD\n  echo prompt | cx -- summarize this",
+        )
+        .arg(
+            Arg::new(ARG_SLOT)
+                .long(ARG_SLOT)
+                .short('s')
+                .value_name("SLOT")
+                .help("Use a specific slot"),
+        )
+        .arg(
+            Arg::new(ARG_TARGET)
+                .long(ARG_TARGET)
+                .value_name("TARGET")
+                .help("Use a target config"),
+        )
+        .arg(
+            Arg::new(ARG_MANAGER_DIR)
+                .long(ARG_MANAGER_DIR)
+                .value_name("DIR")
+                .value_parser(value_parser!(PathBuf))
+                .value_hint(ValueHint::DirPath)
+                .help("Profile-manager directory"),
+        )
+        .arg(
+            Arg::new(ARG_CODEX_BIN)
+                .long(ARG_CODEX_BIN)
+                .value_name("FILE")
+                .value_parser(value_parser!(PathBuf))
+                .value_hint(ValueHint::FilePath)
+                .help("Path to the real Codex binary"),
+        )
+        .arg(
+            Arg::new(ARG_CX_QUIET)
+                .long(ARG_CX_QUIET)
+                .action(ArgAction::SetTrue)
+                .help("Suppress cx slot banner"),
+        )
+        .arg(
+            Arg::new(ARG_CX_DEBUG)
+                .long(ARG_CX_DEBUG)
+                .action(ArgAction::SetTrue)
+                .help("Print slot selection details"),
+        )
+        .arg(
+            Arg::new(ARG_CX_SERVICE_REMOTE)
+                .long(ARG_CX_SERVICE_REMOTE)
+                .action(ArgAction::SetTrue)
+                .help("Use experimental cx service remote"),
+        )
+        .arg(
+            Arg::new(ARG_MANAGED)
+                .long(ARG_MANAGED)
+                .hide(true)
+                .action(ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new(ARG_CODEX_ARGS)
+                .value_name("CODEX_ARGS")
+                .value_parser(OsStringValueParser::new())
+                .num_args(0..)
+                .allow_hyphen_values(true)
+                .last(true)
+                .help("Arguments passed verbatim to Codex after `--`"),
+        )
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 struct RunOptions {
     slot: Option<String>,
@@ -53,8 +141,13 @@ struct RunOptions {
     codex_bin: Option<PathBuf>,
     quiet: bool,
     debug: bool,
+    service_remote: bool,
     codex_args: Vec<OsString>,
-    first_non_option: Option<String>,
+}
+
+pub(crate) struct LauncherArgsSplit {
+    pub(crate) cx_args: Vec<OsString>,
+    pub(crate) codex_args: Vec<OsString>,
 }
 
 pub(crate) struct RuntimeSelection {
@@ -111,8 +204,7 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
 
     if options.slot.is_none()
         && options.target.is_none()
-        && options
-            .first_non_option
+        && first_forwarded_non_option(&options.codex_args)
             .as_deref()
             .is_some_and(|arg| BYPASS_SUBCOMMANDS.contains(&arg))
     {
@@ -203,14 +295,19 @@ pub(crate) fn should_skip_stdin_wrapper(args: &[OsString]) -> bool {
     if args.iter().any(|arg| arg == "--managed") {
         return true;
     }
-    if first_forwarded_non_option(args).is_none()
-        && args
+    let Ok(options) = parse_run_args(args.to_vec()) else {
+        return true;
+    };
+    if first_forwarded_non_option(&options.codex_args).is_none()
+        && options
+            .codex_args
             .iter()
             .any(|arg| matches!(arg.to_str(), Some("-V" | "--version")))
     {
         return true;
     }
-    first_forwarded_non_option(args).is_some_and(|arg| BYPASS_SUBCOMMANDS.contains(&arg.as_str()))
+    first_forwarded_non_option(&options.codex_args)
+        .is_some_and(|arg| BYPASS_SUBCOMMANDS.contains(&arg.as_str()))
 }
 
 pub(crate) fn select_runtime(
@@ -336,7 +433,7 @@ fn warn_remote_fallback(err: &anyhow::Error) {
 }
 
 fn should_try_service_remote(options: &RunOptions) -> bool {
-    options.slot.is_none() && options.target.is_none()
+    options.service_remote && options.slot.is_none() && options.target.is_none()
 }
 
 fn warn_remote_ignores_local_selection(options: &RunOptions, spec: &CodexCommandSpec) {
@@ -722,7 +819,7 @@ fn first_forwarded_non_option(args: &[OsString]) -> Option<String> {
             "--slot" | "--target" | "--manager-dir" | "--codex-bin" | "-s" => {
                 let _ = iter.next();
             }
-            "--managed" | "--cx-quiet" | "--cx-debug" => {}
+            "--managed" | "--cx-quiet" | "--cx-debug" | "--cx-service-remote" => {}
             _ if arg_text.starts_with("--slot=")
                 || arg_text.starts_with("--target=")
                 || arg_text.starts_with("--manager-dir=")
@@ -862,99 +959,52 @@ pub(crate) fn usage_timeout() -> f32 {
 }
 
 fn parse_run_args(args: Vec<OsString>) -> Result<RunOptions> {
-    let mut options = RunOptions::default();
-    let mut iter = args.into_iter().peekable();
-    while let Some(arg) = iter.next() {
-        let arg_text = arg.to_string_lossy();
-        match arg_text.as_ref() {
-            "--" => {
-                options.codex_args.extend(iter);
-                break;
-            }
-            "--slot" => {
-                let value = next_value(&mut iter, "--slot")?;
-                options.slot = Some(value);
-            }
-            "--target" => {
-                let value = next_value(&mut iter, "--target")?;
-                options.target = Some(value);
-            }
-            "--manager-dir" => {
-                let value = next_os_value(&mut iter, "--manager-dir")?;
-                options.manager_dir = Some(PathBuf::from(value));
-            }
-            "--codex-bin" => {
-                let value = next_os_value(&mut iter, "--codex-bin")?;
-                options.codex_bin = Some(PathBuf::from(value));
-            }
-            "--cx-quiet" => {
-                options.quiet = true;
-            }
-            "--cx-debug" => {
-                options.debug = true;
-            }
-            "--managed" => {
-                anyhow::bail!(
-                    "`cx --managed` was removed; `cx` now connects to the cx service app-server by default. Start it with `cx service start --no-telegram`."
-                );
-            }
-            "-s" => {
-                if let Some(next) = iter.peek() {
-                    let value = next.to_string_lossy();
-                    if matches!(
-                        value.as_ref(),
-                        "read-only" | "workspace-write" | "danger-full-access"
-                    ) {
-                        options.codex_args.push(arg);
-                        options
-                            .codex_args
-                            .push(iter.next().expect("peeked value exists"));
-                    } else {
-                        options.slot = Some(next_value(&mut iter, "-s")?);
-                    }
-                } else {
-                    options.codex_args.push(arg);
-                }
-            }
-            _ if arg_text.starts_with("--slot=") => {
-                options.slot = Some(arg_text["--slot=".len()..].to_string());
-            }
-            _ if arg_text.starts_with("--target=") => {
-                options.target = Some(arg_text["--target=".len()..].to_string());
-            }
-            _ if arg_text.starts_with("--manager-dir=") => {
-                options.manager_dir = Some(PathBuf::from(&arg_text["--manager-dir=".len()..]));
-            }
-            _ if arg_text.starts_with("--codex-bin=") => {
-                options.codex_bin = Some(PathBuf::from(&arg_text["--codex-bin=".len()..]));
-            }
-            _ => {
-                if options.first_non_option.is_none() && !arg_text.starts_with('-') {
-                    options.first_non_option = Some(arg_text.to_string());
-                }
-                options.codex_args.push(arg);
-            }
+    let matches = match launcher_command()
+        .try_get_matches_from(std::iter::once(OsString::from("cx")).chain(args))
+    {
+        Ok(matches) => matches,
+        Err(err) if matches!(err.kind(), ClapErrorKind::DisplayHelp) => {
+            err.print().context("print launcher help")?;
+            std::process::exit(0);
         }
+        Err(err) => {
+            return Err(anyhow::anyhow!(
+                "{err}\nCodex arguments now require `--`; for example: `cx -- resume THREAD`."
+            ));
+        }
+    };
+
+    if matches.get_flag(ARG_MANAGED) {
+        anyhow::bail!(
+            "`cx --managed` was removed; service remote is experimental. Start the service with `cx service start --no-telegram`, then opt in with `cx --cx-service-remote`."
+        );
     }
-    Ok(options)
+
+    Ok(RunOptions {
+        slot: matches.get_one::<String>(ARG_SLOT).cloned(),
+        target: matches.get_one::<String>(ARG_TARGET).cloned(),
+        manager_dir: matches.get_one::<PathBuf>(ARG_MANAGER_DIR).cloned(),
+        codex_bin: matches.get_one::<PathBuf>(ARG_CODEX_BIN).cloned(),
+        quiet: matches.get_flag(ARG_CX_QUIET),
+        debug: matches.get_flag(ARG_CX_DEBUG),
+        service_remote: matches.get_flag(ARG_CX_SERVICE_REMOTE),
+        codex_args: matches
+            .get_many::<OsString>(ARG_CODEX_ARGS)
+            .map(|values| values.cloned().collect())
+            .unwrap_or_default(),
+    })
 }
 
-fn next_value(
-    iter: &mut std::iter::Peekable<impl Iterator<Item = OsString>>,
-    flag: &str,
-) -> Result<String> {
-    let value = next_os_value(iter, flag)?;
-    value
-        .into_string()
-        .map_err(|_| anyhow::anyhow!("{flag} requires UTF-8 value"))
-}
-
-fn next_os_value(
-    iter: &mut std::iter::Peekable<impl Iterator<Item = OsString>>,
-    flag: &str,
-) -> Result<OsString> {
-    iter.next()
-        .with_context(|| format!("{flag} requires a value"))
+pub(crate) fn split_launcher_args(args: &[OsString]) -> Result<LauncherArgsSplit> {
+    let options = parse_run_args(args.to_vec())?;
+    let cx_args = args
+        .iter()
+        .position(|arg| arg == "--")
+        .map_or_else(|| args.to_vec(), |index| args[..index].to_vec());
+    Ok(LauncherArgsSplit {
+        cx_args,
+        codex_args: options.codex_args,
+    })
 }
 
 #[cfg(test)]
@@ -973,6 +1023,7 @@ mod tests {
         let options = parse_run_args(vec![
             OsString::from("--slot"),
             OsString::from("bus1"),
+            OsString::from("--"),
             OsString::from("-m"),
             OsString::from("gpt-5.4"),
         ])
@@ -989,6 +1040,7 @@ mod tests {
     fn target_flag_is_removed_from_forwarded_args() {
         let options = parse_run_args(vec![
             OsString::from("--target=research"),
+            OsString::from("--"),
             OsString::from("-m"),
             OsString::from("gpt-5.5"),
         ])
@@ -1020,9 +1072,18 @@ mod tests {
     }
 
     #[test]
-    fn service_remote_is_used_for_plain_launch() {
+    fn service_remote_is_skipped_for_plain_launch_by_default() {
         let options = parse_run_args(Vec::new()).unwrap();
 
+        assert!(!options.service_remote);
+        assert!(!should_try_service_remote(&options));
+    }
+
+    #[test]
+    fn service_remote_requires_explicit_experimental_opt_in() {
+        let options = parse_run_args(vec![OsString::from("--cx-service-remote")]).unwrap();
+
+        assert!(options.service_remote);
         assert!(should_try_service_remote(&options));
     }
 
@@ -1038,6 +1099,7 @@ mod tests {
         assert!(should_skip_stdin_wrapper(&[
             OsString::from("--slot"),
             OsString::from("bus1"),
+            OsString::from("--"),
             OsString::from("app-server"),
             OsString::from("--help"),
         ]));
@@ -1054,13 +1116,20 @@ mod tests {
 
     #[test]
     fn version_flag_skips_stdin_wrapper() {
-        assert!(should_skip_stdin_wrapper(&[OsString::from("--version")]));
-        assert!(should_skip_stdin_wrapper(&[OsString::from("-V")]));
+        assert!(should_skip_stdin_wrapper(&[
+            OsString::from("--"),
+            OsString::from("--version")
+        ]));
+        assert!(should_skip_stdin_wrapper(&[
+            OsString::from("--"),
+            OsString::from("-V")
+        ]));
     }
 
     #[test]
     fn sandbox_short_flag_is_forwarded() {
         let options = parse_run_args(vec![
+            OsString::from("--"),
             OsString::from("-s"),
             OsString::from("workspace-write"),
             OsString::from("hello"),
@@ -1076,6 +1145,31 @@ mod tests {
                 OsString::from("hello")
             ]
         );
+    }
+
+    #[test]
+    fn codex_args_require_separator() {
+        let err =
+            parse_run_args(vec![OsString::from("resume"), OsString::from("thread-1")]).unwrap_err();
+
+        assert!(format!("{err:#}").contains("Codex arguments now require `--`"));
+    }
+
+    #[test]
+    fn launcher_split_preserves_cx_options_for_stdin_relaunch() {
+        let split = split_launcher_args(&[
+            OsString::from("--slot"),
+            OsString::from("dia1"),
+            OsString::from("--"),
+            OsString::from("summarize"),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            split.cx_args,
+            vec![OsString::from("--slot"), OsString::from("dia1")]
+        );
+        assert_eq!(split.codex_args, vec![OsString::from("summarize")]);
     }
 
     #[test]

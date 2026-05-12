@@ -3,7 +3,7 @@ set -euo pipefail
 
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
 RUN_TESTS=0
-REFRESH_SERVICE=1
+REFRESH_SERVICE=0
 START_SERVICE=1
 INSTALL_CLI=1
 SERVICE_ARGS=()
@@ -12,26 +12,27 @@ usage() {
   cat <<'USAGE'
 Usage: scripts/release-local.sh [options] [-- service install args...]
 
-Build the current worktree in release mode, install a local cx binary, and
-refresh the local cx service so it runs that binary. This is for local testing
-before a real GitHub/Homebrew release.
+Build the current worktree in release mode and install a local cx binary. This
+does not restart the local cx service unless --service is passed.
 
 Options:
   --bin-dir DIR       Install cx here. Default: ~/.local/bin or $BIN_DIR.
   --test              Run cargo test --all-targets before installing.
   --no-cli            Do not install the cx CLI shim/binary.
-  --no-service        Do not stop/reinstall/start the local cx service.
-  --no-start          Reinstall launchd plist but do not start the service.
+  --service           Stop/reinstall/start the local cx service using this build.
+  --no-service        Do not stop/reinstall/start the local cx service. Default.
+  --no-start          With --service, reinstall launchd plist but do not start.
   -h, --help          Show this help.
 
 Service args:
-  If a launchd plist already exists, its current service args are preserved.
-  Args after -- override that and are passed to `cx service install`.
+  Only used with --service. If a launchd plist already exists, its current
+  service args are preserved. Args after -- override that and are passed to
+  `cx service install`.
 
 Examples:
   scripts/release-local.sh
   scripts/release-local.sh --test
-  scripts/release-local.sh -- --allow-chat 1032180412 --target default
+  scripts/release-local.sh --service -- --allow-chat 1032180412 --target default
 USAGE
 }
 
@@ -141,6 +142,9 @@ while [[ $# -gt 0 ]]; do
     --no-cli)
       INSTALL_CLI=0
       ;;
+    --service)
+      REFRESH_SERVICE=1
+      ;;
     --no-service)
       REFRESH_SERVICE=0
       ;;
@@ -166,9 +170,9 @@ done
 add_common_tool_paths
 need_cmd cargo
 need_cmd install
-need_cmd ruby
 if [[ "$REFRESH_SERVICE" -eq 1 ]]; then
   need_cmd launchctl
+  need_cmd ruby
 fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

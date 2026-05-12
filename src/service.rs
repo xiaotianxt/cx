@@ -45,6 +45,9 @@ use crate::worker_pool::WorkerPoolConfig;
 const SERVICE_STATE_SCHEMA_VERSION: u64 = 1;
 const SERVICE_TOKEN_SCHEMA_VERSION: u64 = 1;
 const LAUNCHD_LABEL: &str = "dev.xiaotian.cx.service";
+const CHILD_RESTART_BASE_DELAY: Duration = Duration::from_secs(2);
+const CHILD_RESTART_MAX_DELAY: Duration = Duration::from_secs(60);
+const CHILD_RESTART_STABLE_RUNTIME: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -125,10 +128,30 @@ struct ServiceTokenStatusReport {
 
 struct ManagedChild {
     name: &'static str,
-    child: Child,
+    child: Option<Child>,
+    pid: u32,
     started_at_unix: u64,
+    started_at: Option<Instant>,
     restarts: u64,
     last_exit: Option<String>,
+    restart_at: Option<Instant>,
+    restart_policy: RestartPolicy,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct RestartPolicy {
+    consecutive_failures: u32,
+}
+
+impl RestartPolicy {
+    fn record_exit(&mut self, runtime: Duration) -> Duration {
+        if runtime >= CHILD_RESTART_STABLE_RUNTIME {
+            self.consecutive_failures = 0;
+        }
+        let delay = restart_delay_for_failure(self.consecutive_failures);
+        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+        delay
+    }
 }
 
 pub fn start(args: ServiceStartArgs) -> Result<()> {
@@ -239,16 +262,69 @@ pub fn run(args: ServiceRunArgs) -> Result<()> {
             log_line(&paths, &format!("broker worker poll failed: {err:#}"))?;
         }
 
-        if let Some(child) = telegram.as_mut() {
-            if let Some(status) = child.child.try_wait().context("poll telegram child")? {
-                child.last_exit = Some(status.to_string());
-                child.restarts += 1;
-                log_line(
-                    &paths,
-                    &format!("telegram child exited with {status}; restarting"),
-                )?;
-                thread::sleep(Duration::from_secs(2));
-                telegram = Some(start_telegram_child(&args.spec, &paths)?);
+        let telegram_restart = if let Some(child) = telegram.as_mut() {
+            if let Some(process) = child.child.as_mut() {
+                if let Some(status) = process.try_wait().context("poll telegram child")? {
+                    let runtime = child.started_at.map_or(Duration::ZERO, |started| {
+                        Instant::now().saturating_duration_since(started)
+                    });
+                    let delay = child.restart_policy.record_exit(runtime);
+                    let restart_at = Instant::now() + delay;
+                    child.last_exit = Some(format!("{status}; restarting in {}s", delay.as_secs()));
+                    child.child = None;
+                    child.pid = 0;
+                    child.started_at = None;
+                    child.restarts += 1;
+                    child.restart_at = Some(restart_at);
+                    log_line(
+                        &paths,
+                        &format!(
+                            "telegram child exited with {status}; restarting in {}s",
+                            delay.as_secs()
+                        ),
+                    )?;
+                }
+            }
+            if child
+                .restart_at
+                .is_some_and(|restart_at| Instant::now() >= restart_at)
+            {
+                Some((
+                    child.restarts,
+                    child.last_exit.clone(),
+                    child.restart_policy,
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some((restarts, last_exit, restart_policy)) = telegram_restart {
+            match start_telegram_child(&args.spec, &paths) {
+                Ok(mut restarted) => {
+                    restarted.restarts = restarts;
+                    restarted.last_exit = last_exit;
+                    restarted.restart_policy = restart_policy;
+                    telegram = Some(restarted);
+                }
+                Err(err) => {
+                    if let Some(child) = telegram.as_mut() {
+                        let delay = child.restart_policy.record_exit(Duration::ZERO);
+                        child.restart_at = Some(Instant::now() + delay);
+                        child.last_exit = Some(format!(
+                            "restart failed: {err:#}; retrying in {}s",
+                            delay.as_secs()
+                        ));
+                        log_line(
+                            &paths,
+                            &format!(
+                                "telegram child restart failed: {err:#}; retrying in {}s",
+                                delay.as_secs()
+                            ),
+                        )?;
+                    }
+                }
             }
         }
 
@@ -528,10 +604,14 @@ fn spawn_managed(
     log_line(paths, &format!("{name} child started pid={}", child.id()))?;
     Ok(ManagedChild {
         name,
-        child,
+        pid: child.id(),
+        child: Some(child),
         started_at_unix: unix_now()?,
+        started_at: Some(Instant::now()),
         restarts: 0,
         last_exit: None,
+        restart_at: None,
+        restart_policy: RestartPolicy::default(),
     })
 }
 
@@ -591,11 +671,19 @@ fn broker_child_states(broker: &AppServerBroker) -> Result<Vec<ServiceChildState
 fn child_state(child: &ManagedChild) -> Result<ServiceChildState> {
     Ok(ServiceChildState {
         name: child.name.to_string(),
-        pid: child.child.id(),
+        pid: child.pid,
         started_at_unix: child.started_at_unix,
         restarts: child.restarts,
         last_exit: child.last_exit.clone(),
     })
+}
+
+fn restart_delay_for_failure(consecutive_failures: u32) -> Duration {
+    let shift = consecutive_failures.min(5);
+    let multiplier = 1_u32 << shift;
+    CHILD_RESTART_BASE_DELAY
+        .saturating_mul(multiplier)
+        .min(CHILD_RESTART_MAX_DELAY)
 }
 
 fn wait_for_service_state(
@@ -1087,14 +1175,6 @@ enum Signal {
 
 impl Signal {
     #[cfg(unix)]
-    fn kill_arg(self) -> &'static str {
-        match self {
-            Self::Terminate => "-TERM",
-            Self::Kill => "-KILL",
-        }
-    }
-
-    #[cfg(unix)]
     fn signo(self) -> libc::c_int {
         match self {
             Self::Terminate => libc::SIGTERM,
@@ -1105,17 +1185,17 @@ impl Signal {
 
 #[cfg(unix)]
 fn send_signal(pid: u32, signal: Signal) -> Result<()> {
-    let status = Command::new("kill")
-        .arg(signal.kill_arg())
-        .arg(pid.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .with_context(|| format!("send signal to pid {pid}"))?;
-    if !status.success() {
-        anyhow::bail!("failed to send signal to pid {pid}");
+    let pid_i32 = i32::try_from(pid).with_context(|| format!("invalid pid {pid}"))?;
+    if pid_i32 <= 0 {
+        anyhow::bail!("invalid pid {pid}");
     }
-    Ok(())
+    // SAFETY: kill is invoked with a validated positive pid and a fixed signal
+    // number. It does not touch Rust memory.
+    let result = unsafe { libc::kill(pid_i32, signal.signo()) };
+    if result == 0 {
+        return Ok(());
+    }
+    Err(std::io::Error::last_os_error()).with_context(|| format!("send signal to pid {pid}"))
 }
 
 #[cfg(not(unix))]
@@ -1187,13 +1267,19 @@ fn send_signal_to_process_group(_process_group_id: u32, _signal: Signal) -> Resu
 
 #[cfg(unix)]
 fn process_exists(pid: u32) -> bool {
-    Command::new("ps")
-        .arg("-p")
-        .arg(pid.to_string())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+    let Ok(pid_i32) = i32::try_from(pid) else {
+        return false;
+    };
+    if pid_i32 <= 0 {
+        return false;
+    }
+    // SAFETY: kill with signal 0 probes process existence without delivering a
+    // signal and does not touch Rust memory.
+    let result = unsafe { libc::kill(pid_i32, 0) };
+    if result == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 #[cfg(not(unix))]
@@ -1220,20 +1306,32 @@ fn pid_process_group_id(_pid: u32) -> Option<u32> {
 
 #[cfg(unix)]
 fn process_looks_like_service_supervisor(pid: u32) -> bool {
-    let Ok(output) = Command::new("ps")
-        .arg("-p")
-        .arg(pid.to_string())
-        .arg("-o")
-        .arg("command=")
-        .output()
-    else {
+    let Some(command) = process_command_line(pid) else {
         return false;
     };
-    if !output.status.success() {
-        return false;
-    }
-    let command = String::from_utf8_lossy(&output.stdout);
     command.contains("service") && command.contains("run")
+}
+
+#[cfg(unix)]
+fn process_command_line(pid: u32) -> Option<String> {
+    for ps in ["/bin/ps", "/usr/bin/ps", "ps"] {
+        if ps.contains('/') && !Path::new(ps).is_file() {
+            continue;
+        }
+        let Ok(output) = Command::new(ps)
+            .arg("-p")
+            .arg(pid.to_string())
+            .arg("-o")
+            .arg("command=")
+            .output()
+        else {
+            continue;
+        };
+        if output.status.success() {
+            return Some(String::from_utf8_lossy(&output.stdout).into_owned());
+        }
+    }
+    None
 }
 
 #[cfg(not(unix))]
@@ -1356,6 +1454,30 @@ mod tests {
     }
 
     #[test]
+    fn restart_policy_backs_off_to_cap() {
+        let mut policy = RestartPolicy::default();
+
+        let delays = (0..7)
+            .map(|_| policy.record_exit(Duration::from_secs(1)).as_secs())
+            .collect::<Vec<_>>();
+
+        assert_eq!(delays, vec![2, 4, 8, 16, 32, 60, 60]);
+    }
+
+    #[test]
+    fn restart_policy_resets_after_stable_runtime() {
+        let mut policy = RestartPolicy::default();
+        assert_eq!(policy.record_exit(Duration::from_secs(1)).as_secs(), 2);
+        assert_eq!(policy.record_exit(Duration::from_secs(1)).as_secs(), 4);
+        assert_eq!(policy.record_exit(Duration::from_secs(1)).as_secs(), 8);
+
+        let delay = policy.record_exit(CHILD_RESTART_STABLE_RUNTIME);
+
+        assert_eq!(delay.as_secs(), 2);
+        assert_eq!(policy.record_exit(Duration::from_secs(1)).as_secs(), 4);
+    }
+
+    #[test]
     fn legacy_service_state_defaults_process_group_to_none() {
         let state = serde_json::from_str::<ServiceStateFile>(
             r#"{
@@ -1369,6 +1491,24 @@ mod tests {
         .unwrap();
 
         assert_eq!(state.process_group_id, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_exists_reports_current_process() {
+        assert!(process_exists(std::process::id()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_exists_rejects_invalid_pid_zero() {
+        assert!(!process_exists(0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_test_process_is_not_service_supervisor() {
+        assert!(!process_looks_like_service_supervisor(std::process::id()));
     }
 
     #[test]

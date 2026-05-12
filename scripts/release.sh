@@ -207,22 +207,6 @@ prepare_local_service_refresh() {
   fi
 }
 
-stop_local_service_for_reinstall() {
-  [[ "$RESTART_LOCAL_SERVICE" -eq 1 ]] || return
-  [[ "$LOCAL_SERVICE_SHOULD_START" -eq 1 ]] || return
-
-  if [[ "$LOCAL_SERVICE_LAUNCHD" -eq 1 ]] && command -v launchctl >/dev/null 2>&1; then
-    log "stopping local launchd service"
-    launchctl bootout "gui/$(id -u)" "$(local_service_plist)" >/dev/null 2>&1 || true
-  fi
-
-  local_cx_available || return
-  if [[ "$LOCAL_SERVICE_STATE" == "running" ]]; then
-    log "stopping local cx service"
-    cx service stop --force --wait-timeout 10
-  fi
-}
-
 refresh_local_service_after_reinstall() {
   [[ "$RESTART_LOCAL_SERVICE" -eq 1 ]] || return
   [[ "$LOCAL_SERVICE_SHOULD_START" -eq 1 ]] || return
@@ -493,16 +477,15 @@ fi
 if [[ "$BREW_VERIFY" -eq 1 ]]; then
   log "verifying Homebrew install"
   prepare_local_service_refresh
-  if [[ "$LOCAL_SERVICE_SHOULD_START" -eq 1 ]]; then
-    trap restore_local_service_on_exit EXIT
-    stop_local_service_for_reinstall
-  fi
   brew update
   brew upgrade "$FORMULA_REF" || brew reinstall "$FORMULA_REF"
   cx --help >/dev/null
   brew test "$FORMULA_REF"
-  refresh_local_service_after_reinstall
-  trap - EXIT
+  if [[ "$LOCAL_SERVICE_SHOULD_START" -eq 1 ]]; then
+    trap restore_local_service_on_exit EXIT
+    refresh_local_service_after_reinstall
+    trap - EXIT
+  fi
 fi
 
 log "release ${TAG} complete"

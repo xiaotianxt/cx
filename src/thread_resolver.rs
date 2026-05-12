@@ -76,6 +76,10 @@ pub(crate) trait ThreadResolverClient {
         cwd: Option<&str>,
         exclude_turns: bool,
     ) -> Result<AppThreadRead>;
+
+    fn classify_thread_read_failure(&self, error: &anyhow::Error) -> ThreadReadFailure {
+        classify_app_server_thread_read_failure(error)
+    }
 }
 
 impl ThreadResolverClient for AppServerClient {
@@ -100,6 +104,30 @@ impl ThreadResolverClient for AppServerClient {
     ) -> Result<AppThreadRead> {
         AppServerClient::thread_resume_with_path(self, thread_id, path, cwd, exclude_turns)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ThreadReadFailure {
+    UnreadableThread,
+    Fatal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThreadReadFailurePolicy {
+    Ignore,
+    PropagateFatal,
+}
+
+fn classify_app_server_thread_read_failure(error: &anyhow::Error) -> ThreadReadFailure {
+    let message = format!("{error:#}").to_ascii_lowercase();
+    if message.contains("not loaded")
+        || message.contains("not found")
+        || message.contains("no such thread")
+        || message.contains("unknown thread")
+    {
+        return ThreadReadFailure::UnreadableThread;
+    }
+    ThreadReadFailure::Fatal
 }
 
 pub(crate) fn resolve_app_thread<C: ThreadResolverClient>(
@@ -139,7 +167,15 @@ pub(crate) fn resolve_app_thread<C: ThreadResolverClient>(
                 default_terminal_channel,
             );
         }
-        if let Some(outcome) = attach_session_thread(paths, client, &scope, &session, &cwd, None)? {
+        if let Some(outcome) = attach_session_thread(
+            paths,
+            client,
+            &scope,
+            &session,
+            &cwd,
+            None,
+            ThreadReadFailurePolicy::Ignore,
+        )? {
             return Ok(outcome);
         }
     }
@@ -155,7 +191,15 @@ pub(crate) fn resolve_app_thread<C: ThreadResolverClient>(
                 default_terminal_channel,
             );
         }
-        if let Some(outcome) = attach_session_thread(paths, client, &scope, &session, &cwd, None)? {
+        if let Some(outcome) = attach_session_thread(
+            paths,
+            client,
+            &scope,
+            &session,
+            &cwd,
+            None,
+            ThreadReadFailurePolicy::Ignore,
+        )? {
             return Ok(outcome);
         }
     }
@@ -320,8 +364,15 @@ fn resolve_explicit_resume(
                 );
             }
             let session = session::show_session(paths, session_id)?;
-            if let Some(outcome) = attach_session_thread(paths, client, scope, &session, cwd, None)?
-            {
+            if let Some(outcome) = attach_session_thread(
+                paths,
+                client,
+                scope,
+                &session,
+                cwd,
+                None,
+                ThreadReadFailurePolicy::PropagateFatal,
+            )? {
                 return Ok(outcome);
             }
             Ok(ThreadResolverOutcome {
@@ -374,6 +425,11 @@ fn resolve_explicit_app_or_codex_id(
             })
         }
         Err(read_err) => {
+            if client.classify_thread_read_failure(&read_err) == ThreadReadFailure::Fatal {
+                return Err(read_err).with_context(|| {
+                    format!("read explicit app-server thread {thread_or_session_id}")
+                });
+            }
             let (session, requested_thread_id) = if let Some(session) =
                 session::find_session_by_app_thread_id(paths, thread_or_session_id)?
             {
@@ -393,9 +449,15 @@ fn resolve_explicit_app_or_codex_id(
                 )
             };
             if let Some(session) = session {
-                if let Some(outcome) =
-                    attach_session_thread(paths, client, scope, &session, cwd, requested_thread_id)?
-                {
+                if let Some(outcome) = attach_session_thread(
+                    paths,
+                    client,
+                    scope,
+                    &session,
+                    cwd,
+                    requested_thread_id,
+                    ThreadReadFailurePolicy::PropagateFatal,
+                )? {
                     return Ok(outcome);
                 }
             }
@@ -416,19 +478,29 @@ fn attach_session_thread(
     session: &session::SessionRecord,
     cwd: &str,
     requested_thread_id: Option<&str>,
+    read_failure_policy: ThreadReadFailurePolicy,
 ) -> Result<Option<ThreadResolverOutcome>> {
     let Some(app_thread) = session.app_thread.as_ref() else {
         return Ok(None);
     };
     let thread_id = requested_thread_id.unwrap_or(&app_thread.thread_id);
-    let read = client.thread_read(thread_id, false).or_else(|read_err| {
-        let Some(path) = app_thread.path.as_deref() else {
-            return Err(read_err);
-        };
-        client.thread_resume_with_path(thread_id, Some(path), Some(cwd), false)
-    });
-    let Ok(read) = read else {
-        return Ok(None);
+    let read = match client.thread_read(thread_id, false) {
+        Ok(read) => read,
+        Err(read_err) => {
+            if read_failure_policy == ThreadReadFailurePolicy::PropagateFatal
+                && client.classify_thread_read_failure(&read_err) == ThreadReadFailure::Fatal
+            {
+                return Err(read_err);
+            }
+            let Some(path) = app_thread.path.as_deref() else {
+                return Ok(None);
+            };
+            let Ok(read) = client.thread_resume_with_path(thread_id, Some(path), Some(cwd), false)
+            else {
+                return Ok(None);
+            };
+            read
+        }
     };
     let _session = bind_summary(
         paths,
@@ -592,6 +664,7 @@ mod tests {
     #[derive(Default)]
     struct FakeResolverClient {
         readable: BTreeMap<String, AppThreadSummary>,
+        read_errors: BTreeMap<String, String>,
         listed: Vec<AppThreadSummary>,
         started: Option<StartedThread>,
         resume_result: Option<AppThreadSummary>,
@@ -621,6 +694,9 @@ mod tests {
 
         fn thread_read(&mut self, thread_id: &str, _include_turns: bool) -> Result<AppThreadRead> {
             self.read_calls.push(thread_id.to_string());
+            if let Some(error) = self.read_errors.get(thread_id) {
+                return Err(anyhow!(error.clone()));
+            }
             self.readable
                 .get(thread_id)
                 .cloned()
@@ -986,6 +1062,71 @@ mod tests {
     }
 
     #[test]
+    fn explicit_thread_transport_read_failure_is_returned_without_fallback() {
+        let paths = temp_paths("explicit-transport-failure");
+        let channel_id = ChannelId::parse("terminal").unwrap();
+        let session = session::create_session(
+            &paths,
+            CreateSessionRequest {
+                session_id: None,
+                channel_id: channel_id.clone(),
+            },
+        )
+        .unwrap()
+        .session;
+        session::bind_app_thread(
+            &paths,
+            BindAppThreadRequest {
+                session_id: session.session_id,
+                app_thread: AppThreadBinding {
+                    thread_id: "old-thread".to_string(),
+                    codex_session_id: None,
+                    cwd: "/tmp/project".to_string(),
+                    title: Some("old".to_string()),
+                    slot: Some("slot-a".to_string()),
+                    generation: 1,
+                    path: Some("/tmp/threads/old.jsonl".to_string()),
+                    updated_at_unix: 10,
+                },
+            },
+        )
+        .unwrap();
+        let mut client = FakeResolverClient {
+            read_errors: BTreeMap::from([(
+                "old-thread".to_string(),
+                "app-server websocket closed".to_string(),
+            )]),
+            resume_result: Some(summary_with_path(
+                "current-thread",
+                "/tmp/project",
+                "idle",
+                40,
+                Some("/tmp/threads/old.jsonl"),
+            )),
+            ..FakeResolverClient::default()
+        };
+
+        let err = resolve_app_thread(
+            &paths,
+            &mut client,
+            ThreadResolverScope {
+                cwd: PathBuf::from("/tmp/project"),
+                channel_id: Some(channel_id),
+                explicit_resume_id: Some(ExplicitResumeId::AppThreadOrCodexSession(
+                    "old-thread".to_string(),
+                )),
+                slot: Some("slot-b".to_string()),
+                generation: 2,
+            },
+        )
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("read explicit app-server thread old-thread"));
+        assert_eq!(client.read_calls, vec!["old-thread"]);
+        assert!(client.resume_calls.is_empty());
+    }
+
+    #[test]
     fn explicit_cx_session_id_uses_bound_thread_not_session_id_as_thread() {
         let paths = temp_paths("explicit-cx-session");
         let channel_id = ChannelId::parse("terminal").unwrap();
@@ -1108,6 +1249,71 @@ mod tests {
                 thread_id: "thread-1".to_string()
             }
         );
+        assert_eq!(client.read_calls, vec!["codex-session-1", "thread-1"]);
+        assert!(client.resume_calls.is_empty());
+    }
+
+    #[test]
+    fn explicit_codex_session_bound_thread_malformed_read_failure_is_returned() {
+        let paths = temp_paths("explicit-bound-malformed-failure");
+        let channel_id = ChannelId::parse("terminal").unwrap();
+        let session = session::create_session(
+            &paths,
+            CreateSessionRequest {
+                session_id: None,
+                channel_id: channel_id.clone(),
+            },
+        )
+        .unwrap()
+        .session;
+        session::bind_app_thread(
+            &paths,
+            BindAppThreadRequest {
+                session_id: session.session_id,
+                app_thread: AppThreadBinding {
+                    thread_id: "thread-1".to_string(),
+                    codex_session_id: Some("codex-session-1".to_string()),
+                    cwd: "/tmp/project".to_string(),
+                    title: Some("bound".to_string()),
+                    slot: Some("slot-a".to_string()),
+                    generation: 1,
+                    path: Some("/tmp/threads/thread-1.jsonl".to_string()),
+                    updated_at_unix: 10,
+                },
+            },
+        )
+        .unwrap();
+        let mut client = FakeResolverClient {
+            read_errors: BTreeMap::from([(
+                "thread-1".to_string(),
+                "decode thread/read response".to_string(),
+            )]),
+            resume_result: Some(summary_with_path(
+                "current-thread",
+                "/tmp/project",
+                "idle",
+                40,
+                Some("/tmp/threads/thread-1.jsonl"),
+            )),
+            ..FakeResolverClient::default()
+        };
+
+        let err = resolve_app_thread(
+            &paths,
+            &mut client,
+            ThreadResolverScope {
+                cwd: PathBuf::from("/tmp/project"),
+                channel_id: Some(channel_id),
+                explicit_resume_id: Some(ExplicitResumeId::AppThreadOrCodexSession(
+                    "codex-session-1".to_string(),
+                )),
+                slot: Some("slot-b".to_string()),
+                generation: 2,
+            },
+        )
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("decode thread/read response"));
         assert_eq!(client.read_calls, vec!["codex-session-1", "thread-1"]);
         assert!(client.resume_calls.is_empty());
     }

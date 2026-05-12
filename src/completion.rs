@@ -19,6 +19,7 @@ use crate::cli::CompleteArgs;
 use crate::cli::CompleteKind;
 use crate::cli::CompletionShell;
 use crate::paths::ManagerPaths;
+use crate::run;
 use crate::slot;
 use crate::target;
 
@@ -69,7 +70,6 @@ struct Candidate {
 enum DynamicKind {
     Slots,
     Targets,
-    Models,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,65 +83,6 @@ enum ValueCompletion {
     Dynamic(DynamicKind),
     Path(PathKind),
 }
-
-#[derive(Debug, Clone, Copy)]
-struct LauncherOption {
-    long: Option<&'static str>,
-    short: Option<char>,
-    description: &'static str,
-    value: Option<ValueCompletion>,
-}
-
-const LAUNCHER_OPTIONS: &[LauncherOption] = &[
-    LauncherOption {
-        long: Some("slot"),
-        short: Some('s'),
-        description: "Use a specific slot",
-        value: Some(ValueCompletion::Dynamic(DynamicKind::Slots)),
-    },
-    LauncherOption {
-        long: Some("target"),
-        short: None,
-        description: "Use a target config",
-        value: Some(ValueCompletion::Dynamic(DynamicKind::Targets)),
-    },
-    LauncherOption {
-        long: Some("manager-dir"),
-        short: None,
-        description: "Profile-manager directory",
-        value: Some(ValueCompletion::Path(PathKind::Directories)),
-    },
-    LauncherOption {
-        long: Some("codex-bin"),
-        short: None,
-        description: "Path to the real Codex binary",
-        value: Some(ValueCompletion::Path(PathKind::Files)),
-    },
-    LauncherOption {
-        long: Some("cx-quiet"),
-        short: None,
-        description: "Suppress cx slot banner",
-        value: None,
-    },
-    LauncherOption {
-        long: Some("cx-debug"),
-        short: None,
-        description: "Print slot selection details",
-        value: None,
-    },
-    LauncherOption {
-        long: None,
-        short: Some('m'),
-        description: "Codex model",
-        value: Some(ValueCompletion::Dynamic(DynamicKind::Models)),
-    },
-    LauncherOption {
-        long: Some("help"),
-        short: Some('h'),
-        description: "Print help",
-        value: None,
-    },
-];
 
 pub fn print_script(shell: CompletionShell) -> Result<()> {
     let script = match shell {
@@ -199,6 +140,9 @@ fn word_candidates(args: &CompleteArgs) -> Result<Vec<Candidate>> {
         .or_else(|| manager_dir_from(&before));
     let paths = ManagerPaths::new(manager_dir)?;
     let user_words = strip_program_name(&before);
+    if user_words.iter().any(|word| word == "--") {
+        return Ok(Vec::new());
+    }
 
     if let Some(candidates) = complete_attached_value(current, &user_words, &paths)? {
         return Ok(candidates);
@@ -277,7 +221,7 @@ fn is_management_mode(user_words: &[String]) -> bool {
 
 fn launcher_candidates(current: &str) -> Result<Vec<Candidate>> {
     if current.starts_with('-') {
-        return Ok(launcher_option_candidates());
+        return Ok(option_candidates(&run::launcher_command()));
     }
     let root = Cli::command();
     Ok(command_candidates(&root))
@@ -383,13 +327,18 @@ fn complete_attached_value(
             .collect();
         Ok(Some(candidates))
     } else {
-        let Some(value_completion) =
-            launcher_option_by_long(option_name).and_then(|option| option.value)
+        let launcher = run::launcher_command();
+        let Some(arg) = launcher
+            .get_arguments()
+            .find(|arg| !arg.is_hide_set() && arg.get_long() == Some(option_name))
         else {
             return Ok(None);
         };
+        let Some(candidates) = value_candidates_for_arg(arg, value_prefix, paths)? else {
+            return Ok(None);
+        };
         let prefix = format!("--{option_name}=");
-        let candidates = value_candidates(value_completion, value_prefix, paths)?
+        let candidates = candidates
             .into_iter()
             .map(|candidate| Candidate {
                 value: format!("{prefix}{}", candidate.value),
@@ -417,10 +366,11 @@ fn complete_value_after_previous(
             .transpose()
             .map(Option::flatten)
     } else {
-        launcher_option_from_token(previous)
-            .and_then(|option| option.value)
-            .map(|completion| value_candidates(completion, current, paths))
+        let launcher = run::launcher_command();
+        option_from_token(&launcher, previous)
+            .map(|arg| value_candidates_for_arg(arg, current, paths))
             .transpose()
+            .map(Option::flatten)
     }
 }
 
@@ -529,27 +479,7 @@ fn dynamic_candidates(kind: DynamicKind, paths: &ManagerPaths) -> Result<Vec<Can
     match kind {
         DynamicKind::Slots => slot_candidates(paths),
         DynamicKind::Targets => target_candidates(paths),
-        DynamicKind::Models => model_candidates(&paths.base_codex_home.join("models_cache.json")),
     }
-}
-
-fn launcher_option_candidates() -> Vec<Candidate> {
-    let mut candidates = Vec::new();
-    for option in LAUNCHER_OPTIONS {
-        if let Some(long) = option.long {
-            candidates.push(Candidate {
-                value: format!("--{long}"),
-                description: option.description.to_string(),
-            });
-        }
-        if let Some(short) = option.short {
-            candidates.push(Candidate {
-                value: format!("-{short}"),
-                description: option.description.to_string(),
-            });
-        }
-    }
-    candidates
 }
 
 fn command_candidates(command: &Command) -> Vec<Candidate> {
@@ -646,29 +576,6 @@ fn visible_subcommand<'a>(command: &'a Command, name: &str) -> Option<&'a Comman
     command
         .get_subcommands()
         .find(|command| !command.is_hide_set() && command.get_name() == name)
-}
-
-fn launcher_option_by_long(name: &str) -> Option<LauncherOption> {
-    LAUNCHER_OPTIONS
-        .iter()
-        .copied()
-        .find(|option| option.long == Some(name))
-}
-
-fn launcher_option_from_token(token: &str) -> Option<LauncherOption> {
-    if let Some(name) = token.strip_prefix("--") {
-        let name = name.split_once('=').map_or(name, |(name, _)| name);
-        return launcher_option_by_long(name);
-    }
-    let mut chars = token.strip_prefix('-')?.chars();
-    let short = chars.next()?;
-    if chars.next().is_some() {
-        return None;
-    }
-    LAUNCHER_OPTIONS
-        .iter()
-        .copied()
-        .find(|option| option.short == Some(short))
 }
 
 fn filter_candidates(candidates: Vec<Candidate>, prefix: &str) -> Vec<Candidate> {
@@ -915,6 +822,23 @@ mod tests {
     }
 
     #[test]
+    fn launcher_options_include_experimental_service_remote() {
+        let paths = temp_paths("service-remote-option");
+
+        let candidates = complete(&["cx"], "--cx-s", &paths);
+
+        assert_eq!(
+            candidates,
+            vec![Candidate {
+                value: "--cx-service-remote".to_string(),
+                description: "Use experimental cx service remote".to_string(),
+            }]
+        );
+
+        let _ = fs::remove_dir_all(&paths.manager_dir);
+    }
+
+    #[test]
     fn clap_value_enum_options_complete_possible_values() {
         let paths = temp_paths("sort-values");
 
@@ -960,27 +884,28 @@ mod tests {
     }
 
     #[test]
-    fn launcher_model_option_completes_cached_models() {
-        let paths = temp_paths("models-runtime");
-        let runtime_base = paths.manager_dir.parent().unwrap();
-        fs::create_dir_all(runtime_base).unwrap();
-        fs::write(
-            runtime_base.join("models_cache.json"),
-            r#"{"models":[{"slug":"gpt-test","display_name":"GPT Test"}]}"#,
-        )
-        .unwrap();
-
-        let candidates = complete(&["cx", "-m"], "g", &paths);
+    fn launcher_slot_option_completes_slot_names() {
+        let paths = temp_paths("slot-option");
+        fs::create_dir_all(paths.slot_home("dia1")).unwrap();
 
         assert_eq!(
-            candidates,
+            complete(&["cx", "--slot"], "d", &paths),
             vec![Candidate {
-                value: "gpt-test".to_string(),
-                description: "GPT Test".to_string(),
+                value: "dia1".to_string(),
+                description: "slot directory".to_string(),
             }]
         );
 
-        let _ = fs::remove_dir_all(runtime_base);
+        let _ = fs::remove_dir_all(&paths.manager_dir);
+    }
+
+    #[test]
+    fn launcher_completion_stops_at_codex_arg_boundary() {
+        let paths = temp_paths("codex-boundary");
+
+        assert!(complete(&["cx", "--"], "-", &paths).is_empty());
+
+        let _ = fs::remove_dir_all(&paths.manager_dir);
     }
 
     #[test]

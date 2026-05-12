@@ -2,7 +2,10 @@ use std::fmt;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::SystemTime;
@@ -309,6 +312,7 @@ pub fn create_session(
     paths: &ManagerPaths,
     request: CreateSessionRequest,
 ) -> Result<CreateSessionResult> {
+    let _state_lock = lock_session_state(paths)?;
     let now = unix_now_secs()?;
     let session_id = match request.session_id {
         Some(session_id) => session_id,
@@ -341,6 +345,7 @@ pub fn create_session(
 }
 
 pub fn acquire_lease(paths: &ManagerPaths, request: AcquireLeaseRequest) -> Result<LeaseResult> {
+    let _state_lock = lock_session_state(paths)?;
     let now = unix_now_secs()?;
     let mut session = show_session(paths, &request.session_id)?;
     if session.active_lease.is_some() && !request.steal {
@@ -378,6 +383,7 @@ pub fn acquire_lease(paths: &ManagerPaths, request: AcquireLeaseRequest) -> Resu
 }
 
 pub fn release_lease(paths: &ManagerPaths, request: ReleaseLeaseRequest) -> Result<LeaseResult> {
+    let _state_lock = lock_session_state(paths)?;
     let now = unix_now_secs()?;
     let mut session = show_session(paths, &request.session_id)?;
     let Some(active_lease) = session.active_lease.clone() else {
@@ -406,6 +412,7 @@ pub fn record_channel_message(
     paths: &ManagerPaths,
     request: RecordChannelMessageRequest,
 ) -> Result<JournalEvent> {
+    let _state_lock = lock_session_state(paths)?;
     let now = unix_now_secs()?;
     let _ = show_session(paths, &request.session_id)?;
     let event = JournalEvent {
@@ -424,6 +431,7 @@ pub fn bind_app_thread(
     paths: &ManagerPaths,
     request: BindAppThreadRequest,
 ) -> Result<SessionRecord> {
+    let _state_lock = lock_session_state(paths)?;
     let now = unix_now_secs()?;
     let mut session = show_session(paths, &request.session_id)?;
     session.app_thread = Some(request.app_thread);
@@ -677,6 +685,61 @@ fn append_event(paths: &ManagerPaths, event: &JournalEvent) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+struct SessionStateLock {
+    file: fs::File,
+}
+
+#[cfg(unix)]
+impl Drop for SessionStateLock {
+    fn drop(&mut self) {
+        // SAFETY: flock only reads the valid file descriptor owned by self.file.
+        let result = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        debug_assert_eq!(result, 0);
+    }
+}
+
+#[cfg(unix)]
+fn lock_session_state(paths: &ManagerPaths) -> Result<SessionStateLock> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    fs::create_dir_all(paths.serve_dir())
+        .with_context(|| format!("create {}", paths.serve_dir().display()))?;
+    set_private_dir_permissions(&paths.serve_dir())?;
+
+    let lock_file = session_state_lock_file(paths);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&lock_file)
+        .with_context(|| format!("open {}", lock_file.display()))?;
+    set_private_file_permissions(&lock_file)?;
+
+    // SAFETY: flock only reads the valid file descriptor owned by file.
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("lock {}", lock_file.display()));
+    }
+
+    Ok(SessionStateLock { file })
+}
+
+fn session_state_lock_file(paths: &ManagerPaths) -> PathBuf {
+    paths.serve_dir().join(".session-state.lock")
+}
+
+#[cfg(not(unix))]
+struct SessionStateLock;
+
+#[cfg(not(unix))]
+fn lock_session_state(_paths: &ManagerPaths) -> Result<SessionStateLock> {
+    Ok(SessionStateLock)
+}
+
 fn parse_id(raw: String, label: &str, prefix: &str) -> Result<String> {
     if raw.len() <= prefix.len() || !raw.starts_with(prefix) {
         anyhow::bail!("{label} must start with {prefix}");
@@ -895,6 +958,81 @@ mod tests {
         let journal = fs::read_to_string(paths.serve_event_journal_file()).unwrap();
         assert!(journal.contains("\"eventKind\":\"lease-acquired\""));
         assert!(journal.contains("\"eventKind\":\"lease-released\""));
+
+        let _ = fs::remove_dir_all(&paths.manager_dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_mutations_use_private_local_lock_file() {
+        let paths = temp_paths("state-lock");
+        let session_id = SessionId::parse("sess_manual").unwrap();
+        create_session(
+            &paths,
+            CreateSessionRequest {
+                session_id: Some(session_id.clone()),
+                channel_id: ChannelId::parse("terminal").unwrap(),
+            },
+        )
+        .unwrap();
+
+        let acquired = acquire_lease(
+            &paths,
+            AcquireLeaseRequest {
+                session_id: session_id.clone(),
+                channel_id: ChannelId::parse("telegram:12345").unwrap(),
+                steal: false,
+            },
+        )
+        .unwrap();
+        release_lease(
+            &paths,
+            ReleaseLeaseRequest {
+                session_id: session_id.clone(),
+                lease_token: acquired.session.active_lease.unwrap().lease_token,
+            },
+        )
+        .unwrap();
+        let rebound = bind_app_thread(
+            &paths,
+            BindAppThreadRequest {
+                session_id: session_id.clone(),
+                app_thread: AppThreadBinding {
+                    thread_id: String::from("thread-1"),
+                    codex_session_id: Some(String::from("codex-session-1")),
+                    cwd: String::from("/tmp/project"),
+                    title: Some(String::from("Project")),
+                    slot: Some(String::from("main")),
+                    generation: 1,
+                    path: Some(String::from("/tmp/project/session.jsonl")),
+                    updated_at_unix: 123,
+                },
+            },
+        )
+        .unwrap();
+
+        assert_eq!(rebound.app_thread.unwrap().thread_id, "thread-1");
+        let lock_file = session_state_lock_file(&paths);
+        assert_eq!(lock_file, paths.serve_dir().join(".session-state.lock"));
+        assert!(lock_file.exists());
+        assert!(paths
+            .manager_dir
+            .join("serve")
+            .starts_with(&paths.manager_dir));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let lock_mode = fs::metadata(&lock_file).unwrap().permissions().mode() & 0o777;
+            let serve_mode = fs::metadata(paths.serve_dir())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(lock_mode, 0o600);
+            assert_eq!(serve_mode, 0o700);
+        }
 
         let _ = fs::remove_dir_all(&paths.manager_dir);
     }

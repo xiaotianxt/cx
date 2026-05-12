@@ -14,6 +14,7 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
         return crate::run::run_from_args(args);
     }
 
+    let split = crate::run::split_launcher_args(&args)?;
     debug("reading piped stdin");
     let mut input = String::new();
     io::stdin()
@@ -24,13 +25,16 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
         input.len()
     ));
 
-    let combined_prompt = build_stdin_prompt(&args, &input);
+    let combined_prompt = build_stdin_prompt(&split.codex_args, &input);
     debug("starting codex tui");
 
+    let mut relaunch_args = split.cx_args;
+    relaunch_args.push(OsString::from("--"));
+    relaunch_args.push(OsString::from(combined_prompt));
     if script_command_available() {
-        exec_with_script(combined_prompt)
+        exec_with_script(relaunch_args)
     } else {
-        exec_self_with_tty(vec![OsString::from("--"), OsString::from(combined_prompt)])
+        exec_self_with_tty(relaunch_args)
     }
 }
 
@@ -48,7 +52,7 @@ fn build_stdin_prompt(args: &[OsString], input: &str) -> String {
     format!("{prompt}\n\n<stdin>\n{input}\n</stdin>")
 }
 
-fn exec_with_script(combined_prompt: String) -> Result<()> {
+fn exec_with_script(args: Vec<OsString>) -> Result<()> {
     let cx = current_exe()?;
     let tty = File::open("/dev/tty").context("open /dev/tty")?;
     let mut command = Command::new("script");
@@ -56,8 +60,7 @@ fn exec_with_script(combined_prompt: String) -> Result<()> {
         .arg("-q")
         .arg("/dev/null")
         .arg(cx)
-        .arg("--")
-        .arg(combined_prompt)
+        .args(args)
         .stdin(tty);
     exec(command)
 }

@@ -39,6 +39,13 @@ struct ListenUrl {
     port: u16,
 }
 
+#[derive(Debug)]
+struct BoundListenUrl {
+    listener: TcpListener,
+    listen_url: String,
+    readyz_url: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ServeStateFile {
@@ -206,14 +213,40 @@ impl ListenUrl {
         })
     }
 
-    fn resolve(self) -> Result<Self> {
+    fn bind_listener(&self) -> Result<BoundListenUrl> {
+        let bind_host = self.bind_host();
+        let listener = TcpListener::bind((bind_host, self.port))
+            .with_context(|| format!("bind serve listener {}", self.websocket_url()))?;
+        let addr = listener
+            .local_addr()
+            .context("read serve listener address")?;
+        let host = addr.ip().to_string();
+        let port = addr.port();
+        Ok(BoundListenUrl {
+            listener,
+            listen_url: format!("ws://{host}:{port}"),
+            readyz_url: format!("http://{host}:{port}/readyz"),
+        })
+    }
+
+    fn reserve_for_external_child(self) -> Result<Self> {
         if self.port != 0 {
             return Ok(self);
         }
-        let listener = TcpListener::bind(("127.0.0.1", 0)).context("reserve loopback port")?;
-        let port = listener.local_addr().context("read reserved port")?.port();
+        // Codex app-server accepts only a URL before process start. Until it can
+        // inherit a pre-bound listener, this child-owned port cannot be held
+        // across exec the way the parent proxy listener is.
+        let listener = TcpListener::bind((self.bind_host(), 0)).context("reserve upstream port")?;
+        let port = listener.local_addr().context("read upstream port")?.port();
         drop(listener);
         Ok(Self { port, ..self })
+    }
+
+    fn bind_host(&self) -> &str {
+        match self.host.as_str() {
+            "localhost" => "127.0.0.1",
+            host => host,
+        }
     }
 
     fn websocket_url(&self) -> String {
@@ -233,13 +266,14 @@ pub fn start(args: ServeStartArgs) -> Result<()> {
     let paths = ManagerPaths::new(args.manager_dir.clone())?;
     let runtime = run::select_runtime(&paths, args.slot.as_deref(), args.target.as_deref(), false)?;
     let real_codex = run::resolve_codex_bin(args.codex_bin.as_deref())?;
-    let listen = ListenUrl::parse(&args.listen)?.resolve()?;
-    let proxy_listen_url = listen.websocket_url();
+    let listen = ListenUrl::parse(&args.listen)?;
+    let proxy_listen = listen.bind_listener()?;
+    let proxy_listen_url = proxy_listen.listen_url.clone();
     let upstream = ListenUrl {
         host: listen.host.clone(),
         port: 0,
     }
-    .resolve()?;
+    .reserve_for_external_child()?;
     let upstream_listen_url = upstream.websocket_url();
 
     let mut codex_args = vec![
@@ -281,11 +315,10 @@ pub fn start(args: ServeStartArgs) -> Result<()> {
     }
 
     let proxy = AppServerProxy::new(
-        proxy_listen_url.clone(),
         upstream_listen_url,
         paths.serve_dir().join("events").join("default.jsonl"),
     );
-    let _proxy_handle = match proxy.spawn() {
+    let _proxy_handle = match proxy.spawn_with_listener(proxy_listen.listener) {
         Ok(handle) => handle,
         Err(err) => {
             let _ = child.kill();
@@ -302,7 +335,7 @@ pub fn start(args: ServeStartArgs) -> Result<()> {
         codex_home,
         target,
         listen_url: proxy_listen_url,
-        readyz_url: listen.readyz_url(),
+        readyz_url: proxy_listen.readyz_url,
         started_at_unix: unix_now()?,
     };
     if let Err(err) = write_state(&paths, &state) {
@@ -973,6 +1006,22 @@ mod tests {
                 port: 0,
             }
         );
+    }
+
+    #[test]
+    fn bind_zero_port_holds_actual_listener_port() {
+        let listen = ListenUrl::parse("ws://127.0.0.1:0").unwrap();
+        let bound = listen.bind_listener().unwrap();
+        let port = bound
+            .listen_url
+            .rsplit_once(':')
+            .and_then(|(_, port)| port.parse::<u16>().ok())
+            .unwrap();
+
+        assert_ne!(port, 0);
+        assert_eq!(bound.listen_url, format!("ws://127.0.0.1:{port}"));
+        assert_eq!(bound.readyz_url, format!("http://127.0.0.1:{port}/readyz"));
+        assert!(TcpListener::bind(("127.0.0.1", port)).is_err());
     }
 
     #[test]

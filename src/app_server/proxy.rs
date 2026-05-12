@@ -34,7 +34,6 @@ const MAX_HANDSHAKE_BYTES: usize = 16 * 1024;
 const MAX_FRAME_PAYLOAD: u64 = 16 * 1024 * 1024;
 #[derive(Debug, Clone)]
 pub(crate) struct AppServerProxy {
-    listen_url: String,
     upstream: ProxyUpstream,
     event_log: PathBuf,
 }
@@ -58,18 +57,17 @@ struct ProxyEventRecord {
 }
 
 impl AppServerProxy {
-    pub(crate) fn new(listen_url: String, upstream_url: String, event_log: PathBuf) -> Self {
+    pub(crate) fn new(upstream_url: String, event_log: PathBuf) -> Self {
         Self {
-            listen_url,
             upstream: ProxyUpstream::Fixed(upstream_url),
             event_log,
         }
     }
 
-    pub(crate) fn spawn(self) -> Result<thread::JoinHandle<()>> {
-        let listen = LoopbackWsUrl::parse(&self.listen_url)?;
-        let listener = TcpListener::bind((listen.host(), listen.port()))
-            .with_context(|| format!("bind app-server proxy {}", self.listen_url))?;
+    pub(crate) fn spawn_with_listener(
+        self,
+        listener: TcpListener,
+    ) -> Result<thread::JoinHandle<()>> {
         listener
             .set_nonblocking(false)
             .context("configure app-server proxy listener")?;

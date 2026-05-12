@@ -15,10 +15,10 @@ pub use service::*;
 #[command(name = "cx")]
 #[command(about = "Fast local Codex launcher, stdin wrapper, and slot manager")]
 #[command(
-    override_usage = "cx [COMMAND] [ARGS]...\n       cx [CODEX_ARGS]...\n       <stdin> | cx [PROMPT]"
+    override_usage = "cx [COMMAND] [ARGS]...\n       cx [CX_OPTIONS] [-- CODEX_ARGS]...\n       <stdin> | cx [CX_OPTIONS] [-- PROMPT]"
 )]
 #[command(
-    after_help = "Without a cx management command, arguments are forwarded to Codex through the best available slot. Use `--` when a Codex prompt or arg starts with a cx command name."
+    after_help = "Without a cx management command, cx launches Codex through the best available local slot. Codex arguments must follow `--`."
 )]
 pub struct Cli {
     #[command(subcommand)]

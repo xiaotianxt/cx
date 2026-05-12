@@ -7,6 +7,7 @@ REFRESH_SERVICE=0
 START_SERVICE=1
 INSTALL_CLI=1
 SERVICE_ARGS=()
+CARGO_FEATURE_ARGS=()
 
 usage() {
   cat <<'USAGE'
@@ -19,7 +20,8 @@ Options:
   --bin-dir DIR       Install cx here. Default: ~/.local/bin or $BIN_DIR.
   --test              Run cargo test --all-targets before installing.
   --no-cli            Do not install the cx CLI shim/binary.
-  --service           Stop/reinstall/start the local cx service using this build.
+  --service           Build with the service feature, then stop/reinstall/start
+                      the local cx service using this build.
   --no-service        Do not stop/reinstall/start the local cx service. Default.
   --no-start          With --service, reinstall launchd plist but do not start.
   -h, --help          Show this help.
@@ -173,6 +175,7 @@ need_cmd install
 if [[ "$REFRESH_SERVICE" -eq 1 ]]; then
   need_cmd launchctl
   need_cmd ruby
+  CARGO_FEATURE_ARGS=(--features service)
 fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -187,11 +190,11 @@ fi
 
 if [[ "$RUN_TESTS" -eq 1 ]]; then
   log "running cargo test --all-targets"
-  cargo test --all-targets
+  cargo test --all-targets "${CARGO_FEATURE_ARGS[@]}"
 fi
 
 log "building release binary from current worktree"
-cargo build --release
+cargo build --release "${CARGO_FEATURE_ARGS[@]}"
 
 BUILT_BIN="$ROOT/target/release/cx"
 LOCAL_BIN="$BIN_DIR/cx"

@@ -8,7 +8,9 @@ use clap::ValueEnum;
 
 use crate::paths::ManagerPaths;
 
+#[cfg(feature = "service")]
 mod service;
+#[cfg(feature = "service")]
 pub use service::*;
 
 #[derive(Debug, Parser)]
@@ -42,10 +44,13 @@ pub enum Command {
     /// Launch Codex Desktop through a selected slot.
     Desktop(DesktopArgs),
     /// Run external channel adapters.
+    #[cfg(feature = "service")]
     Channel(ChannelArgs),
     /// Start and manage a local Codex app-server.
+    #[cfg(feature = "service")]
     Serve(ServeArgs),
     /// Start and manage a background cx service supervisor.
+    #[cfg(feature = "service")]
     Service(ServiceArgs),
     #[command(name = "managed", hide = true)]
     Managed(RemovedManagedArgs),
@@ -273,6 +278,7 @@ mod tests {
         assert!(!args.typescript);
     }
 
+    #[cfg(feature = "service")]
     #[test]
     fn serve_stop_accepts_force_and_json() {
         let cli = Cli::parse_from([
@@ -296,6 +302,7 @@ mod tests {
         assert!(args.json);
     }
 
+    #[cfg(feature = "service")]
     #[test]
     fn serve_threads_accepts_limit_and_listen_url() {
         let cli = Cli::parse_from([
@@ -318,6 +325,7 @@ mod tests {
         assert_eq!(args.limit, 5);
     }
 
+    #[cfg(feature = "service")]
     #[test]
     fn telegram_run_accepts_allow_chat_and_token_env() {
         let cli = Cli::parse_from([
@@ -349,6 +357,7 @@ mod tests {
         assert!(args.log_updates);
     }
 
+    #[cfg(feature = "service")]
     #[test]
     fn telegram_run_accepts_negative_allow_chat_with_equals() {
         let cli = Cli::parse_from([
@@ -369,6 +378,7 @@ mod tests {
         assert_eq!(args.allow_chats, vec![-1003586916929]);
     }
 
+    #[cfg(feature = "service")]
     #[test]
     fn telegram_bind_accepts_token_env_and_timeouts() {
         let cli = Cli::parse_from([
@@ -398,6 +408,7 @@ mod tests {
         assert!(args.log_updates);
     }
 
+    #[cfg(feature = "service")]
     #[test]
     fn telegram_menu_accepts_token_env_and_timeout() {
         let cli = Cli::parse_from([
@@ -422,6 +433,7 @@ mod tests {
         assert_eq!(args.request_timeout, 10.0);
     }
 
+    #[cfg(feature = "service")]
     #[test]
     fn service_start_defaults_to_telegram() {
         let cli = Cli::parse_from([
@@ -447,6 +459,7 @@ mod tests {
         assert!(args.spec.acquire_lease);
     }
 
+    #[cfg(feature = "service")]
     #[test]
     fn service_start_accepts_negative_allow_chat_with_equals() {
         let cli = Cli::parse_from(["cx", "service", "start", "--allow-chat=-1003586916929"]);
@@ -460,6 +473,7 @@ mod tests {
         assert_eq!(args.spec.allow_chats, vec![-1003586916929]);
     }
 
+    #[cfg(feature = "service")]
     #[test]
     fn service_stop_accepts_force_and_json() {
         let cli = Cli::parse_from([
@@ -483,6 +497,7 @@ mod tests {
         assert!(args.json);
     }
 
+    #[cfg(feature = "service")]
     #[test]
     fn service_token_set_reads_named_token_from_stdin() {
         let cli = Cli::parse_from(["cx", "service", "token", "set", "telegram"]);
@@ -499,6 +514,7 @@ mod tests {
         assert_eq!(args.token, ServiceTokenName::Telegram);
     }
 
+    #[cfg(feature = "service")]
     #[test]
     fn serve_ping_accepts_timeout_and_json() {
         let cli = Cli::parse_from(["cx", "serve", "ping", "--timeout", "0.5", "--json"]);
@@ -541,6 +557,7 @@ mod tests {
         assert_eq!(args.args, vec![String::from("--enable-logging")]);
     }
 
+    #[cfg(feature = "service")]
     #[test]
     fn serve_session_create_accepts_id_channel_and_json() {
         let cli = Cli::parse_from([
@@ -569,6 +586,7 @@ mod tests {
         assert!(args.json);
     }
 
+    #[cfg(feature = "service")]
     #[test]
     fn serve_lease_acquire_accepts_session_channel_and_json() {
         let cli = Cli::parse_from([
@@ -599,6 +617,7 @@ mod tests {
         assert!(args.json);
     }
 
+    #[cfg(feature = "service")]
     #[test]
     fn serve_event_list_accepts_session_filter_and_json() {
         let cli = Cli::parse_from([
@@ -722,12 +741,14 @@ pub struct RemovedManagedArgs {
     pub args: Vec<String>,
 }
 
+#[cfg(feature = "service")]
 #[derive(Debug, Clone, Args)]
 pub struct ServeArgs {
     #[command(subcommand)]
     pub command: ServeCommand,
 }
 
+#[cfg(feature = "service")]
 #[derive(Debug, Clone, Subcommand)]
 pub enum ServeCommand {
     /// Start the foreground cx control daemon on a private local socket.
@@ -754,6 +775,7 @@ pub enum ServeCommand {
     Threads(ServeThreadsArgs),
 }
 
+#[cfg(feature = "service")]
 #[derive(Debug, Clone, Args)]
 pub struct ServeDaemonArgs {
     /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
@@ -765,6 +787,7 @@ pub struct ServeDaemonArgs {
     pub json: bool,
 }
 
+#[cfg(feature = "service")]
 #[derive(Debug, Clone, Args)]
 pub struct ServePingArgs {
     /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
@@ -780,6 +803,7 @@ pub struct ServePingArgs {
     pub json: bool,
 }
 
+#[cfg(feature = "service")]
 #[derive(Debug, Clone, Args)]
 pub struct ServeShutdownArgs {
     /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
@@ -795,12 +819,14 @@ pub struct ServeShutdownArgs {
     pub json: bool,
 }
 
+#[cfg(feature = "service")]
 #[derive(Debug, Clone, Args)]
 pub struct ServeSessionArgs {
     #[command(subcommand)]
     pub command: ServeSessionCommand,
 }
 
+#[cfg(feature = "service")]
 #[derive(Debug, Clone, Subcommand)]
 pub enum ServeSessionCommand {
     /// Create a cx session and append a session-created event.
@@ -811,6 +837,7 @@ pub enum ServeSessionCommand {
     Show(ServeSessionShowArgs),
 }
 
+#[cfg(feature = "service")]
 #[derive(Debug, Clone, Args)]
 pub struct ServeSessionCreateArgs {
     /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
@@ -834,6 +861,7 @@ pub struct ServeSessionCreateArgs {
     pub json: bool,
 }
 
+#[cfg(feature = "service")]
 #[derive(Debug, Clone, Args)]
 pub struct ServeSessionListArgs {
     /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
@@ -849,6 +877,7 @@ pub struct ServeSessionListArgs {
     pub json: bool,
 }
 
+#[cfg(feature = "service")]
 #[derive(Debug, Clone, Args)]
 pub struct ServeSessionShowArgs {
     /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
@@ -867,12 +896,14 @@ pub struct ServeSessionShowArgs {
     pub session_id: String,
 }
 
+#[cfg(feature = "service")]
 #[derive(Debug, Clone, Args)]
 pub struct ServeLeaseArgs {
     #[command(subcommand)]
     pub command: ServeLeaseCommand,
 }
 
+#[cfg(feature = "service")]
 #[derive(Debug, Clone, Subcommand)]
 pub enum ServeLeaseCommand {
     /// Acquire control of a cx session for a channel.
@@ -881,6 +912,7 @@ pub enum ServeLeaseCommand {
     Release(ServeLeaseReleaseArgs),
 }
 
+#[cfg(feature = "service")]
 #[derive(Debug, Clone, Args)]
 pub struct ServeLeaseAcquireArgs {
     /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
@@ -908,6 +940,7 @@ pub struct ServeLeaseAcquireArgs {
     pub json: bool,
 }
 
+#[cfg(feature = "service")]
 #[derive(Debug, Clone, Args)]
 pub struct ServeLeaseReleaseArgs {
     /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
@@ -931,18 +964,21 @@ pub struct ServeLeaseReleaseArgs {
     pub json: bool,
 }
 
+#[cfg(feature = "service")]
 #[derive(Debug, Clone, Args)]
 pub struct ServeEventArgs {
     #[command(subcommand)]
     pub command: ServeEventCommand,
 }
 
+#[cfg(feature = "service")]
 #[derive(Debug, Clone, Subcommand)]
 pub enum ServeEventCommand {
     /// List append-only cx control-plane events.
     List(ServeEventListArgs),
 }
 
+#[cfg(feature = "service")]
 #[derive(Debug, Clone, Args)]
 pub struct ServeEventListArgs {
     /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
@@ -962,6 +998,7 @@ pub struct ServeEventListArgs {
     pub json: bool,
 }
 
+#[cfg(feature = "service")]
 #[derive(Debug, Clone, Args)]
 pub struct ServeStartArgs {
     /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
@@ -993,6 +1030,7 @@ pub struct ServeStartArgs {
     pub args: Vec<String>,
 }
 
+#[cfg(feature = "service")]
 #[derive(Debug, Clone, Args)]
 pub struct ServeStopArgs {
     /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
@@ -1012,6 +1050,7 @@ pub struct ServeStopArgs {
     pub json: bool,
 }
 
+#[cfg(feature = "service")]
 #[derive(Debug, Clone, Args)]
 pub struct ServeStatusArgs {
     /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
@@ -1023,6 +1062,7 @@ pub struct ServeStatusArgs {
     pub json: bool,
 }
 
+#[cfg(feature = "service")]
 #[derive(Debug, Clone, Args)]
 pub struct ServeProbeArgs {
     /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
@@ -1042,6 +1082,7 @@ pub struct ServeProbeArgs {
     pub json: bool,
 }
 
+#[cfg(feature = "service")]
 #[derive(Debug, Clone, Args)]
 pub struct ServeThreadsArgs {
     /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
@@ -1065,24 +1106,28 @@ pub struct ServeThreadsArgs {
     pub json: bool,
 }
 
+#[cfg(feature = "service")]
 #[derive(Debug, Clone, Args)]
 pub struct ChannelArgs {
     #[command(subcommand)]
     pub command: ChannelCommand,
 }
 
+#[cfg(feature = "service")]
 #[derive(Debug, Clone, Subcommand)]
 pub enum ChannelCommand {
     /// Run the Telegram channel adapter.
     Telegram(TelegramArgs),
 }
 
+#[cfg(feature = "service")]
 #[derive(Debug, Clone, Args)]
 pub struct TelegramArgs {
     #[command(subcommand)]
     pub command: TelegramCommand,
 }
 
+#[cfg(feature = "service")]
 #[derive(Debug, Clone, Subcommand)]
 pub enum TelegramCommand {
     /// Poll Telegram and bridge allowed chats into cx sessions.
@@ -1095,6 +1140,7 @@ pub enum TelegramCommand {
     Status(TelegramStatusArgs),
 }
 
+#[cfg(feature = "service")]
 #[derive(Debug, Clone, Args)]
 pub struct TelegramRunArgs {
     /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
@@ -1134,6 +1180,7 @@ pub struct TelegramRunArgs {
     pub log_updates: bool,
 }
 
+#[cfg(feature = "service")]
 #[derive(Debug, Clone, Args)]
 pub struct TelegramBindArgs {
     /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
@@ -1157,6 +1204,7 @@ pub struct TelegramBindArgs {
     pub log_updates: bool,
 }
 
+#[cfg(feature = "service")]
 #[derive(Debug, Clone, Args)]
 pub struct TelegramMenuArgs {
     /// Environment variable containing the Telegram bot token.
@@ -1168,6 +1216,7 @@ pub struct TelegramMenuArgs {
     pub request_timeout: f32,
 }
 
+#[cfg(feature = "service")]
 #[derive(Debug, Clone, Args)]
 pub struct TelegramStatusArgs {
     /// Profile-manager directory. Defaults to ~/.codex/profile-manager.

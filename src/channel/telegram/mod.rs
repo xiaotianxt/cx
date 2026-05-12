@@ -36,6 +36,7 @@ use crate::cli::TelegramMenuArgs;
 use crate::cli::TelegramRunArgs;
 use crate::cli::TelegramStatusArgs;
 use crate::paths::ManagerPaths;
+use crate::resume_id::ExplicitResumeId;
 use crate::serve;
 use crate::session;
 use crate::session::AcquireLeaseRequest;
@@ -524,7 +525,7 @@ fn drain_watched_app_server_binding(
         ThreadResolverScope {
             cwd: resolver_cwd,
             channel_id: Some(binding.channel_id.clone()),
-            explicit_resume_id: Some(thread_resolver::ExplicitResumeId::AppThreadOrCodexSession(
+            explicit_resume_id: Some(ExplicitResumeId::AppThreadOrCodexSession(
                 thread_id.to_string(),
             )),
             slot: server.app_slot(),
@@ -2367,7 +2368,7 @@ fn run_codex_turn(
         .app_thread_id
         .clone()
         .or_else(|| session_app_thread.map(|app_thread| app_thread.thread_id))
-        .map(thread_resolver::ExplicitResumeId::AppThreadOrCodexSession);
+        .map(ExplicitResumeId::AppThreadOrCodexSession);
     let resolve_start = Instant::now();
     let outcome = thread_resolver::resolve_app_thread(
         paths,

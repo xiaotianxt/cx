@@ -821,6 +821,7 @@ mod tests {
         let _ = fs::remove_dir_all(&paths.manager_dir);
     }
 
+    #[cfg(feature = "service")]
     #[test]
     fn launcher_options_include_experimental_service_remote() {
         let paths = temp_paths("service-remote-option");
@@ -834,6 +835,18 @@ mod tests {
                 description: "Use experimental cx service remote".to_string(),
             }]
         );
+
+        let _ = fs::remove_dir_all(&paths.manager_dir);
+    }
+
+    #[cfg(not(feature = "service"))]
+    #[test]
+    fn launcher_options_omit_service_remote_without_feature() {
+        let paths = temp_paths("no-service-remote-option");
+
+        let candidates = complete(&["cx"], "--cx-s", &paths);
+
+        assert!(candidates.is_empty());
 
         let _ = fs::remove_dir_all(&paths.manager_dir);
     }

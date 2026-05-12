@@ -11,6 +11,7 @@ use crate::app_server::StartedThread;
 use crate::app_server::ThreadListFilter;
 use crate::app_server::ThreadListPage;
 use crate::paths::ManagerPaths;
+use crate::resume_id::ExplicitResumeId;
 use crate::session;
 use crate::session::AppThreadBinding;
 use crate::session::BindAppThreadRequest;
@@ -27,29 +28,6 @@ pub(crate) struct ThreadResolverScope {
     pub(crate) explicit_resume_id: Option<ExplicitResumeId>,
     pub(crate) slot: Option<String>,
     pub(crate) generation: u64,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ExplicitResumeId {
-    CxSession(SessionId),
-    AppThreadOrCodexSession(String),
-}
-
-impl ExplicitResumeId {
-    pub(crate) fn parse(raw: impl Into<String>) -> Self {
-        let raw = raw.into();
-        match SessionId::parse(raw.clone()) {
-            Ok(session_id) => Self::CxSession(session_id),
-            Err(_) => Self::AppThreadOrCodexSession(raw),
-        }
-    }
-
-    pub(crate) fn as_str(&self) -> &str {
-        match self {
-            Self::CxSession(session_id) => session_id.as_str(),
-            Self::AppThreadOrCodexSession(id) => id,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

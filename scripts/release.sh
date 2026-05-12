@@ -10,7 +10,7 @@ RUN_TESTS=1
 UPDATE_TAP=1
 BREW_VERIFY=1
 WATCH_RELEASE=1
-RESTART_LOCAL_SERVICE=1
+RESTART_LOCAL_SERVICE=0
 BUMP_KIND="patch"
 VERSION_OVERRIDE=""
 
@@ -35,6 +35,8 @@ Options:
   --skip-tests         Do not run cargo test before tagging.
   --skip-tap           Do not update the Homebrew tap formula.
   --skip-brew-verify   Do not run brew update/upgrade/test after tap update.
+  --service-restart    Stop/reinstall/start the local cx service after
+                       Homebrew verification. Default: disabled.
   --skip-service-restart
                        Do not stop/reinstall/start the local cx service during
                        Homebrew verification.
@@ -268,6 +270,9 @@ while [[ $# -gt 0 ]]; do
     --skip-brew-verify)
       BREW_VERIFY=0
       ;;
+    --service-restart)
+      RESTART_LOCAL_SERVICE=1
+      ;;
     --skip-service-restart)
       RESTART_LOCAL_SERVICE=0
       ;;
@@ -352,6 +357,8 @@ fi
 if [[ "$RUN_TESTS" -eq 1 ]]; then
   log "running cargo test"
   cargo test
+  log "running cargo test --features service"
+  cargo test --features service
 fi
 
 if ! git diff --quiet -- Cargo.toml Cargo.lock; then

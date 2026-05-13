@@ -198,7 +198,7 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
     let selected_slot = if let Some(slot) = options.slot.clone() {
         slot
     } else {
-        let results = selector::query_slots(&paths, &candidates, usage_timeout())?;
+        let results = selector::query_slots(&paths, &candidates, usage_query_options())?;
         let selected = selector::choose_result(&results);
         if options.debug || std::env::var_os("CX_SLOT_DEBUG").is_some() {
             crate::output::print_report(
@@ -273,7 +273,7 @@ pub(crate) fn select_runtime(
         anyhow::bail!("no configured slots");
     }
 
-    let results = selector::query_slots(paths, &candidates, usage_timeout())?;
+    let results = selector::query_slots(paths, &candidates, usage_query_options())?;
     let selected = selector::choose_result(&results);
     if debug || std::env::var_os("CX_SLOT_DEBUG").is_some() {
         crate::output::print_report(&results, selected.map(|result| result.slot.as_str()), false)?;
@@ -558,6 +558,18 @@ pub(crate) fn usage_timeout() -> f32 {
         .ok()
         .and_then(|value| value.parse::<f32>().ok())
         .unwrap_or(2.0)
+}
+
+fn usage_query_options() -> selector::SlotQueryOptions {
+    let jobs = std::env::var("CX_SLOT_USAGE_JOBS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(selector::DEFAULT_SLOT_QUERY_JOBS);
+    let retries = std::env::var("CX_SLOT_USAGE_RETRIES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(selector::DEFAULT_SLOT_QUERY_RETRIES);
+    selector::SlotQueryOptions::new(usage_timeout(), jobs, retries)
 }
 
 fn parse_run_args(args: Vec<OsString>) -> Result<RunOptions> {

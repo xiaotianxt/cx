@@ -6,20 +6,38 @@ use crate::usage::SlotResult;
 #[derive(Debug, Serialize)]
 struct Report<'a> {
     selected: Option<&'a str>,
+    complete: bool,
+    #[serde(rename = "transientFailures")]
+    transient_failures: usize,
     results: &'a [SlotResult],
 }
 
 pub fn print_report(results: &[SlotResult], selected: Option<&str>, json: bool) -> Result<()> {
+    let transient_failures = transient_failure_count(results);
+    let complete = transient_failures == 0;
     if json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&Report { selected, results })?
+            serde_json::to_string_pretty(&Report {
+                selected,
+                complete,
+                transient_failures,
+                results
+            })?
         );
         return Ok(());
     }
 
     if let Some(selected) = selected {
-        println!("selected: {selected}");
+        let unverified = results
+            .iter()
+            .find(|result| result.slot == selected)
+            .is_some_and(|result| result.is_transient());
+        if unverified {
+            println!("selected: {selected} (unverified)");
+        } else {
+            println!("selected: {selected}");
+        }
         println!();
     }
 
@@ -52,6 +70,12 @@ pub fn print_report(results: &[SlotResult], selected: Option<&str>, json: bool) 
         }
         println!();
     }
+    if transient_failures > 0 {
+        println!(
+            "warning: {transient_failures}/{} slots could not be refreshed; no cached status was used",
+            results.len()
+        );
+    }
     Ok(())
 }
 
@@ -65,4 +89,11 @@ pub fn print_no_available(results: &[SlotResult]) {
             result.summary
         );
     }
+}
+
+fn transient_failure_count(results: &[SlotResult]) -> usize {
+    results
+        .iter()
+        .filter(|result| result.is_transient())
+        .count()
 }

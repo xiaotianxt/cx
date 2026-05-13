@@ -33,8 +33,10 @@ const MAX_DAILY_CHART_WIDTH: usize = 60;
 const MAX_SELECTED_DAYS: usize = 3_660;
 const MODEL_MIX_LIMIT: usize = 6;
 
+pub mod progress;
 mod status;
 
+pub use progress::SlotStatusProgress;
 pub use status::print_no_available;
 pub use status::print_report;
 

@@ -77,6 +77,17 @@ masked account label, using a masked email plus a short account-id suffix when
 available, so accounts can be distinguished without printing full email
 addresses.
 
+Usage checks are live, not cached. To avoid burst failures with many accounts,
+`cx status`, `cx select`, and automatic slot selection query at most 4 slots at
+once and retry transient refresh failures once by default. Use `--jobs`,
+`--retries`, and `--timeout` on status/select/doctor online checks when the
+local network needs different limits. Automatic launcher selection also honors
+`CX_SLOT_USAGE_JOBS`, `CX_SLOT_USAGE_RETRIES`, and `CX_SLOT_USAGE_TIMEOUT`.
+Human `cx status` also shows a temporary progress line on stderr when both
+stdout and stderr are interactive terminals. The line is cleared before the
+final report and is disabled for `--json`, pipes, redirects, `--no-progress`,
+or `CX_NO_PROGRESS`.
+
 ## Install
 
 ### Homebrew

@@ -52,7 +52,16 @@ fn entry() -> Result<()> {
             let paths = paths::ManagerPaths::new(args.query.manager_dir.clone())?;
             upgrade::run_startup(&paths)?;
             let slots = args.slots_or_rotation(&paths)?;
-            let mut results = selector::query_slots(&paths, &slots, args.query.timeout)?;
+            let options = selector::SlotQueryOptions::new(
+                args.query.timeout,
+                args.query.jobs,
+                args.query.retries,
+            );
+            let mut progress =
+                output::SlotStatusProgress::for_status_command(args.query.json, args.no_progress);
+            let mut results =
+                selector::query_slots_with_progress(&paths, &slots, options, &mut progress)?;
+            progress.finish_and_clear();
             match args.sort {
                 StatusSort::Score => usage::sort_by_score_desc(&mut results),
                 StatusSort::Rotation => {}
@@ -79,7 +88,8 @@ fn entry() -> Result<()> {
             let paths = paths::ManagerPaths::new(args.manager_dir.clone())?;
             upgrade::run_startup(&paths)?;
             let slots = args.slots_or_rotation(&paths)?;
-            let results = selector::query_slots(&paths, &slots, args.timeout)?;
+            let options = selector::SlotQueryOptions::new(args.timeout, args.jobs, args.retries);
+            let results = selector::query_slots(&paths, &slots, options)?;
             let selected = selector::choose_result(&results);
             if args.json {
                 output::print_report(&results, selected.map(|result| result.slot.as_str()), true)?;
@@ -165,7 +175,9 @@ fn entry() -> Result<()> {
             let slots = slot::load_rotation(&paths)?;
             output::print_doctor(&paths, &slots)?;
             if args.online {
-                let results = selector::query_slots(&paths, &slots, args.timeout)?;
+                let options =
+                    selector::SlotQueryOptions::new(args.timeout, args.jobs, args.retries);
+                let results = selector::query_slots(&paths, &slots, options)?;
                 let selected = selector::choose_result(&results).map(|result| result.slot.clone());
                 output::print_report(&results, selected.as_deref(), false)?;
             }

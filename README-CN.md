@@ -62,6 +62,14 @@ ChatGPT-Account-ID: <account_id>
 reset 时间，summary 会显示下一次 refresh 还要多久。状态行也会展示脱敏账号标识：优先使用
 脱敏 email，并在可用时补一个短 account id 后缀，这样能区分账号，但不会打印完整邮箱地址。
 
+用量检查是实时结果，不做缓存。为了避免账号较多时出现突发请求失败，`cx status`、`cx select`
+和自动 slot 选择默认最多同时查询 4 个 slot，并对临时刷新失败重试 1 次。status/select/doctor
+online 检查可以用 `--jobs`、`--retries` 和 `--timeout` 调整本地网络策略；自动启动选择也支持
+`CX_SLOT_USAGE_JOBS`、`CX_SLOT_USAGE_RETRIES` 和 `CX_SLOT_USAGE_TIMEOUT`。
+human `cx status` 在 stdout 和 stderr 都是交互式终端时，会在 stderr 显示一行临时进度。
+最终报告打印前会清掉这行；`--json`、pipe、redirect、`--no-progress` 或 `CX_NO_PROGRESS`
+都会禁用它。
+
 ## 安装
 
 ### Homebrew

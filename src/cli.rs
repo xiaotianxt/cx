@@ -210,6 +210,14 @@ pub struct SlotQueryArgs {
     #[arg(long, default_value_t = 2.0)]
     pub timeout: f32,
 
+    /// Maximum number of slot usage requests to run at once.
+    #[arg(long, default_value_t = crate::selector::DEFAULT_SLOT_QUERY_JOBS)]
+    pub jobs: usize,
+
+    /// Retry transient usage request failures this many times.
+    #[arg(long, default_value_t = crate::selector::DEFAULT_SLOT_QUERY_RETRIES)]
+    pub retries: usize,
+
     /// Print JSON instead of a human table.
     #[arg(long)]
     pub json: bool,
@@ -235,6 +243,10 @@ impl SlotQueryArgs {
 pub struct StatusArgs {
     #[command(flatten)]
     pub query: SlotQueryArgs,
+
+    /// Disable the interactive progress line.
+    #[arg(long)]
+    pub no_progress: bool,
 
     /// Sort status output.
     #[arg(long, value_enum, default_value = "score")]
@@ -309,6 +321,12 @@ mod tests {
             panic!("expected status command");
         };
         assert_eq!(args.sort, StatusSort::Score);
+        assert!(!args.no_progress);
+        assert_eq!(args.query.jobs, crate::selector::DEFAULT_SLOT_QUERY_JOBS);
+        assert_eq!(
+            args.query.retries,
+            crate::selector::DEFAULT_SLOT_QUERY_RETRIES
+        );
     }
 
     #[test]
@@ -330,6 +348,27 @@ mod tests {
             panic!("expected status command");
         };
         assert_eq!(args.query.target, Some(String::from("work")));
+    }
+
+    #[test]
+    fn status_accepts_network_tuning_options() {
+        let cli = Cli::parse_from(["cx", "status", "--jobs", "2", "--retries", "3"]);
+
+        let Command::Status(args) = cli.command else {
+            panic!("expected status command");
+        };
+        assert_eq!(args.query.jobs, 2);
+        assert_eq!(args.query.retries, 3);
+    }
+
+    #[test]
+    fn status_accepts_no_progress() {
+        let cli = Cli::parse_from(["cx", "status", "--no-progress"]);
+
+        let Command::Status(args) = cli.command else {
+            panic!("expected status command");
+        };
+        assert!(args.no_progress);
     }
 
     #[test]
@@ -606,6 +645,14 @@ pub struct DoctorArgs {
     /// Per-slot usage request timeout in seconds.
     #[arg(long, default_value_t = 2.0)]
     pub timeout: f32,
+
+    /// Maximum number of slot usage requests to run at once.
+    #[arg(long, default_value_t = crate::selector::DEFAULT_SLOT_QUERY_JOBS)]
+    pub jobs: usize,
+
+    /// Retry transient usage request failures this many times.
+    #[arg(long, default_value_t = crate::selector::DEFAULT_SLOT_QUERY_RETRIES)]
+    pub retries: usize,
 }
 
 #[derive(Debug, Clone, Args)]

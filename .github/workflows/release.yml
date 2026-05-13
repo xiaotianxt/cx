@@ -6,14 +6,13 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   build:
     runs-on: macos-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: actions-rust-lang/setup-rust-toolchain@v1
 
       - name: Verify arm64 runner
@@ -38,7 +37,7 @@ jobs:
           cd archive
           tar czf ../cx-${{ github.ref_name }}-darwin-arm64.tar.gz cx
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: cx-${{ github.ref_name }}-darwin-arm64
           path: cx-${{ github.ref_name }}-darwin-arm64.tar.gz
@@ -50,12 +49,12 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: cx-*
           merge-multiple: true
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: cx-*.tar.gz
           generate_release_notes: true

@@ -9,6 +9,9 @@ use anyhow::Result;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::cache;
+use crate::cache::entries;
+use crate::cache::CacheStore;
 use crate::cli::StatsArgs;
 use crate::paths::ManagerPaths;
 
@@ -17,7 +20,6 @@ use super::rollout;
 use super::CalibrationReport;
 use super::TokenMix;
 use super::TokenTotals;
-use super::CALIBRATION_FILE;
 use super::CALIBRATION_SCHEMA_VERSION;
 use super::FALLBACK_TOKEN_MIX;
 use super::STATE_DB;
@@ -103,7 +105,7 @@ pub fn calibrate_mix(paths: &ManagerPaths, args: StatsArgs) -> Result<Calibratio
 }
 
 pub(super) fn load_token_mix(paths: &ManagerPaths) -> (TokenMix, String) {
-    let path = paths.manager_dir.join(CALIBRATION_FILE);
+    let path = CacheStore::new(paths).path(entries::STATS_CALIBRATION);
     let Some(calibration) = read_mix_calibration(&path) else {
         return (FALLBACK_TOKEN_MIX, "built-in fallback".to_string());
     };
@@ -121,23 +123,16 @@ pub(super) fn load_token_mix(paths: &ManagerPaths) -> (TokenMix, String) {
 }
 
 pub(super) fn read_mix_calibration(path: &Path) -> Option<MixCalibration> {
-    let content = fs::read_to_string(path).ok()?;
-    parse_mix_calibration(&content)
+    cache::read_json_path(path, |calibration: &MixCalibration| {
+        calibration.schema_version == CALIBRATION_SCHEMA_VERSION
+    })
 }
 
 fn write_mix_calibration(paths: &ManagerPaths, calibration: &MixCalibration) -> Result<PathBuf> {
-    fs::create_dir_all(&paths.manager_dir)
-        .with_context(|| format!("create {}", paths.manager_dir.display()))?;
-    let path = paths.manager_dir.join(CALIBRATION_FILE);
-    write_mix_calibration_path(&path, calibration)?;
-    Ok(path)
+    CacheStore::new(paths).write_json(entries::STATS_CALIBRATION, calibration)
 }
 
-fn write_mix_calibration_path(path: &Path, calibration: &MixCalibration) -> Result<()> {
-    let content = serde_json::to_string_pretty(calibration)?;
-    fs::write(path, content).with_context(|| format!("write {}", path.display()))
-}
-
+#[cfg(test)]
 pub(super) fn parse_mix_calibration(content: &str) -> Option<MixCalibration> {
     let calibration = serde_json::from_str::<MixCalibration>(content).ok()?;
     (calibration.schema_version == CALIBRATION_SCHEMA_VERSION).then_some(calibration)

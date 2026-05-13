@@ -1,16 +1,23 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashSet;
+use std::fs;
+use std::path::Path;
 use std::path::PathBuf;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 use anyhow::Result;
+use rusqlite::params;
 use rusqlite::Connection;
+use rusqlite::OptionalExtension;
 use serde::Deserialize;
 use serde::Serialize;
 use time::OffsetDateTime;
 
+use crate::cache::entries;
+use crate::cache::CacheStore;
+use crate::cache::SqliteCache;
 use crate::cli::StatsArgs;
 use crate::cli::StatsRange;
 use crate::paths::ManagerPaths;
@@ -26,8 +33,8 @@ use pricing::PriceBook;
 use pricing::StatsPricePolicy;
 
 const STATE_DB: &str = "state_5.sqlite";
-const CALIBRATION_FILE: &str = "stats-calibration.json";
 const CALIBRATION_SCHEMA_VERSION: u64 = 2;
+const ROLLOUT_CACHE_SCHEMA_VERSION: u64 = 2;
 
 pub const STATS_JSON_SCHEMA_VERSION: u64 = 2;
 
@@ -178,7 +185,7 @@ struct ThreadUsage {
     rollout_path: PathBuf,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct TokenTotals {
     samples: u64,
     total_tokens: u64,
@@ -186,6 +193,38 @@ struct TokenTotals {
     cached_input_tokens: u64,
     output_tokens: u64,
     reasoning_output_tokens: u64,
+}
+
+#[derive(Debug)]
+struct RolloutTokenCache {
+    sqlite: SqliteCache,
+}
+
+#[derive(Debug, Clone)]
+struct CachedRolloutUsage {
+    daily: Vec<CachedRolloutDailyUsage>,
+    period_totals: Vec<TokenTotals>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedRolloutDailyUsage {
+    date: String,
+    totals: TokenTotals,
+}
+
+#[derive(Debug, Clone)]
+struct CachedRolloutFile {
+    fingerprint: RolloutFingerprint,
+    final_totals: TokenTotals,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct RolloutFingerprint {
+    len: u64,
+    #[serde(rename = "modifiedSecs")]
+    modified_secs: u64,
+    #[serde(rename = "modifiedNanos")]
+    modified_nanos: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -234,6 +273,7 @@ struct DailyTokenAccumulator {
 
 pub fn collect_report(paths: &ManagerPaths, args: StatsArgs) -> Result<StatsReport> {
     let price_policy = StatsPricePolicy::from_args(&args);
+    let collect_period_windows = args.json || args.by_slot;
     let slot_filters = args.slots.iter().cloned().collect::<BTreeSet<_>>();
     let db_paths = db::state_db_paths(paths, &slot_filters)?;
     if db_paths.is_empty() {
@@ -257,11 +297,16 @@ pub fn collect_report(paths: &ManagerPaths, args: StatsArgs) -> Result<StatsRepo
             (Some(price_book), Some(mix), Some(source))
         }
     };
-    let mut accumulators = periods
-        .into_iter()
-        .map(PeriodAccumulator::new)
-        .collect::<Vec<_>>();
+    let mut accumulators = if collect_period_windows {
+        periods
+            .into_iter()
+            .map(PeriodAccumulator::new)
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let mut daily = DailyReportAccumulator::new(min_since);
+    let mut rollout_cache = RolloutTokenCache::load(paths);
     let mut seen_threads = HashSet::new();
 
     for db_path in &db_paths {
@@ -272,7 +317,13 @@ pub fn collect_report(paths: &ManagerPaths, args: StatsArgs) -> Result<StatsRepo
             if !seen_threads.insert(usage.id.clone()) {
                 continue;
             }
-            add_thread_usage(&mut accumulators, &mut daily, price_book.as_ref(), &usage);
+            add_thread_usage(
+                &mut accumulators,
+                &mut daily,
+                price_book.as_ref(),
+                &mut rollout_cache,
+                &usage,
+            );
         }
     }
 
@@ -371,19 +422,20 @@ fn add_thread_usage(
     accumulators: &mut [PeriodAccumulator],
     daily: &mut DailyReportAccumulator,
     price_book: Option<&PriceBook>,
+    rollout_cache: &mut RolloutTokenCache,
     usage: &ThreadUsage,
 ) {
     if usage.rollout_path.exists() {
-        if let Ok(events) = rollout::read_token_usage_events(&usage.rollout_path) {
-            if !events.is_empty() {
-                daily.add_events(usage, price_book, &events);
-                for accumulator in accumulators.iter_mut() {
-                    let mut totals = TokenTotals::default();
-                    for event in &events {
-                        if event.timestamp_unix >= accumulator.period.since_unix {
-                            totals.add(event.totals.clone());
-                        }
-                    }
+        let period_sinces = accumulators
+            .iter()
+            .map(|accumulator| accumulator.period.since_unix)
+            .collect::<Vec<_>>();
+        if let Ok(summary) =
+            rollout_cache.token_usage_summary(&usage.rollout_path, daily.min_since, &period_sinces)
+        {
+            if summary.has_usage() {
+                daily.add_rollout_daily_usage(usage, price_book, &summary.daily);
+                for (accumulator, totals) in accumulators.iter_mut().zip(summary.period_totals) {
                     if totals.total_tokens > 0 {
                         let cost = price_book.and_then(|book| {
                             book.estimate_token_totals_cost(&usage.provider, &usage.model, &totals)
@@ -467,6 +519,447 @@ impl TokenTotals {
     }
 }
 
+impl CachedRolloutUsage {
+    fn from_events(
+        events: &[rollout::TokenUsageEvent],
+        daily_min_since: i64,
+        period_sinces: &[i64],
+    ) -> Self {
+        let mut daily_by_date = BTreeMap::<String, TokenTotals>::new();
+        let mut period_totals = vec![TokenTotals::default(); period_sinces.len()];
+        for event in events {
+            if event.timestamp_unix >= daily_min_since {
+                if let Some(date) = utc_date_key(event.timestamp_unix) {
+                    daily_by_date
+                        .entry(date)
+                        .or_default()
+                        .add(event.totals.clone());
+                }
+            }
+            for (index, since) in period_sinces.iter().enumerate() {
+                if event.timestamp_unix >= *since {
+                    period_totals[index].add(event.totals.clone());
+                }
+            }
+        }
+
+        let daily = daily_by_date
+            .into_iter()
+            .map(|(date, totals)| CachedRolloutDailyUsage { date, totals })
+            .collect();
+        Self {
+            daily,
+            period_totals,
+        }
+    }
+
+    fn has_usage(&self) -> bool {
+        self.daily.iter().any(|day| day.totals.total_tokens > 0)
+            || self
+                .period_totals
+                .iter()
+                .any(|totals| totals.total_tokens > 0)
+    }
+}
+
+impl RolloutTokenCache {
+    fn load(paths: &ManagerPaths) -> Self {
+        Self {
+            sqlite: CacheStore::new(paths).open_sqlite(
+                entries::STATS_ROLLOUT_SQLITE,
+                ROLLOUT_CACHE_SCHEMA_VERSION,
+                initialize_rollout_cache,
+            ),
+        }
+    }
+
+    fn token_usage_summary(
+        &mut self,
+        path: &Path,
+        daily_min_since: i64,
+        period_sinces: &[i64],
+    ) -> Result<CachedRolloutUsage> {
+        let fingerprint = RolloutFingerprint::from_path(path)?;
+        let writable = self.sqlite.is_writable();
+        let Some(conn) = self.sqlite.conn_mut() else {
+            let events = rollout::read_token_usage_events(path)?;
+            return Ok(CachedRolloutUsage::from_events(
+                &events,
+                daily_min_since,
+                period_sinces,
+            ));
+        };
+
+        let key = rollout_cache_key(path);
+        if writable {
+            ensure_rollout_cache_fresh(conn, &key, path, fingerprint)?;
+        } else if !cached_rollout_file(conn, &key)?
+            .is_some_and(|cached| cached.fingerprint == fingerprint)
+        {
+            let events = rollout::read_token_usage_events(path)?;
+            return Ok(CachedRolloutUsage::from_events(
+                &events,
+                daily_min_since,
+                period_sinces,
+            ));
+        }
+        let daily = cached_rollout_daily_usage(conn, &key, daily_min_since)?;
+        let period_totals = cached_rollout_period_totals(conn, &key, period_sinces)?;
+        Ok(CachedRolloutUsage {
+            daily,
+            period_totals,
+        })
+    }
+}
+
+fn initialize_rollout_cache(conn: &Connection) -> Result<()> {
+    conn.execute_batch("PRAGMA synchronous = NORMAL;")?;
+    let version: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    let schema_version = i64::try_from(ROLLOUT_CACHE_SCHEMA_VERSION).unwrap_or(i64::MAX);
+    if version != schema_version {
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS rollout_files;
+             DROP TABLE IF EXISTS rollout_events;
+             DROP TABLE IF EXISTS rollout_daily;",
+        )?;
+    }
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS rollout_files (
+            path TEXT PRIMARY KEY,
+            len INTEGER NOT NULL,
+            modified_secs INTEGER NOT NULL,
+            modified_nanos INTEGER NOT NULL,
+            final_total_tokens INTEGER NOT NULL,
+            final_uncached_input_tokens INTEGER NOT NULL,
+            final_cached_input_tokens INTEGER NOT NULL,
+            final_output_tokens INTEGER NOT NULL,
+            final_reasoning_output_tokens INTEGER NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS rollout_events (
+            path TEXT NOT NULL,
+            timestamp_unix INTEGER NOT NULL,
+            samples INTEGER NOT NULL,
+            total_tokens INTEGER NOT NULL,
+            uncached_input_tokens INTEGER NOT NULL,
+            cached_input_tokens INTEGER NOT NULL,
+            output_tokens INTEGER NOT NULL,
+            reasoning_output_tokens INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS rollout_events_path_timestamp
+            ON rollout_events(path, timestamp_unix);
+         CREATE TABLE IF NOT EXISTS rollout_daily (
+            path TEXT NOT NULL,
+            date TEXT NOT NULL,
+            samples INTEGER NOT NULL,
+            total_tokens INTEGER NOT NULL,
+            uncached_input_tokens INTEGER NOT NULL,
+            cached_input_tokens INTEGER NOT NULL,
+            output_tokens INTEGER NOT NULL,
+            reasoning_output_tokens INTEGER NOT NULL,
+            PRIMARY KEY (path, date)
+         );",
+    )?;
+    conn.pragma_update(None, "user_version", schema_version)?;
+    Ok(())
+}
+
+fn ensure_rollout_cache_fresh(
+    conn: &mut Connection,
+    key: &str,
+    path: &Path,
+    fingerprint: RolloutFingerprint,
+) -> Result<()> {
+    let cached = cached_rollout_file(conn, key)?;
+    if cached
+        .as_ref()
+        .is_some_and(|cached| cached.fingerprint == fingerprint)
+    {
+        return Ok(());
+    }
+
+    if let Some(cached) = cached {
+        if fingerprint.len > cached.fingerprint.len {
+            let scan = rollout::read_token_usage_scan_from(
+                path,
+                cached.fingerprint.len,
+                Some(cached.final_totals.clone()),
+            )?;
+            append_rollout_cache(conn, key, fingerprint, cached.final_totals, &scan)?;
+            return Ok(());
+        }
+    }
+
+    let scan = rollout::read_token_usage_scan_from(path, 0, None)?;
+    replace_rollout_cache(conn, key, fingerprint, &scan)
+}
+
+fn cached_rollout_file(conn: &Connection, key: &str) -> Result<Option<CachedRolloutFile>> {
+    conn.query_row(
+        "SELECT len, modified_secs, modified_nanos,
+                final_total_tokens, final_uncached_input_tokens,
+                final_cached_input_tokens, final_output_tokens,
+                final_reasoning_output_tokens
+         FROM rollout_files
+         WHERE path = ?1",
+        params![key],
+        |row| {
+            Ok(CachedRolloutFile {
+                fingerprint: RolloutFingerprint {
+                    len: row_i64_to_u64(row, 0)?,
+                    modified_secs: row_i64_to_u64(row, 1)?,
+                    modified_nanos: row_i64_to_u32(row, 2)?,
+                },
+                final_totals: TokenTotals {
+                    samples: 1,
+                    total_tokens: row_i64_to_u64(row, 3)?,
+                    uncached_input_tokens: row_i64_to_u64(row, 4)?,
+                    cached_input_tokens: row_i64_to_u64(row, 5)?,
+                    output_tokens: row_i64_to_u64(row, 6)?,
+                    reasoning_output_tokens: row_i64_to_u64(row, 7)?,
+                },
+            })
+        },
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn replace_rollout_cache(
+    conn: &mut Connection,
+    key: &str,
+    fingerprint: RolloutFingerprint,
+    scan: &rollout::TokenUsageScan,
+) -> Result<()> {
+    let final_totals = scan.final_totals.clone().unwrap_or_default();
+    let tx = conn.transaction()?;
+    tx.execute("DELETE FROM rollout_events WHERE path = ?1", params![key])?;
+    tx.execute("DELETE FROM rollout_daily WHERE path = ?1", params![key])?;
+    write_rollout_file(&tx, key, fingerprint, &final_totals)?;
+    insert_rollout_events(&tx, key, &scan.events)?;
+    upsert_rollout_daily(&tx, key, aggregate_events_by_day(&scan.events))?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn append_rollout_cache(
+    conn: &mut Connection,
+    key: &str,
+    fingerprint: RolloutFingerprint,
+    previous_final_totals: TokenTotals,
+    scan: &rollout::TokenUsageScan,
+) -> Result<()> {
+    let final_totals = scan.final_totals.clone().unwrap_or(previous_final_totals);
+    let tx = conn.transaction()?;
+    write_rollout_file(&tx, key, fingerprint, &final_totals)?;
+    insert_rollout_events(&tx, key, &scan.events)?;
+    upsert_rollout_daily(&tx, key, aggregate_events_by_day(&scan.events))?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn write_rollout_file(
+    tx: &rusqlite::Transaction<'_>,
+    key: &str,
+    fingerprint: RolloutFingerprint,
+    final_totals: &TokenTotals,
+) -> Result<()> {
+    tx.execute(
+        "INSERT OR REPLACE INTO rollout_files
+            (path, len, modified_secs, modified_nanos, final_total_tokens,
+             final_uncached_input_tokens, final_cached_input_tokens,
+             final_output_tokens, final_reasoning_output_tokens)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            key,
+            u64_to_i64(fingerprint.len),
+            u64_to_i64(fingerprint.modified_secs),
+            u64_to_i64(u64::from(fingerprint.modified_nanos)),
+            u64_to_i64(final_totals.total_tokens),
+            u64_to_i64(final_totals.uncached_input_tokens),
+            u64_to_i64(final_totals.cached_input_tokens),
+            u64_to_i64(final_totals.output_tokens),
+            u64_to_i64(final_totals.reasoning_output_tokens),
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_rollout_events(
+    tx: &rusqlite::Transaction<'_>,
+    key: &str,
+    events: &[rollout::TokenUsageEvent],
+) -> Result<()> {
+    for event in events {
+        tx.execute(
+            "INSERT INTO rollout_events
+                (path, timestamp_unix, samples, total_tokens, uncached_input_tokens,
+                 cached_input_tokens, output_tokens, reasoning_output_tokens)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                key,
+                event.timestamp_unix,
+                u64_to_i64(event.totals.samples),
+                u64_to_i64(event.totals.total_tokens),
+                u64_to_i64(event.totals.uncached_input_tokens),
+                u64_to_i64(event.totals.cached_input_tokens),
+                u64_to_i64(event.totals.output_tokens),
+                u64_to_i64(event.totals.reasoning_output_tokens),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn aggregate_events_by_day(events: &[rollout::TokenUsageEvent]) -> BTreeMap<String, TokenTotals> {
+    let mut daily = BTreeMap::<String, TokenTotals>::new();
+    for event in events {
+        if let Some(date) = utc_date_key(event.timestamp_unix) {
+            daily.entry(date).or_default().add(event.totals.clone());
+        }
+    }
+    daily
+}
+
+fn upsert_rollout_daily(
+    tx: &rusqlite::Transaction<'_>,
+    key: &str,
+    daily: BTreeMap<String, TokenTotals>,
+) -> Result<()> {
+    for (date, totals) in daily {
+        tx.execute(
+            "INSERT INTO rollout_daily
+                (path, date, samples, total_tokens, uncached_input_tokens,
+                 cached_input_tokens, output_tokens, reasoning_output_tokens)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(path, date) DO UPDATE SET
+                samples = rollout_daily.samples + excluded.samples,
+                total_tokens = rollout_daily.total_tokens + excluded.total_tokens,
+                uncached_input_tokens =
+                    rollout_daily.uncached_input_tokens + excluded.uncached_input_tokens,
+                cached_input_tokens =
+                    rollout_daily.cached_input_tokens + excluded.cached_input_tokens,
+                output_tokens = rollout_daily.output_tokens + excluded.output_tokens,
+                reasoning_output_tokens =
+                    rollout_daily.reasoning_output_tokens + excluded.reasoning_output_tokens",
+            params![
+                key,
+                date,
+                u64_to_i64(totals.samples),
+                u64_to_i64(totals.total_tokens),
+                u64_to_i64(totals.uncached_input_tokens),
+                u64_to_i64(totals.cached_input_tokens),
+                u64_to_i64(totals.output_tokens),
+                u64_to_i64(totals.reasoning_output_tokens),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn cached_rollout_daily_usage(
+    conn: &Connection,
+    key: &str,
+    daily_min_since: i64,
+) -> Result<Vec<CachedRolloutDailyUsage>> {
+    let min_date = utc_date_key(daily_min_since).unwrap_or_else(|| "0000-00-00".to_string());
+    let mut statement = conn.prepare(
+        "SELECT date, samples, total_tokens, uncached_input_tokens,
+                cached_input_tokens, output_tokens, reasoning_output_tokens
+         FROM rollout_daily
+         WHERE path = ?1 AND date >= ?2
+         ORDER BY date",
+    )?;
+    let rows = statement.query_map(params![key, min_date], |row| {
+        Ok(CachedRolloutDailyUsage {
+            date: row.get(0)?,
+            totals: TokenTotals {
+                samples: row_i64_to_u64(row, 1)?,
+                total_tokens: row_i64_to_u64(row, 2)?,
+                uncached_input_tokens: row_i64_to_u64(row, 3)?,
+                cached_input_tokens: row_i64_to_u64(row, 4)?,
+                output_tokens: row_i64_to_u64(row, 5)?,
+                reasoning_output_tokens: row_i64_to_u64(row, 6)?,
+            },
+        })
+    })?;
+
+    let mut daily = Vec::new();
+    for row in rows {
+        daily.push(row?);
+    }
+    Ok(daily)
+}
+
+fn cached_rollout_period_totals(
+    conn: &Connection,
+    key: &str,
+    period_sinces: &[i64],
+) -> Result<Vec<TokenTotals>> {
+    let mut totals = Vec::with_capacity(period_sinces.len());
+    let mut statement = conn.prepare(
+        "SELECT COALESCE(SUM(samples), 0),
+                COALESCE(SUM(total_tokens), 0),
+                COALESCE(SUM(uncached_input_tokens), 0),
+                COALESCE(SUM(cached_input_tokens), 0),
+                COALESCE(SUM(output_tokens), 0),
+                COALESCE(SUM(reasoning_output_tokens), 0)
+         FROM rollout_events
+         WHERE path = ?1 AND timestamp_unix >= ?2",
+    )?;
+    for since in period_sinces {
+        totals.push(statement.query_row(params![key, since], |row| {
+            Ok(TokenTotals {
+                samples: row_i64_to_u64(row, 0)?,
+                total_tokens: row_i64_to_u64(row, 1)?,
+                uncached_input_tokens: row_i64_to_u64(row, 2)?,
+                cached_input_tokens: row_i64_to_u64(row, 3)?,
+                output_tokens: row_i64_to_u64(row, 4)?,
+                reasoning_output_tokens: row_i64_to_u64(row, 5)?,
+            })
+        })?);
+    }
+    Ok(totals)
+}
+
+impl RolloutFingerprint {
+    fn from_path(path: &Path) -> Result<Self> {
+        let metadata = fs::metadata(path)?;
+        let modified = metadata
+            .modified()?
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        Ok(Self {
+            len: metadata.len(),
+            modified_secs: modified.as_secs(),
+            modified_nanos: modified.subsec_nanos(),
+        })
+    }
+}
+
+fn row_i64_to_u64(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u64> {
+    let value = row.get::<_, i64>(index)?;
+    Ok(value.max(0) as u64)
+}
+
+fn row_i64_to_u32(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<u32> {
+    let value = row.get::<_, i64>(index)?.max(0);
+    Ok(u32::try_from(value).unwrap_or(u32::MAX))
+}
+
+fn u64_to_i64(value: u64) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn rollout_cache_key(path: &Path) -> String {
+    if path.is_absolute() {
+        return path.display().to_string();
+    }
+    fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string()
+}
+
 impl DailyReportAccumulator {
     fn new(min_since: i64) -> Self {
         Self {
@@ -475,30 +968,21 @@ impl DailyReportAccumulator {
         }
     }
 
-    fn add_events(
+    fn add_rollout_daily_usage(
         &mut self,
         usage: &ThreadUsage,
         price_book: Option<&PriceBook>,
-        events: &[rollout::TokenUsageEvent],
+        daily: &[CachedRolloutDailyUsage],
     ) {
-        let mut by_day = BTreeMap::<String, TokenTotals>::new();
-        for event in events {
-            if event.timestamp_unix < self.min_since {
-                continue;
-            }
-            if let Some(date) = utc_date_key(event.timestamp_unix) {
-                by_day.entry(date).or_default().add(event.totals.clone());
-            }
-        }
-
-        for (date, totals) in by_day {
+        for day in daily {
+            let totals = &day.totals;
             if totals.total_tokens == 0 {
                 continue;
             }
             let cost = price_book.and_then(|book| {
-                book.estimate_token_totals_cost(&usage.provider, &usage.model, &totals)
+                book.estimate_token_totals_cost(&usage.provider, &usage.model, totals)
             });
-            self.add_totals(&date, usage, &totals, cost);
+            self.add_totals(&day.date, usage, totals, cost);
         }
     }
 
@@ -783,6 +1267,18 @@ mod tests {
         args
     }
 
+    fn temp_paths(name: &str) -> ManagerPaths {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "cx-stats-test-{name}-{}-{unique}",
+            std::process::id()
+        ));
+        ManagerPaths::from_roots(root.join("codex"), root.join("profile-manager"))
+    }
+
     #[test]
     fn stats_price_policy_defaults_to_local_only() {
         let args = parse_stats_args(&[]);
@@ -959,6 +1455,42 @@ mod tests {
         assert_eq!(usage.uncached_input_tokens, 100);
         assert_eq!(usage.cached_input_tokens, 900);
         assert_eq!(usage.output_tokens, 50);
+    }
+
+    #[test]
+    fn rollout_token_cache_reuses_and_invalidates_by_fingerprint() {
+        let paths = temp_paths("rollout-cache");
+        fs::create_dir_all(&paths.manager_dir).expect("create manager dir");
+        let rollout_path = paths.manager_dir.join("rollout.jsonl");
+        let first = r#"{"timestamp":"1970-01-01T00:00:10.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":80,"output_tokens":10,"total_tokens":110}}}}"#;
+        fs::write(&rollout_path, format!("{first}\n")).expect("write rollout");
+
+        let mut cache = RolloutTokenCache::load(&paths);
+        let summary = cache
+            .token_usage_summary(&rollout_path, 0, &[0])
+            .expect("read rollout summary");
+        assert_eq!(summary.daily.len(), 1);
+        assert_eq!(summary.daily[0].totals.total_tokens, 110);
+        assert_eq!(summary.period_totals[0].total_tokens, 110);
+
+        let mut loaded = RolloutTokenCache::load(&paths);
+        let cached = loaded
+            .token_usage_summary(&rollout_path, 0, &[0])
+            .expect("read cached rollout summary");
+        assert_eq!(cached.daily.len(), 1);
+        assert_eq!(cached.period_totals[0].total_tokens, 110);
+
+        let second = r#"{"timestamp":"1970-01-01T00:00:11.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":150,"cached_input_tokens":120,"output_tokens":20,"total_tokens":170}}}}"#;
+        fs::write(&rollout_path, format!("{first}\n{second}\n")).expect("extend rollout");
+        let refreshed = loaded
+            .token_usage_summary(&rollout_path, 0, &[0])
+            .expect("refresh rollout summary");
+        assert_eq!(refreshed.daily.len(), 1);
+        assert_eq!(refreshed.daily[0].totals.total_tokens, 170);
+        assert_eq!(refreshed.period_totals[0].total_tokens, 170);
+
+        let _ = fs::remove_dir_all(&paths.manager_dir);
+        let _ = fs::remove_dir_all(&paths.base_codex_home);
     }
 
     #[test]

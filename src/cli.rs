@@ -279,8 +279,8 @@ pub struct StatsArgs {
     #[arg(long)]
     pub by_slot: bool,
 
-    /// Include best-effort OpenAI API price estimates. Human output enables this by default.
-    #[arg(long)]
+    /// Legacy alias to include best-effort OpenAI API price estimates.
+    #[arg(long, hide = true)]
     pub price: bool,
 
     /// Skip price estimates even if another price flag is supplied.

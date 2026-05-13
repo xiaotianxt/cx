@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
+use std::io::Read;
+use std::io::Write;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 
@@ -28,10 +30,24 @@ use crate::usage::format_refresh_in;
 const BAR_WIDTH: usize = 20;
 const CHART_PREFIX_WIDTH: usize = 9;
 const DAILY_CHART_MODEL_LIMIT: usize = 5;
-const DAILY_LINE_CHART_HEIGHT: usize = 8;
+const DAILY_BAR_CHART_HEIGHT: usize = 8;
 const MAX_DAILY_CHART_WIDTH: usize = 60;
 const MAX_SELECTED_DAYS: usize = 3_660;
 const MODEL_MIX_LIMIT: usize = 6;
+const MODEL_COLORS: [(u8, u8, u8); 12] = [
+    (124, 156, 255),
+    (40, 209, 124),
+    (255, 176, 0),
+    (255, 92, 138),
+    (0, 194, 255),
+    (181, 108, 255),
+    (255, 122, 26),
+    (0, 208, 176),
+    (242, 233, 78),
+    (255, 79, 216),
+    (110, 231, 249),
+    (184, 243, 90),
+];
 
 pub mod progress;
 mod status;
@@ -346,6 +362,15 @@ pub fn print_stats(report: &StatsReport) -> Result<()> {
         return Ok(());
     }
 
+    if should_run_interactive_stats() {
+        return print_stats_interactive(report.clone());
+    }
+
+    print_stats_static(report);
+    Ok(())
+}
+
+fn print_stats_static(report: &StatsReport) {
     print_daily_chart(report);
     print_model_mix(report);
 
@@ -363,9 +388,9 @@ pub fn print_stats(report: &StatsReport) -> Result<()> {
     }
 
     if report
-        .periods
+        .daily
         .iter()
-        .any(|period| period.estimated_cost_usd.is_some() && period.unpriced_tokens > 0)
+        .any(|day| day.estimated_cost_usd.is_some() && day.unpriced_tokens > 0)
     {
         print_wrapped_text(
             "* est. cost excludes tokens for models without known OpenAI pricing.",
@@ -376,7 +401,109 @@ pub fn print_stats(report: &StatsReport) -> Result<()> {
         println!("Price estimates:");
         print_wrapped_text(&price_source_label(source), 2);
     }
+}
+
+fn should_run_interactive_stats() -> bool {
+    #[cfg(not(unix))]
+    {
+        false
+    }
+    #[cfg(unix)]
+    {
+        std::io::stdin().is_terminal()
+            && std::io::stdout().is_terminal()
+            && std::env::var_os("CI").is_none()
+            && std::env::var_os("CX_STATS_STATIC").is_none()
+    }
+}
+
+#[cfg(unix)]
+fn print_stats_interactive(mut report: StatsReport) -> Result<()> {
+    let _terminal = TerminalMode::enter()?;
+    loop {
+        print!("\x1b[2J\x1b[H");
+        print_stats_static(&report);
+        println!("q quit · +/- range · a all · 7 last 7d · 3 last 30d");
+        std::io::stdout().flush()?;
+
+        let mut key = [0_u8; 1];
+        std::io::stdin().read_exact(&mut key)?;
+        match key[0] {
+            b'q' | 0x1b => break,
+            b'+' | b'=' => report.range = zoom_stats_range(&report.range, ZoomDirection::In),
+            b'-' | b'_' => report.range = zoom_stats_range(&report.range, ZoomDirection::Out),
+            b'a' | b'A' => report.range = "all".parse().expect("valid built-in stats range"),
+            b'7' => report.range = "7d".parse().expect("valid built-in stats range"),
+            b'3' => report.range = "30d".parse().expect("valid built-in stats range"),
+            _ => {}
+        }
+    }
     Ok(())
+}
+
+#[cfg(not(unix))]
+fn print_stats_interactive(_report: StatsReport) -> Result<()> {
+    unreachable!("interactive stats is only enabled on unix terminals")
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ZoomDirection {
+    In,
+    Out,
+}
+
+fn zoom_stats_range(range: &StatsRange, direction: ZoomDirection) -> StatsRange {
+    let days = match range.kind() {
+        StatsRangeKind::All => 30,
+        StatsRangeKind::LastDays(days) => *days,
+        StatsRangeKind::Since(_) | StatsRangeKind::Between { .. } => 30,
+    };
+    let next_days = match direction {
+        ZoomDirection::In => days.saturating_add(1) / 2,
+        ZoomDirection::Out => days.saturating_mul(2),
+    }
+    .clamp(1, MAX_SELECTED_DAYS as u32);
+    format!("{next_days}d")
+        .parse()
+        .expect("generated stats range is valid")
+}
+
+#[cfg(unix)]
+struct TerminalMode {
+    fd: i32,
+    previous: libc::termios,
+}
+
+#[cfg(unix)]
+impl TerminalMode {
+    fn enter() -> Result<Self> {
+        let stdin = std::io::stdin();
+        let fd = stdin.as_raw_fd();
+        let mut previous = std::mem::MaybeUninit::<libc::termios>::uninit();
+        // SAFETY: tcgetattr initializes `previous` when it returns 0.
+        if unsafe { libc::tcgetattr(fd, previous.as_mut_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: tcgetattr succeeded, so the termios value is initialized.
+        let previous = unsafe { previous.assume_init() };
+        let mut next = previous;
+        next.c_lflag &= !(libc::ICANON | libc::ECHO);
+        next.c_cc[libc::VMIN] = 1;
+        next.c_cc[libc::VTIME] = 0;
+        // SAFETY: fd is stdin's live file descriptor and `next` is a valid termios value.
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &next) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(Self { fd, previous })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TerminalMode {
+    fn drop(&mut self) {
+        // SAFETY: `previous` was captured from the same live terminal fd.
+        let _ = unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.previous) };
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -411,29 +538,34 @@ struct ChartCell {
     color_index: Option<usize>,
 }
 
+#[derive(Debug, Clone)]
+struct ModelVisuals {
+    colors: BTreeMap<DisplayModelKey, usize>,
+}
+
 fn print_daily_chart(report: &StatsReport) {
     let days = selected_daily_days(report);
     if days.is_empty() || days.iter().all(|day| day.tokens == 0) {
         return;
     }
 
-    let width = daily_chart_width();
+    let width = daily_chart_bucket_count();
     let use_color = color_enabled();
     let points = chart_points(&days, width);
     let max_tokens = points.iter().map(|point| point.tokens).max().unwrap_or(0);
-    let top_models = top_models_for_chart(&points, max_tokens, DAILY_CHART_MODEL_LIMIT);
+    let top_models = top_models_for_stacked_chart(&points, DAILY_CHART_MODEL_LIMIT);
+    let visuals = ModelVisuals::from_models(&top_models);
 
     println!("Tokens per Day");
-    print_line_chart(&points, &top_models, max_tokens, use_color);
+    print_stacked_bar_chart(&points, &top_models, &visuals, max_tokens, use_color);
 
     if !top_models.is_empty() {
         let legend = top_models
             .iter()
-            .enumerate()
-            .map(|(index, key)| {
+            .map(|key| {
                 format!(
                     "{} {}",
-                    model_marker(index, use_color),
+                    model_marker_for_key(key, &visuals, use_color),
                     truncate(&model_label(key), legend_label_width())
                 )
             })
@@ -465,18 +597,25 @@ fn print_model_mix(report: &StatsReport) {
         None
     };
 
-    for (index, (key, usage)) in models.iter().enumerate() {
-        print_model_mix_row(index, key, usage, total_tokens, use_color);
+    let visual_keys = models
+        .iter()
+        .map(|(key, _usage)| key.clone())
+        .chain(other.as_ref().map(|_| other_model_key()))
+        .collect::<Vec<_>>();
+    let visuals = ModelVisuals::from_models(&visual_keys);
+
+    for (key, usage) in &models {
+        print_model_mix_row(key, usage, &visuals, total_tokens, use_color);
     }
 
     if let Some(usage) = other {
         print_model_mix_row(
-            MODEL_MIX_LIMIT,
             &DisplayModelKey {
                 provider: "other".to_string(),
                 model: "other".to_string(),
             },
             &usage,
+            &visuals,
             total_tokens,
             use_color,
         );
@@ -485,16 +624,16 @@ fn print_model_mix(report: &StatsReport) {
 }
 
 fn print_model_mix_row(
-    index: usize,
     key: &DisplayModelKey,
     usage: &DisplayModelUsage,
+    visuals: &ModelVisuals,
     total_tokens: u64,
     use_color: bool,
 ) {
     let label_width = text_wrap_width().saturating_sub(4).clamp(8, 48);
     println!(
         "  {} {}",
-        model_marker(index, use_color),
+        model_marker_for_key(key, visuals, use_color),
         truncate(&model_label(key), label_width)
     );
     print_wrapped_items(&model_mix_primary_parts(usage, total_tokens), 4);
@@ -586,43 +725,37 @@ fn empty_daily_usage(date: String) -> DailyUsage {
     }
 }
 
-fn top_models_for_chart(
-    points: &[ChartPoint],
-    max_tokens: u64,
-    limit: usize,
-) -> Vec<DisplayModelKey> {
-    let mut usage_by_model = BTreeMap::<DisplayModelKey, (u64, u64)>::new();
+fn top_models_for_stacked_chart(points: &[ChartPoint], limit: usize) -> Vec<DisplayModelKey> {
+    if limit == 0 {
+        return Vec::new();
+    }
+
+    let mut usage_by_model = BTreeMap::<DisplayModelKey, u64>::new();
     for point in points {
         for (key, tokens) in &point.models {
-            let (total, peak) = usage_by_model.entry(key.clone()).or_default();
-            *total += *tokens;
-            *peak = (*peak).max(*tokens);
+            *usage_by_model.entry(key.clone()).or_default() += *tokens;
         }
     }
 
     let mut models = usage_by_model.into_iter().collect::<Vec<_>>();
-    models.sort_by(
-        |(left_key, (left_tokens, _)), (right_key, (right_tokens, _))| {
-            right_tokens
-                .cmp(left_tokens)
-                .then_with(|| left_key.provider.cmp(&right_key.provider))
-                .then_with(|| left_key.model.cmp(&right_key.model))
-        },
-    );
+    models.sort_by(|(left_key, left_tokens), (right_key, right_tokens)| {
+        right_tokens
+            .cmp(left_tokens)
+            .then_with(|| left_key.provider.cmp(&right_key.provider))
+            .then_with(|| left_key.model.cmp(&right_key.model))
+    });
 
-    let mut visible = models
-        .iter()
-        .filter(|(_, (_, peak))| chart_y(*peak, max_tokens) < DAILY_LINE_CHART_HEIGHT - 1)
-        .take(limit)
-        .map(|(key, _usage)| key.clone())
-        .collect::<Vec<_>>();
-    if visible.is_empty() {
-        visible = models
-            .into_iter()
-            .take(1)
-            .map(|(key, _usage)| key)
-            .collect();
+    if models.len() <= limit {
+        return models.into_iter().map(|(key, _usage)| key).collect();
     }
+
+    let visible_count = limit.saturating_sub(1).max(1);
+    let mut visible = models
+        .into_iter()
+        .take(visible_count)
+        .map(|(key, _usage)| key)
+        .collect::<Vec<_>>();
+    visible.push(other_model_key());
     visible
 }
 
@@ -672,6 +805,18 @@ fn chart_points(days: &[DailyUsage], width: usize) -> Vec<ChartPoint> {
         let end = ((index + 1) * days.len() / bucket_count).max(start + 1);
         compacted.push(combine_days(&days[start..end]));
     }
+    if let Some(first) = compacted.first_mut() {
+        first.date = days
+            .first()
+            .map(|day| day.date.clone())
+            .unwrap_or_else(|| first.date.clone());
+    }
+    if let Some(last) = compacted.last_mut() {
+        last.date = days
+            .last()
+            .map(|day| day.date.clone())
+            .unwrap_or_else(|| last.date.clone());
+    }
 
     if compacted.len() >= width {
         return compacted;
@@ -706,9 +851,10 @@ fn combine_days(days: &[DailyUsage]) -> ChartPoint {
     point
 }
 
-fn print_line_chart(
+fn print_stacked_bar_chart(
     points: &[ChartPoint],
     top_models: &[DisplayModelKey],
+    visuals: &ModelVisuals,
     max_tokens: u64,
     use_color: bool,
 ) {
@@ -716,14 +862,33 @@ fn print_line_chart(
         return;
     }
 
-    let width = points.len();
-    let mut grid = vec![vec![ChartCell::blank(); width]; DAILY_LINE_CHART_HEIGHT];
-    for (index, key) in top_models.iter().enumerate() {
-        let values = points
+    let width = chart_render_width(points.len());
+    let mut grid = vec![vec![ChartCell::blank(); width]; DAILY_BAR_CHART_HEIGHT];
+    let visible_models = top_models
+        .iter()
+        .filter(|key| !key.is_other())
+        .collect::<Vec<_>>();
+    for (point_index, point) in points.iter().enumerate() {
+        let x = chart_point_x(point_index);
+        let values = top_models
             .iter()
-            .map(|point| point.models.get(key).copied().unwrap_or(0))
+            .map(|key| chart_model_tokens(point, key, &visible_models))
             .collect::<Vec<_>>();
-        draw_series(&mut grid, &values, max_tokens, index);
+        let heights = stacked_bar_segment_heights(&values, point.tokens, max_tokens);
+        let mut y = DAILY_BAR_CHART_HEIGHT;
+        for (key, height) in top_models.iter().zip(heights) {
+            let cell = ChartCell {
+                glyph: bar_glyph_for_key(key, visuals, use_color),
+                color_index: Some(visuals.color_index(key)),
+            };
+            for _ in 0..height {
+                if y == 0 {
+                    break;
+                }
+                y -= 1;
+                set_chart_cell(&mut grid, x, y, cell);
+            }
+        }
     }
 
     for (row_index, row) in grid.iter().enumerate() {
@@ -737,120 +902,79 @@ fn print_line_chart(
         );
     }
     println!("{:>7} └{}", "", "─".repeat(width));
-    println!("{}", x_axis_labels(points));
+    println!("{}", x_axis_labels(points, width));
 }
 
-fn draw_series(grid: &mut [Vec<ChartCell>], values: &[u64], max_tokens: u64, color_index: usize) {
-    if values.is_empty() || grid.is_empty() {
-        return;
+fn chart_model_tokens(
+    point: &ChartPoint,
+    key: &DisplayModelKey,
+    visible_models: &[&DisplayModelKey],
+) -> u64 {
+    if !key.is_other() {
+        return point.models.get(key).copied().unwrap_or(0);
     }
-
-    let Some(first_positive) = values.iter().position(|value| *value > 0) else {
-        return;
-    };
-    let last_positive = values
+    let visible_tokens = visible_models
         .iter()
-        .rposition(|value| *value > 0)
-        .unwrap_or(first_positive);
-
-    let bottom_y = DAILY_LINE_CHART_HEIGHT.saturating_sub(1);
-    let first_y = chart_y(values[first_positive], max_tokens);
-    if first_positive == 0 {
-        put_chart_cell(grid, 0, first_y, '─', color_index);
-    } else {
-        draw_series_start(grid, first_positive, bottom_y, first_y, color_index);
-    }
-
-    let final_x = last_positive
-        .checked_add(1)
-        .filter(|index| *index < values.len())
-        .unwrap_or(last_positive);
-    for x in first_positive.saturating_add(1)..=final_x {
-        let previous_y = chart_y(values[x - 1], max_tokens);
-        let y = if x > last_positive {
-            bottom_y
-        } else {
-            chart_y(values[x], max_tokens)
-        };
-        draw_series_step(grid, x, previous_y, y, color_index);
-    }
+        .map(|model| point.models.get(*model).copied().unwrap_or(0))
+        .sum::<u64>();
+    point.tokens.saturating_sub(visible_tokens)
 }
 
-fn draw_series_start(
-    grid: &mut [Vec<ChartCell>],
-    x: usize,
-    bottom_y: usize,
-    y: usize,
-    color_index: usize,
-) {
-    if y == bottom_y {
-        put_chart_cell(grid, x, y, '─', color_index);
-        return;
+fn stacked_bar_segment_heights(values: &[u64], total_tokens: u64, max_tokens: u64) -> Vec<usize> {
+    let mut heights = vec![0; values.len()];
+    if values.is_empty() || total_tokens == 0 || max_tokens == 0 {
+        return heights;
     }
-    draw_vertical(grid, x, y, bottom_y, color_index);
-    put_chart_cell(grid, x, y, '╭', color_index);
+
+    let total_height = scaled_bar_height(total_tokens, max_tokens);
+    if total_height == 0 {
+        return heights;
+    }
+
+    let mut assigned = 0;
+    let mut remainders = Vec::new();
+    for (index, value) in values.iter().enumerate() {
+        if *value == 0 {
+            continue;
+        }
+        let scaled = *value as u128 * total_height as u128;
+        let base = (scaled / total_tokens as u128) as usize;
+        heights[index] = base;
+        assigned += base;
+        remainders.push((index, scaled % total_tokens as u128));
+    }
+
+    remainders.sort_by(|(left_index, left), (right_index, right)| {
+        right
+            .cmp(left)
+            .then_with(|| values[*right_index].cmp(&values[*left_index]))
+    });
+    for (index, _remainder) in remainders
+        .into_iter()
+        .take(total_height.saturating_sub(assigned))
+    {
+        heights[index] += 1;
+    }
+    heights
 }
 
-fn draw_series_step(
-    grid: &mut [Vec<ChartCell>],
-    x: usize,
-    previous_y: usize,
-    y: usize,
-    color_index: usize,
-) {
-    if y == previous_y {
-        put_chart_cell(grid, x, y, '─', color_index);
-    } else if y < previous_y {
-        put_chart_cell(grid, x, previous_y, '╯', color_index);
-        draw_vertical(grid, x, y, previous_y, color_index);
-        put_chart_cell(grid, x, y, '╭', color_index);
-    } else {
-        put_chart_cell(grid, x, previous_y, '╮', color_index);
-        draw_vertical(grid, x, previous_y, y, color_index);
-        put_chart_cell(grid, x, y, '╰', color_index);
+fn scaled_bar_height(tokens: u64, max_tokens: u64) -> usize {
+    if tokens == 0 || max_tokens == 0 {
+        return 0;
     }
+    let scaled = tokens as u128 * DAILY_BAR_CHART_HEIGHT as u128;
+    let height = scaled.div_ceil(max_tokens as u128) as usize;
+    height.clamp(1, DAILY_BAR_CHART_HEIGHT)
 }
 
-fn draw_vertical(
-    grid: &mut [Vec<ChartCell>],
-    x: usize,
-    top: usize,
-    bottom: usize,
-    color_index: usize,
-) {
-    let start = top.min(bottom) + 1;
-    let end = top.max(bottom);
-    for row in start..end {
-        put_chart_cell(grid, x, row, '│', color_index);
-    }
-}
-
-fn chart_y(value: u64, max_tokens: u64) -> usize {
-    if max_tokens == 0 || DAILY_LINE_CHART_HEIGHT <= 1 {
-        return DAILY_LINE_CHART_HEIGHT.saturating_sub(1);
-    }
-    let ratio = value as f64 / max_tokens as f64;
-    let y = (1.0 - ratio.clamp(0.0, 1.0)) * (DAILY_LINE_CHART_HEIGHT - 1) as f64;
-    y.round() as usize
-}
-
-fn put_chart_cell(
-    grid: &mut [Vec<ChartCell>],
-    x: usize,
-    y: usize,
-    glyph: char,
-    color_index: usize,
-) {
+fn set_chart_cell(grid: &mut [Vec<ChartCell>], x: usize, y: usize, value: ChartCell) {
     let Some(row) = grid.get_mut(y) else {
         return;
     };
     let Some(cell) = row.get_mut(x) else {
         return;
     };
-    if cell.glyph == ' ' || cell.color_index == Some(color_index) {
-        cell.glyph = glyph;
-        cell.color_index = Some(color_index);
-    }
+    *cell = value;
 }
 
 fn render_chart_cell(cell: ChartCell, use_color: bool) -> String {
@@ -865,19 +989,18 @@ fn render_chart_cell(cell: ChartCell, use_color: bool) -> String {
 }
 
 fn y_axis_label(row_index: usize, max_tokens: u64) -> String {
-    if row_index + 1 == DAILY_LINE_CHART_HEIGHT {
+    if row_index + 1 == DAILY_BAR_CHART_HEIGHT {
         return "0".to_string();
     }
-    if max_tokens == 0 || DAILY_LINE_CHART_HEIGHT <= 1 {
+    if max_tokens == 0 || DAILY_BAR_CHART_HEIGHT <= 1 {
         return String::new();
     }
-    let numerator = (DAILY_LINE_CHART_HEIGHT - 1 - row_index) as u64;
-    let denominator = (DAILY_LINE_CHART_HEIGHT - 1) as u64;
+    let numerator = (DAILY_BAR_CHART_HEIGHT - 1 - row_index) as u64;
+    let denominator = (DAILY_BAR_CHART_HEIGHT - 1) as u64;
     stats::human_tokens(max_tokens.saturating_mul(numerator) / denominator)
 }
 
-fn x_axis_labels(points: &[ChartPoint]) -> String {
-    let width = points.len();
+fn x_axis_labels(points: &[ChartPoint], width: usize) -> String {
     let mut line = vec![' '; width + CHART_PREFIX_WIDTH];
     if let Some(point) = points.first() {
         place_label(
@@ -886,9 +1009,11 @@ fn x_axis_labels(points: &[ChartPoint]) -> String {
             &short_date_label(&point.date),
         );
     }
-    if let Some(point) = points.get(width / 2) {
+    let midpoint = points.len() / 2;
+    if let Some(point) = points.get(midpoint) {
         let label = short_date_label(&point.date);
-        let start = CHART_PREFIX_WIDTH + (width / 2).saturating_sub(label.chars().count() / 2);
+        let start =
+            CHART_PREFIX_WIDTH + chart_point_x(midpoint).saturating_sub(label.chars().count() / 2);
         place_label(&mut line, start, &label);
     }
     if let Some(point) = points.last() {
@@ -912,11 +1037,23 @@ fn place_label(line: &mut [char], start: usize, label: &str) {
     }
 }
 
-fn daily_chart_width() -> usize {
-    daily_chart_width_for_terminal(terminal_width())
+fn chart_render_width(points: usize) -> usize {
+    points.saturating_mul(2).saturating_sub(1).max(1)
 }
 
-fn daily_chart_width_for_terminal(columns: usize) -> usize {
+fn chart_point_x(index: usize) -> usize {
+    index.saturating_mul(2)
+}
+
+fn daily_chart_bucket_count() -> usize {
+    daily_chart_bucket_count_for_terminal(terminal_width())
+}
+
+fn daily_chart_bucket_count_for_terminal(columns: usize) -> usize {
+    daily_chart_render_width_for_terminal(columns).div_ceil(2)
+}
+
+fn daily_chart_render_width_for_terminal(columns: usize) -> usize {
     columns
         .saturating_sub(CHART_PREFIX_WIDTH)
         .clamp(1, MAX_DAILY_CHART_WIDTH)
@@ -1161,21 +1298,55 @@ fn colorize(value: &str, index: usize, use_color: bool) -> String {
     if !use_color {
         return value.to_string();
     }
-    const COLORS: [u8; 7] = [147, 42, 214, 202, 45, 81, 246];
-    format!(
-        "\x1b[38;5;{}m{}\x1b[0m",
-        COLORS[index % COLORS.len()],
-        value
-    )
+    let (red, green, blue) = MODEL_COLORS[index % MODEL_COLORS.len()];
+    format!("\x1b[38;2;{red};{green};{blue}m{value}\x1b[0m")
 }
 
-fn model_marker(index: usize, use_color: bool) -> String {
-    const MARKERS: [&str; 7] = ["●", "◆", "■", "▲", "◇", "□", "○"];
-    let marker = MARKERS[index % MARKERS.len()];
+fn model_marker_for_key(key: &DisplayModelKey, visuals: &ModelVisuals, use_color: bool) -> String {
+    let marker = if use_color {
+        "█"
+    } else {
+        fallback_marker(visuals.color_index(key))
+    };
     if use_color {
-        return colorize(marker, index, use_color);
+        return colorize(marker, visuals.color_index(key), use_color);
     }
     marker.to_string()
+}
+
+fn bar_glyph_for_key(key: &DisplayModelKey, visuals: &ModelVisuals, use_color: bool) -> char {
+    if use_color {
+        return '█';
+    }
+    fallback_bar_glyph(visuals.color_index(key))
+}
+
+fn preferred_model_color_index(key: &DisplayModelKey) -> usize {
+    (model_visual_hash(key) % MODEL_COLORS.len() as u64) as usize
+}
+
+fn fallback_marker(color_index: usize) -> &'static str {
+    const MARKERS: [&str; 12] = ["█", "▓", "▒", "░", "■", "□", "●", "○", "◆", "◇", "▲", "△"];
+    MARKERS[color_index % MARKERS.len()]
+}
+
+fn fallback_bar_glyph(color_index: usize) -> char {
+    const GLYPHS: [char; 12] = ['█', '▓', '▒', '░', '■', '□', '●', '○', '◆', '◇', '▲', '△'];
+    GLYPHS[color_index % GLYPHS.len()]
+}
+
+fn model_visual_hash(key: &DisplayModelKey) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in key
+        .provider
+        .bytes()
+        .chain(std::iter::once(0))
+        .chain(key.model.bytes())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 fn format_ratio(tokens: u64, total_tokens: u64) -> String {
@@ -1270,6 +1441,17 @@ impl DisplayModelKey {
             model: model.model.clone(),
         }
     }
+
+    fn is_other(&self) -> bool {
+        self.provider == "other" && self.model == "other"
+    }
+}
+
+fn other_model_key() -> DisplayModelKey {
+    DisplayModelKey {
+        provider: "other".to_string(),
+        model: "other".to_string(),
+    }
 }
 
 impl DisplayModelUsage {
@@ -1300,6 +1482,45 @@ impl DisplayModelUsage {
             self.estimated_cost_usd = Some(self.estimated_cost_usd.unwrap_or(0.0) + cost);
         }
     }
+}
+
+impl ModelVisuals {
+    fn from_models(models: &[DisplayModelKey]) -> Self {
+        let mut colors = BTreeMap::new();
+        let mut used = Vec::new();
+        for model in models {
+            if colors.contains_key(model) {
+                continue;
+            }
+            let color = choose_model_color(model, &used);
+            used.push(color);
+            colors.insert(model.clone(), color);
+        }
+        Self { colors }
+    }
+
+    fn color_index(&self, key: &DisplayModelKey) -> usize {
+        self.colors
+            .get(key)
+            .copied()
+            .unwrap_or_else(|| preferred_model_color_index(key))
+    }
+}
+
+fn choose_model_color(key: &DisplayModelKey, used: &[usize]) -> usize {
+    let preferred = preferred_model_color_index(key);
+    if !used.contains(&preferred) {
+        return preferred;
+    }
+
+    let stride = 5;
+    for offset in 1..MODEL_COLORS.len() {
+        let candidate = (preferred + offset * stride) % MODEL_COLORS.len();
+        if !used.contains(&candidate) {
+            return candidate;
+        }
+    }
+    preferred
 }
 
 impl<'a> StatsJsonReport<'a> {
@@ -1822,6 +2043,13 @@ mod tests {
         }
     }
 
+    fn test_model_key(model: &str) -> DisplayModelKey {
+        DisplayModelKey {
+            provider: "openai".to_string(),
+            model: model.to_string(),
+        }
+    }
+
     #[test]
     fn token_only_stats_columns_do_not_emit_cost_fields() {
         let period = period_usage(None);
@@ -1941,10 +2169,26 @@ mod tests {
 
     #[test]
     fn daily_chart_width_accounts_for_axis_prefix() {
-        assert_eq!(daily_chart_width_for_terminal(40) + CHART_PREFIX_WIDTH, 40);
-        assert_eq!(daily_chart_width_for_terminal(80), MAX_DAILY_CHART_WIDTH);
-        assert_eq!(daily_chart_width_for_terminal(140), MAX_DAILY_CHART_WIDTH);
-        assert_eq!(daily_chart_width_for_terminal(20) + CHART_PREFIX_WIDTH, 20);
+        assert_eq!(
+            daily_chart_render_width_for_terminal(40) + CHART_PREFIX_WIDTH,
+            40
+        );
+        assert_eq!(
+            daily_chart_render_width_for_terminal(80),
+            MAX_DAILY_CHART_WIDTH
+        );
+        assert_eq!(
+            daily_chart_render_width_for_terminal(140),
+            MAX_DAILY_CHART_WIDTH
+        );
+        assert_eq!(
+            daily_chart_render_width_for_terminal(20) + CHART_PREFIX_WIDTH,
+            20
+        );
+        assert_eq!(
+            chart_render_width(daily_chart_bucket_count_for_terminal(40)) + CHART_PREFIX_WIDTH,
+            40
+        );
     }
 
     #[test]
@@ -1969,21 +2213,63 @@ mod tests {
     }
 
     #[test]
-    fn draw_series_keeps_step_turns_on_one_column() {
-        let mut grid = vec![vec![ChartCell::blank(); 3]; DAILY_LINE_CHART_HEIGHT];
+    fn stacked_bar_segments_preserve_total_height() {
+        let heights = stacked_bar_segment_heights(&[80, 20], 100, 100);
 
-        draw_series(&mut grid, &[100, 80], 100, 0);
-
-        assert_eq!(grid[0][0].glyph, '─');
-        assert_eq!(grid[0][1].glyph, '╮');
-        assert_eq!(grid[1][1].glyph, '╰');
+        assert_eq!(heights, vec![6, 2]);
+        assert_eq!(heights.iter().sum::<usize>(), DAILY_BAR_CHART_HEIGHT);
     }
 
     #[test]
-    fn model_markers_keep_shape_without_color() {
-        assert_eq!(model_marker(0, false), "●");
-        assert_eq!(model_marker(1, false), "◆");
-        assert_eq!(model_marker(2, false), "■");
+    fn stacked_chart_collapses_extra_models_into_other() {
+        let mut point = ChartPoint {
+            date: "2026-05-12".to_string(),
+            tokens: 600,
+            models: BTreeMap::new(),
+        };
+        point.models.insert(test_model_key("gpt-a"), 300);
+        point.models.insert(test_model_key("gpt-b"), 200);
+        point.models.insert(test_model_key("gpt-c"), 100);
+
+        let models = top_models_for_stacked_chart(&[point], 2);
+
+        assert_eq!(models, vec![test_model_key("gpt-a"), other_model_key()]);
+    }
+
+    #[test]
+    fn model_visuals_are_stable_for_model_key() {
+        let key = test_model_key("gpt-5.5");
+        let visuals = ModelVisuals::from_models(std::slice::from_ref(&key));
+
+        assert_eq!(
+            preferred_model_color_index(&key),
+            preferred_model_color_index(&key)
+        );
+        assert_eq!(
+            model_marker_for_key(&key, &visuals, false),
+            model_marker_for_key(&key, &visuals, false)
+        );
+    }
+
+    #[test]
+    fn model_visuals_avoid_color_collisions_for_visible_models() {
+        let models = vec![
+            test_model_key("gpt-5.5"),
+            test_model_key("gpt-5.4"),
+            test_model_key("gpt-5.3-codex"),
+            test_model_key("gpt-5.4-mini"),
+            other_model_key(),
+        ];
+
+        let visuals = ModelVisuals::from_models(&models);
+        let mut colors = models
+            .iter()
+            .map(|model| visuals.color_index(model))
+            .collect::<Vec<_>>();
+        colors.sort_unstable();
+        colors.dedup();
+
+        assert_eq!(colors.len(), models.len());
     }
 
     #[test]

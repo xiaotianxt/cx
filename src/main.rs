@@ -1,4 +1,5 @@
 mod auth;
+mod cache;
 mod cli;
 mod completion;
 mod cx;

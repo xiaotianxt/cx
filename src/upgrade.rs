@@ -11,11 +11,14 @@ use anyhow::Result;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::cache;
+use crate::cache::entries;
+use crate::cache::CacheStore;
 use crate::paths;
 use crate::paths::ManagerPaths;
 
 const UPGRADE_SCHEMA_VERSION: u64 = 1;
-const STARTUP_REPAIR_ID: &str = "runtime-surface-removal-v1";
+const STARTUP_REPAIR_ID: &str = "runtime-surface-and-stats-cache-v2";
 const CURRENT_STATS_FILE_SCHEMA_VERSION: u64 = 2;
 #[cfg(target_os = "macos")]
 const REMOVED_LAUNCHD_LABEL: &str = "dev.xiaotian.cx.service";
@@ -57,7 +60,7 @@ fn run_startup_inner(paths: &ManagerPaths, force: bool) -> Result<()> {
     repair_stats_owned_files(paths, &mut actions)?;
     repair_slot_sqlite_layout(paths, &mut actions)?;
     retire_removed_runtime(paths, &mut actions)?;
-    write_startup_repair_marker(paths, actions.clone())?;
+    let _ = write_startup_repair_marker(paths, actions.clone());
 
     if !actions.is_empty() {
         eprintln!(
@@ -78,13 +81,13 @@ fn startup_repair_relevant(paths: &ManagerPaths) -> Result<bool> {
 
 fn repair_stats_owned_files(paths: &ManagerPaths, actions: &mut Vec<String>) -> Result<()> {
     repair_json_schema_file(
-        &paths.manager_dir.join("price-cache.json"),
+        &CacheStore::new(paths).path(entries::PRICE_CACHE),
         &["fetchedAt", "sourceUrl", "prices"],
-        "price-cache.json",
+        entries::PRICE_CACHE,
         actions,
     )?;
     repair_json_schema_file(
-        &paths.manager_dir.join("stats-calibration.json"),
+        &CacheStore::new(paths).path(entries::STATS_CALIBRATION),
         &[
             "calibratedAt",
             "samples",
@@ -92,9 +95,26 @@ fn repair_stats_owned_files(paths: &ManagerPaths, actions: &mut Vec<String>) -> 
             "totalTokens",
             "tokenMix",
         ],
-        "stats-calibration.json",
+        entries::STATS_CALIBRATION,
         actions,
-    )
+    )?;
+    remove_legacy_stats_rollout_cache(paths, actions)
+}
+
+fn remove_legacy_stats_rollout_cache(
+    paths: &ManagerPaths,
+    actions: &mut Vec<String>,
+) -> Result<()> {
+    if CacheStore::new(paths)
+        .remove_file_if_present(entries::LEGACY_STATS_ROLLOUT_JSON)
+        .unwrap_or(false)
+    {
+        actions.push(format!(
+            "removed legacy {}",
+            entries::LEGACY_STATS_ROLLOUT_JSON
+        ));
+    }
+    Ok(())
 }
 
 fn repair_json_schema_file(
@@ -106,8 +126,7 @@ fn repair_json_schema_file(
     if !path.is_file() {
         return Ok(());
     }
-    let content = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let Ok(mut value) = serde_json::from_str::<Value>(&content) else {
+    let Some(mut value) = cache::read_json_path::<Value>(path, |_| true) else {
         return Ok(());
     };
     let Some(object) = value.as_object_mut() else {
@@ -125,8 +144,7 @@ fn repair_json_schema_file(
         "schemaVersion".to_string(),
         Value::from(CURRENT_STATS_FILE_SCHEMA_VERSION),
     );
-    fs::write(path, serde_json::to_string_pretty(&value)? + "\n")
-        .with_context(|| format!("write {}", path.display()))?;
+    cache::write_json_path(path, &value)?;
     actions.push(format!("updated {label} schema marker"));
     Ok(())
 }
@@ -288,18 +306,16 @@ fn retired_runtime_dir(paths: &ManagerPaths) -> PathBuf {
 }
 
 fn startup_repair_marker(paths: &ManagerPaths) -> PathBuf {
-    paths
-        .manager_dir
-        .join("state")
+    CacheStore::new(paths).path(startup_repair_marker_relative())
+}
+
+fn startup_repair_marker_relative() -> PathBuf {
+    PathBuf::from("state")
         .join("upgrades")
         .join(format!("{STARTUP_REPAIR_ID}.json"))
 }
 
 fn write_startup_repair_marker(paths: &ManagerPaths, actions: Vec<String>) -> Result<()> {
-    let path = startup_repair_marker(paths);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
-    }
     let report = StartupRepairReport {
         schema_version: UPGRADE_SCHEMA_VERSION,
         repair_id: STARTUP_REPAIR_ID,
@@ -308,8 +324,9 @@ fn write_startup_repair_marker(paths: &ManagerPaths, actions: Vec<String>) -> Re
         public_release_ceiling: "v0.4.1",
         actions,
     };
-    fs::write(&path, serde_json::to_string_pretty(&report)? + "\n")
-        .with_context(|| format!("write {}", path.display()))
+    CacheStore::new(paths)
+        .write_json(startup_repair_marker_relative(), &report)
+        .map(|_| ())
 }
 
 fn path_exists_or_symlink(path: &Path) -> bool {
@@ -384,6 +401,7 @@ mod tests {
             }"#,
         )
         .unwrap();
+        fs::write(paths.manager_dir.join("stats-rollout-cache.json"), "{}").unwrap();
 
         run_startup(&paths).unwrap();
 
@@ -397,6 +415,7 @@ mod tests {
         .unwrap();
         assert_eq!(price_cache["schemaVersion"], Value::from(2));
         assert_eq!(calibration["schemaVersion"], Value::from(2));
+        assert!(!paths.manager_dir.join("stats-rollout-cache.json").exists());
         assert!(startup_repair_marker(&paths).is_file());
 
         let _ = fs::remove_dir_all(paths.base_codex_home);

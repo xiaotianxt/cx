@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::fs;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -8,6 +7,8 @@ use reqwest::blocking::Client;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::cache::entries;
+use crate::cache::CacheStore;
 use crate::cli::StatsArgs;
 use crate::paths::ManagerPaths;
 
@@ -16,7 +17,6 @@ use super::TokenMix;
 use super::TokenTotals;
 
 pub(super) const DEFAULT_PRICE_URL: &str = "https://developers.openai.com/api/docs/pricing";
-pub(super) const PRICE_CACHE_FILE: &str = "price-cache.json";
 const PRICE_CACHE_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
 pub(super) const PRICE_CACHE_SCHEMA_VERSION: u64 = 2;
 
@@ -219,19 +219,18 @@ fn fetch_prices(price_url: &str) -> Result<BTreeMap<String, ModelPrice>> {
 }
 
 pub(super) fn read_price_cache(paths: &ManagerPaths) -> Option<PriceCache> {
-    let path = paths.manager_dir.join(PRICE_CACHE_FILE);
-    let content = fs::read_to_string(&path).ok()?;
-    parse_price_cache(&content)
+    CacheStore::new(paths).read_json(entries::PRICE_CACHE, |cache: &PriceCache| {
+        cache.schema_version == PRICE_CACHE_SCHEMA_VERSION
+    })
 }
 
 fn write_price_cache(paths: &ManagerPaths, cache: &PriceCache) -> Result<()> {
-    fs::create_dir_all(&paths.manager_dir)
-        .with_context(|| format!("create {}", paths.manager_dir.display()))?;
-    let path = paths.manager_dir.join(PRICE_CACHE_FILE);
-    let content = serde_json::to_string_pretty(cache)?;
-    fs::write(&path, content).with_context(|| format!("write {}", path.display()))
+    CacheStore::new(paths)
+        .write_json(entries::PRICE_CACHE, cache)
+        .map(|_| ())
 }
 
+#[cfg(test)]
 pub(super) fn parse_price_cache(content: &str) -> Option<PriceCache> {
     let cache = serde_json::from_str::<PriceCache>(content).ok()?;
     (cache.schema_version == PRICE_CACHE_SCHEMA_VERSION).then_some(cache)

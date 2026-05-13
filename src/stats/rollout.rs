@@ -1,19 +1,29 @@
 use std::fs::File;
 use std::io::BufRead;
 use std::io::BufReader;
+use std::io::Seek;
+use std::io::SeekFrom;
 use std::path::Path;
 
 use anyhow::Context;
 use anyhow::Result;
+use serde::Deserialize;
+use serde::Serialize;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use super::TokenTotals;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct TokenUsageEvent {
     pub(super) timestamp_unix: i64,
     pub(super) totals: TokenTotals,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct TokenUsageScan {
+    pub(super) events: Vec<TokenUsageEvent>,
+    pub(super) final_totals: Option<TokenTotals>,
 }
 
 pub(super) fn read_final_token_usage(path: &Path) -> Result<Option<TokenTotals>> {
@@ -33,9 +43,21 @@ pub(super) fn read_final_token_usage(path: &Path) -> Result<Option<TokenTotals>>
 }
 
 pub(super) fn read_token_usage_events(path: &Path) -> Result<Vec<TokenUsageEvent>> {
-    let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    Ok(read_token_usage_scan_from(path, 0, None)?.events)
+}
+
+pub(super) fn read_token_usage_scan_from(
+    path: &Path,
+    offset: u64,
+    previous_totals: Option<TokenTotals>,
+) -> Result<TokenUsageScan> {
+    let mut file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    if offset > 0 {
+        file.seek(SeekFrom::Start(offset))
+            .with_context(|| format!("seek {}", path.display()))?;
+    }
     let reader = BufReader::new(file);
-    let mut previous = None;
+    let mut previous = previous_totals;
     let mut events = Vec::new();
 
     for line in reader.lines() {
@@ -59,7 +81,10 @@ pub(super) fn read_token_usage_events(path: &Path) -> Result<Vec<TokenUsageEvent
         }
     }
 
-    Ok(events)
+    Ok(TokenUsageScan {
+        events,
+        final_totals: previous,
+    })
 }
 
 pub(super) fn parse_token_count_line(line: &str) -> Option<TokenTotals> {
@@ -156,6 +181,30 @@ mod tests {
         assert_eq!(duplicate_delta.total_tokens, 0);
         assert_eq!(next_delta.total_tokens, 60);
         assert_eq!(next_delta.cached_input_tokens, 40);
+    }
+
+    #[test]
+    fn token_usage_scan_from_offset_uses_previous_totals() {
+        let first = r#"{"timestamp":"1970-01-01T00:00:10.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":80,"output_tokens":10,"total_tokens":110}}}}"#;
+        let second = r#"{"timestamp":"1970-01-01T00:00:11.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":150,"cached_input_tokens":120,"output_tokens":20,"total_tokens":170}}}}"#;
+        let path = std::env::temp_dir().join(format!(
+            "cx-rollout-scan-{}-{}.jsonl",
+            std::process::id(),
+            OffsetDateTime::now_utc().unix_timestamp_nanos()
+        ));
+        let prefix = format!("{first}\n");
+        std::fs::write(&path, format!("{prefix}{second}\n")).expect("write rollout");
+
+        let previous = parse_token_count_line(first).expect("first totals");
+        let scan = read_token_usage_scan_from(&path, prefix.len() as u64, Some(previous))
+            .expect("scan appended rollout");
+
+        assert_eq!(scan.events.len(), 1);
+        assert_eq!(scan.events[0].totals.total_tokens, 60);
+        assert_eq!(scan.events[0].totals.cached_input_tokens, 40);
+        assert_eq!(scan.final_totals.unwrap().total_tokens, 170);
+
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

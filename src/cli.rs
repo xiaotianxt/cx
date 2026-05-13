@@ -46,11 +46,8 @@ pub enum Command {
     Doctor(DoctorArgs),
     /// Install cx into ~/.local/bin.
     Install(InstallArgs),
-    /// Generate shell completion scripts.
+    /// Generate launcher-only shell completion scripts.
     Completions(CompletionsArgs),
-    /// Internal dynamic completion helper.
-    #[command(name = "__complete", hide = true)]
-    Complete(CompleteArgs),
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -58,14 +55,6 @@ pub enum CompletionShell {
     Fish,
     Zsh,
     Bash,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub enum CompleteKind {
-    Slots,
-    Targets,
-    Models,
-    Words,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -80,32 +69,6 @@ pub enum StatusSort {
 pub struct CompletionsArgs {
     /// Shell to generate completions for.
     pub shell: CompletionShell,
-}
-
-#[derive(Debug, Clone, Args)]
-pub struct CompleteArgs {
-    /// Dynamic candidate kind.
-    pub kind: CompleteKind,
-
-    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
-    #[arg(long, value_hint = clap::ValueHint::DirPath)]
-    pub manager_dir: Option<PathBuf>,
-
-    /// Shell requesting word completion.
-    #[arg(long, value_enum)]
-    pub shell: Option<CompletionShell>,
-
-    /// Active word index reported by the shell.
-    #[arg(long)]
-    pub cursor: Option<usize>,
-
-    /// Active token prefix reported by the shell.
-    #[arg(long, allow_hyphen_values = true)]
-    pub current: Option<String>,
-
-    /// Full shell words for runtime completion.
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    pub words: Vec<String>,
 }
 
 #[derive(Debug, Clone, Args)]

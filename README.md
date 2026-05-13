@@ -18,8 +18,7 @@ live usage.
 - `cx desktop`: launch Codex Desktop through a selected slot.
 - `cx --slot <name>` / `cx --target <name>`: force a launch through that slot
   or target.
-- `cx completions`: generate shell completion scripts with dynamic slot/model
-  candidates.
+- `cx completions`: generate launcher-only shell completion scripts.
 
 cx is intended for people who use Codex heavily across multiple ChatGPT
 accounts, workspaces, or model-provider configurations and want the launcher to
@@ -264,9 +263,8 @@ cx completions bash > ~/.local/share/bash-completion/completions/cx
 ```
 
 The release formula installs these completions automatically for Homebrew users.
-The generated scripts complete cx commands, launcher flags, local slot names, and
-target names, and cached Codex model names. Dynamic candidates come from local
-files only; tab completion does not call the live usage endpoint.
+The generated scripts complete cx launcher flags before `--`; arguments after
+`--` belong to Codex and are not completed by cx.
 
 ## Slot Files
 

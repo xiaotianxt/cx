@@ -39,6 +39,7 @@ pub(super) enum StatsPricePolicy<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PriceCachePolicy {
+    UseCacheOrFallback,
     UseFreshCacheIfAvailable,
     Refresh,
 }
@@ -69,10 +70,22 @@ impl<'a> StatsPricePolicy<'a> {
         if args.no_price {
             return Self::Disabled;
         }
-        if args.price || args.refresh_prices || args.price_url.is_some() {
+        if args.refresh_prices {
             return Self::Enabled {
                 price_url: args.price_url.as_deref().unwrap_or(DEFAULT_PRICE_URL),
-                cache_policy: PriceCachePolicy::from_refresh_flag(args.refresh_prices),
+                cache_policy: PriceCachePolicy::Refresh,
+            };
+        }
+        if args.price || args.price_url.is_some() {
+            return Self::Enabled {
+                price_url: args.price_url.as_deref().unwrap_or(DEFAULT_PRICE_URL),
+                cache_policy: PriceCachePolicy::UseFreshCacheIfAvailable,
+            };
+        }
+        if !args.json {
+            return Self::Enabled {
+                price_url: DEFAULT_PRICE_URL,
+                cache_policy: PriceCachePolicy::UseCacheOrFallback,
             };
         }
         Self::Disabled
@@ -80,16 +93,11 @@ impl<'a> StatsPricePolicy<'a> {
 }
 
 impl PriceCachePolicy {
-    fn from_refresh_flag(refresh_prices: bool) -> Self {
-        if refresh_prices {
-            Self::Refresh
-        } else {
-            Self::UseFreshCacheIfAvailable
-        }
-    }
-
     fn allows_cache_read(self) -> bool {
-        matches!(self, Self::UseFreshCacheIfAvailable)
+        matches!(
+            self,
+            Self::UseCacheOrFallback | Self::UseFreshCacheIfAvailable
+        )
     }
 }
 
@@ -151,17 +159,24 @@ pub(super) fn load_price_book(
 ) -> PriceBook {
     if cache_policy.allows_cache_read() {
         if let Some(cache) = read_price_cache(paths) {
-            if cache.source_url == price_url
-                && unix_now().saturating_sub(cache.fetched_at) < PRICE_CACHE_TTL_SECONDS
-                && !cache.prices.is_empty()
-            {
-                return PriceBook {
-                    prices: cache.prices,
-                    token_mix,
-                    source: format!("cache: {price_url}"),
-                    note: price_estimate_note(token_mix, token_mix_source),
-                };
+            if cache.source_url == price_url && !cache.prices.is_empty() {
+                let fresh = unix_now().saturating_sub(cache.fetched_at) < PRICE_CACHE_TTL_SECONDS;
+                if fresh || matches!(cache_policy, PriceCachePolicy::UseCacheOrFallback) {
+                    return PriceBook {
+                        prices: cache.prices,
+                        token_mix,
+                        source: format!("cache: {price_url}"),
+                        note: price_estimate_note(token_mix, token_mix_source),
+                    };
+                }
             }
+        }
+        if matches!(cache_policy, PriceCachePolicy::UseCacheOrFallback) {
+            return fallback_price_book(
+                token_mix,
+                token_mix_source,
+                "no fresh price cache; use --refresh-prices to update",
+            );
         }
     }
 
@@ -387,6 +402,7 @@ mod tests {
             uncached_input_tokens: 10,
             cached_input_tokens: 80,
             output_tokens: 10,
+            reasoning_output_tokens: 0,
         };
 
         let cost = book

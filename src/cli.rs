@@ -1,10 +1,13 @@
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use anyhow::Result;
 use clap::Args;
 use clap::Parser;
 use clap::Subcommand;
 use clap::ValueEnum;
+use time::macros::format_description;
+use time::Date;
 
 use crate::paths::ManagerPaths;
 
@@ -71,6 +74,110 @@ pub enum StatusSort {
     Score,
     /// Preserve rotation.txt or explicit argument order.
     Rotation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatsRange {
+    raw: String,
+    kind: StatsRangeKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatsRangeKind {
+    All,
+    LastDays(u32),
+    Since(Date),
+    Between { start: Date, end: Date },
+}
+
+impl StatsRange {
+    pub fn key(&self) -> &str {
+        &self.raw
+    }
+
+    pub fn kind(&self) -> &StatsRangeKind {
+        &self.kind
+    }
+
+    pub fn label(&self) -> String {
+        match &self.kind {
+            StatsRangeKind::All => "All time".to_string(),
+            StatsRangeKind::LastDays(days) => format!("Last {days} days"),
+            StatsRangeKind::Since(date) => format!("Since {date}"),
+            StatsRangeKind::Between { start, end } => format!("{start} to {end}"),
+        }
+    }
+}
+
+impl FromStr for StatsRange {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        let raw = value.trim();
+        if raw.is_empty() {
+            return Err("range cannot be empty".to_string());
+        }
+        let normalized = raw.to_ascii_lowercase();
+        if normalized == "all" {
+            return Ok(Self {
+                raw: "all".to_string(),
+                kind: StatsRangeKind::All,
+            });
+        }
+        if let Some(days) = parse_relative_days(&normalized) {
+            return Ok(Self {
+                raw: normalized,
+                kind: StatsRangeKind::LastDays(days),
+            });
+        }
+        if let Some((start, end)) = raw.split_once("..") {
+            let start = parse_stats_date(start.trim())?;
+            let end = parse_stats_date(end.trim())?;
+            return Ok(Self {
+                raw: format!("{start}..{end}"),
+                kind: StatsRangeKind::Between { start, end },
+            });
+        }
+        if let Ok(date) = parse_stats_date(raw) {
+            return Ok(Self {
+                raw: date.to_string(),
+                kind: StatsRangeKind::Since(date),
+            });
+        }
+        Err("range must be all, Nd/Nw/Nm/Ny, YYYY-MM-DD, or YYYY-MM-DD..YYYY-MM-DD".to_string())
+    }
+}
+
+fn parse_relative_days(value: &str) -> Option<u32> {
+    let value = value
+        .strip_prefix("last-")
+        .or_else(|| value.strip_prefix("last"))
+        .unwrap_or(value)
+        .strip_suffix("-days")
+        .or_else(|| value.strip_suffix("days"))
+        .or_else(|| value.strip_suffix("-day"))
+        .or_else(|| value.strip_suffix("day"))
+        .unwrap_or(value);
+    if value.chars().all(|ch| ch.is_ascii_digit()) {
+        return value.parse::<u32>().ok().filter(|days| *days > 0);
+    }
+    let (number, unit) = value.split_at(value.find(|ch: char| !ch.is_ascii_digit())?);
+    let number = number.parse::<u32>().ok()?;
+    if number == 0 {
+        return None;
+    }
+    match unit {
+        "d" => Some(number),
+        "w" => number.checked_mul(7),
+        "m" => number.checked_mul(30),
+        "y" => number.checked_mul(365),
+        _ => None,
+    }
+}
+
+fn parse_stats_date(value: &str) -> std::result::Result<Date, String> {
+    Date::parse(value, format_description!("[year]-[month]-[day]"))
+        .map_err(|_| format!("invalid date `{value}`; expected YYYY-MM-DD"))
 }
 
 #[derive(Debug, Clone, Args)]
@@ -160,7 +267,7 @@ pub struct StatsArgs {
     #[arg(long)]
     pub by_slot: bool,
 
-    /// Include best-effort OpenAI API price estimates.
+    /// Include best-effort OpenAI API price estimates. Human output enables this by default.
     #[arg(long)]
     pub price: bool,
 
@@ -179,6 +286,10 @@ pub struct StatsArgs {
     /// Include price estimates from this pricing page.
     #[arg(long, value_hint = clap::ValueHint::Url)]
     pub price_url: Option<String>,
+
+    /// Time range used by the chart and model mix: all, 17d, 2w, 3m, YYYY-MM-DD, or YYYY-MM-DD..YYYY-MM-DD.
+    #[arg(long, default_value = "all", value_name = "RANGE")]
+    pub range: StatsRange,
 
     /// Slot names to filter. Defaults to all known local Codex usage.
     pub slots: Vec<String>,
@@ -219,6 +330,24 @@ mod tests {
             panic!("expected status command");
         };
         assert_eq!(args.query.target, Some(String::from("work")));
+    }
+
+    #[test]
+    fn stats_range_accepts_dynamic_relative_days() {
+        let cli = Cli::parse_from(["cx", "stats", "--range", "17d"]);
+
+        let Command::Stats(args) = cli.command else {
+            panic!("expected stats command");
+        };
+        assert_eq!(args.range.key(), "17d");
+        assert_eq!(args.range.label(), "Last 17 days");
+    }
+
+    #[test]
+    fn stats_range_rejects_invalid_calendar_dates() {
+        let result = Cli::try_parse_from(["cx", "stats", "--range", "2026-02-31"]);
+
+        assert!(result.is_err());
     }
 
     #[test]

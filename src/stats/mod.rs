@@ -9,8 +9,10 @@ use anyhow::Result;
 use rusqlite::Connection;
 use serde::Deserialize;
 use serde::Serialize;
+use time::OffsetDateTime;
 
 use crate::cli::StatsArgs;
+use crate::cli::StatsRange;
 use crate::paths::ManagerPaths;
 
 mod calibration;
@@ -41,6 +43,7 @@ const FALLBACK_TOKEN_MIX: TokenMix = TokenMix {
 pub struct StatsReport {
     pub json: bool,
     pub by_slot: bool,
+    pub range: StatsRange,
     pub source_databases: Vec<String>,
     pub period_basis: String,
     pub price_source: Option<String>,
@@ -48,6 +51,7 @@ pub struct StatsReport {
     pub token_mix: Option<TokenMix>,
     pub token_mix_source: Option<String>,
     pub periods: Vec<PeriodUsage>,
+    pub daily: Vec<DailyUsage>,
 }
 
 impl StatsReport {
@@ -105,6 +109,38 @@ pub struct PeriodUsage {
 }
 
 #[derive(Debug, Clone)]
+pub struct DailyUsage {
+    pub date: String,
+    pub threads: u64,
+    pub tokens: u64,
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_output_tokens: u64,
+    pub uncategorized_tokens: u64,
+    pub estimated_cost_usd: Option<f64>,
+    pub priced_tokens: u64,
+    pub unpriced_tokens: u64,
+    pub models: Vec<DailyModelUsage>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DailyModelUsage {
+    pub provider: String,
+    pub model: String,
+    pub threads: u64,
+    pub tokens: u64,
+    pub input_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub output_tokens: u64,
+    pub reasoning_output_tokens: u64,
+    pub uncategorized_tokens: u64,
+    pub estimated_cost_usd: Option<f64>,
+    pub priced_tokens: u64,
+    pub unpriced_tokens: u64,
+}
+
+#[derive(Debug, Clone)]
 pub struct NamedUsage {
     pub name: String,
     pub threads: u64,
@@ -149,6 +185,7 @@ struct TokenTotals {
     uncached_input_tokens: u64,
     cached_input_tokens: u64,
     output_tokens: u64,
+    reasoning_output_tokens: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -172,6 +209,27 @@ struct PeriodAccumulator {
     total: UsageAccumulator,
     slots: BTreeMap<String, UsageAccumulator>,
     models: BTreeMap<ModelKey, UsageAccumulator>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DailyReportAccumulator {
+    min_since: i64,
+    days: BTreeMap<String, DailyAccumulator>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DailyAccumulator {
+    total: DailyTokenAccumulator,
+    models: BTreeMap<ModelKey, DailyTokenAccumulator>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DailyTokenAccumulator {
+    threads: u64,
+    totals: TokenTotals,
+    priced_tokens: u64,
+    unpriced_tokens: u64,
+    estimated_cost_usd: Option<f64>,
 }
 
 pub fn collect_report(paths: &ManagerPaths, args: StatsArgs) -> Result<StatsReport> {
@@ -203,6 +261,7 @@ pub fn collect_report(paths: &ManagerPaths, args: StatsArgs) -> Result<StatsRepo
         .into_iter()
         .map(PeriodAccumulator::new)
         .collect::<Vec<_>>();
+    let mut daily = DailyReportAccumulator::new(min_since);
     let mut seen_threads = HashSet::new();
 
     for db_path in &db_paths {
@@ -213,7 +272,7 @@ pub fn collect_report(paths: &ManagerPaths, args: StatsArgs) -> Result<StatsRepo
             if !seen_threads.insert(usage.id.clone()) {
                 continue;
             }
-            add_thread_usage(&mut accumulators, price_book.as_ref(), &usage);
+            add_thread_usage(&mut accumulators, &mut daily, price_book.as_ref(), &usage);
         }
     }
 
@@ -223,6 +282,7 @@ pub fn collect_report(paths: &ManagerPaths, args: StatsArgs) -> Result<StatsRepo
     Ok(StatsReport {
         json: args.json,
         by_slot: args.by_slot,
+        range: args.range,
         source_databases: db_paths
             .iter()
             .map(|path| path.display().to_string())
@@ -238,6 +298,7 @@ pub fn collect_report(paths: &ManagerPaths, args: StatsArgs) -> Result<StatsRepo
             .into_iter()
             .map(PeriodAccumulator::into_usage)
             .collect(),
+        daily: daily.into_usage(),
     })
 }
 
@@ -308,12 +369,14 @@ impl PeriodAccumulator {
 
 fn add_thread_usage(
     accumulators: &mut [PeriodAccumulator],
+    daily: &mut DailyReportAccumulator,
     price_book: Option<&PriceBook>,
     usage: &ThreadUsage,
 ) {
     if usage.rollout_path.exists() {
         if let Ok(events) = rollout::read_token_usage_events(&usage.rollout_path) {
             if !events.is_empty() {
+                daily.add_events(usage, price_book, &events);
                 for accumulator in accumulators.iter_mut() {
                     let mut totals = TokenTotals::default();
                     for event in &events {
@@ -334,6 +397,7 @@ fn add_thread_usage(
     }
 
     let cost = price_book.and_then(|book| estimate_thread_cost(book, usage));
+    daily.add_fallback_thread(usage, cost);
     for accumulator in accumulators.iter_mut() {
         if usage.updated_at >= accumulator.period.since_unix {
             accumulator.add(usage, usage.tokens, cost);
@@ -374,6 +438,9 @@ impl TokenTotals {
                 .cached_input_tokens
                 .saturating_sub(previous.cached_input_tokens),
             output_tokens: self.output_tokens.saturating_sub(previous.output_tokens),
+            reasoning_output_tokens: self
+                .reasoning_output_tokens
+                .saturating_sub(previous.reasoning_output_tokens),
         }
     }
 
@@ -383,6 +450,7 @@ impl TokenTotals {
         self.uncached_input_tokens += usage.uncached_input_tokens;
         self.cached_input_tokens += usage.cached_input_tokens;
         self.output_tokens += usage.output_tokens;
+        self.reasoning_output_tokens += usage.reasoning_output_tokens;
     }
 
     fn token_mix(&self) -> TokenMix {
@@ -397,6 +465,181 @@ impl TokenTotals {
             output_share: self.output_tokens as f64 / denominator as f64,
         }
     }
+}
+
+impl DailyReportAccumulator {
+    fn new(min_since: i64) -> Self {
+        Self {
+            min_since,
+            days: BTreeMap::new(),
+        }
+    }
+
+    fn add_events(
+        &mut self,
+        usage: &ThreadUsage,
+        price_book: Option<&PriceBook>,
+        events: &[rollout::TokenUsageEvent],
+    ) {
+        let mut by_day = BTreeMap::<String, TokenTotals>::new();
+        for event in events {
+            if event.timestamp_unix < self.min_since {
+                continue;
+            }
+            if let Some(date) = utc_date_key(event.timestamp_unix) {
+                by_day.entry(date).or_default().add(event.totals.clone());
+            }
+        }
+
+        for (date, totals) in by_day {
+            if totals.total_tokens == 0 {
+                continue;
+            }
+            let cost = price_book.and_then(|book| {
+                book.estimate_token_totals_cost(&usage.provider, &usage.model, &totals)
+            });
+            self.add_totals(&date, usage, &totals, cost);
+        }
+    }
+
+    fn add_fallback_thread(&mut self, usage: &ThreadUsage, cost: Option<f64>) {
+        if usage.tokens == 0 || usage.updated_at < self.min_since {
+            return;
+        }
+        let totals = TokenTotals {
+            samples: 1,
+            total_tokens: usage.tokens,
+            ..TokenTotals::default()
+        };
+        if let Some(date) = utc_date_key(usage.updated_at) {
+            self.add_totals(&date, usage, &totals, cost);
+        }
+    }
+
+    fn add_totals(
+        &mut self,
+        date: &str,
+        usage: &ThreadUsage,
+        totals: &TokenTotals,
+        cost: Option<f64>,
+    ) {
+        let day = self.days.entry(date.to_string()).or_default();
+        day.total.add(totals, cost);
+        day.models
+            .entry(ModelKey {
+                provider: usage.provider.clone(),
+                model: usage.model.clone(),
+            })
+            .or_default()
+            .add(totals, cost);
+    }
+
+    fn into_usage(self) -> Vec<DailyUsage> {
+        self.days
+            .into_iter()
+            .map(|(date, day)| day.into_usage(date))
+            .collect()
+    }
+}
+
+impl DailyAccumulator {
+    fn into_usage(self, date: String) -> DailyUsage {
+        let mut models = self
+            .models
+            .into_iter()
+            .map(|(key, usage)| usage.into_model(key))
+            .collect::<Vec<_>>();
+        models.sort_by(|left, right| {
+            right
+                .tokens
+                .cmp(&left.tokens)
+                .then_with(|| left.provider.cmp(&right.provider))
+                .then_with(|| left.model.cmp(&right.model))
+        });
+
+        let usage = self.total.into_parts();
+        DailyUsage {
+            date,
+            threads: usage.threads,
+            tokens: usage.tokens,
+            input_tokens: usage.input_tokens,
+            cached_input_tokens: usage.cached_input_tokens,
+            output_tokens: usage.output_tokens,
+            reasoning_output_tokens: usage.reasoning_output_tokens,
+            uncategorized_tokens: usage.uncategorized_tokens,
+            estimated_cost_usd: usage.estimated_cost_usd,
+            priced_tokens: usage.priced_tokens,
+            unpriced_tokens: usage.unpriced_tokens,
+            models,
+        }
+    }
+}
+
+struct DailyUsageParts {
+    threads: u64,
+    tokens: u64,
+    input_tokens: u64,
+    cached_input_tokens: u64,
+    output_tokens: u64,
+    reasoning_output_tokens: u64,
+    uncategorized_tokens: u64,
+    estimated_cost_usd: Option<f64>,
+    priced_tokens: u64,
+    unpriced_tokens: u64,
+}
+
+impl DailyTokenAccumulator {
+    fn add(&mut self, totals: &TokenTotals, cost: Option<f64>) {
+        self.threads += 1;
+        self.totals.add(totals.clone());
+        if let Some(cost) = cost {
+            self.priced_tokens += totals.total_tokens;
+            self.estimated_cost_usd = Some(self.estimated_cost_usd.unwrap_or(0.0) + cost);
+        } else {
+            self.unpriced_tokens += totals.total_tokens;
+        }
+    }
+
+    fn into_parts(self) -> DailyUsageParts {
+        let input_tokens = self.totals.uncached_input_tokens + self.totals.cached_input_tokens;
+        let categorized_tokens = input_tokens + self.totals.output_tokens;
+        DailyUsageParts {
+            threads: self.threads,
+            tokens: self.totals.total_tokens,
+            input_tokens,
+            cached_input_tokens: self.totals.cached_input_tokens,
+            output_tokens: self.totals.output_tokens,
+            reasoning_output_tokens: self.totals.reasoning_output_tokens,
+            uncategorized_tokens: self.totals.total_tokens.saturating_sub(categorized_tokens),
+            estimated_cost_usd: self.estimated_cost_usd,
+            priced_tokens: self.priced_tokens,
+            unpriced_tokens: self.unpriced_tokens,
+        }
+    }
+
+    fn into_model(self, key: ModelKey) -> DailyModelUsage {
+        let usage = self.into_parts();
+        DailyModelUsage {
+            provider: key.provider,
+            model: key.model,
+            threads: usage.threads,
+            tokens: usage.tokens,
+            input_tokens: usage.input_tokens,
+            cached_input_tokens: usage.cached_input_tokens,
+            output_tokens: usage.output_tokens,
+            reasoning_output_tokens: usage.reasoning_output_tokens,
+            uncategorized_tokens: usage.uncategorized_tokens,
+            estimated_cost_usd: usage.estimated_cost_usd,
+            priced_tokens: usage.priced_tokens,
+            unpriced_tokens: usage.unpriced_tokens,
+        }
+    }
+}
+
+fn utc_date_key(timestamp_unix: i64) -> Option<String> {
+    OffsetDateTime::from_unix_timestamp(timestamp_unix)
+        .ok()
+        .map(|timestamp| timestamp.date().to_string())
 }
 
 impl TokenMix {
@@ -543,6 +786,19 @@ mod tests {
     #[test]
     fn stats_price_policy_defaults_to_local_only() {
         let args = parse_stats_args(&[]);
+
+        assert_eq!(
+            StatsPricePolicy::from_args(&args),
+            StatsPricePolicy::Enabled {
+                price_url: DEFAULT_PRICE_URL,
+                cache_policy: PriceCachePolicy::UseCacheOrFallback
+            }
+        );
+    }
+
+    #[test]
+    fn stats_price_policy_json_defaults_to_token_only() {
+        let args = parse_stats_args(&["--json"]);
 
         assert_eq!(
             StatsPricePolicy::from_args(&args),
@@ -714,6 +970,7 @@ mod tests {
             uncached_input_tokens: 100,
             cached_input_tokens: 900,
             output_tokens: 50,
+            reasoning_output_tokens: 0,
         });
 
         let mix = totals.token_mix();

@@ -5,6 +5,8 @@ use std::path::Path;
 
 use anyhow::Context;
 use anyhow::Result;
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 
 use super::TokenTotals;
 
@@ -84,11 +86,16 @@ fn parse_token_totals(value: &serde_json::Value) -> Option<TokenTotals> {
     let input_tokens = usage.get("input_tokens")?.as_u64()?;
     let cached_input_tokens = usage
         .get("cached_input_tokens")
+        .or_else(|| usage.get("cache_read_input_tokens"))
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0)
         .min(input_tokens);
     let output_tokens = usage
         .get("output_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let reasoning_output_tokens = usage
+        .get("reasoning_output_tokens")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
     let total_tokens = usage
@@ -102,48 +109,14 @@ fn parse_token_totals(value: &serde_json::Value) -> Option<TokenTotals> {
         uncached_input_tokens: input_tokens - cached_input_tokens,
         cached_input_tokens,
         output_tokens,
+        reasoning_output_tokens,
     })
 }
 
 fn parse_utc_timestamp(value: &str) -> Option<i64> {
-    if value.len() < 20
-        || value.as_bytes().get(4) != Some(&b'-')
-        || value.as_bytes().get(7) != Some(&b'-')
-        || value.as_bytes().get(10) != Some(&b'T')
-        || value.as_bytes().get(13) != Some(&b':')
-        || value.as_bytes().get(16) != Some(&b':')
-    {
-        return None;
-    }
-    let year = parse_digits(value, 0, 4)? as i64;
-    let month = parse_digits(value, 5, 7)? as i64;
-    let day = parse_digits(value, 8, 10)? as i64;
-    let hour = parse_digits(value, 11, 13)? as i64;
-    let minute = parse_digits(value, 14, 16)? as i64;
-    let second = parse_digits(value, 17, 19)? as i64;
-    if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || hour > 23
-        || minute > 59
-        || second > 60
-    {
-        return None;
-    }
-    Some(days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second)
-}
-
-fn parse_digits(value: &str, start: usize, end: usize) -> Option<u32> {
-    value.get(start..end)?.parse().ok()
-}
-
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let year = year - i64::from(month <= 2);
-    let era = if year >= 0 { year } else { year - 399 } / 400;
-    let year_of_era = year - era * 400;
-    let month_prime = month + if month > 2 { -3 } else { 9 };
-    let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    era * 146_097 + day_of_era - 719_468
+    OffsetDateTime::parse(value, &Rfc3339)
+        .ok()
+        .map(|timestamp| timestamp.unix_timestamp())
 }
 
 #[cfg(test)]
@@ -157,6 +130,11 @@ mod tests {
             parse_utc_timestamp("2026-05-04T12:34:56.789Z"),
             Some(1_777_898_096)
         );
+        assert_eq!(
+            parse_utc_timestamp("2026-05-04T08:34:56.789-04:00"),
+            Some(1_777_898_096)
+        );
+        assert_eq!(parse_utc_timestamp("2026-02-31T00:00:00Z"), None);
     }
 
     #[test]
@@ -178,5 +156,18 @@ mod tests {
         assert_eq!(duplicate_delta.total_tokens, 0);
         assert_eq!(next_delta.total_tokens, 60);
         assert_eq!(next_delta.cached_input_tokens, 40);
+    }
+
+    #[test]
+    fn token_usage_parses_cache_read_alias_and_reasoning() {
+        let line = r#"{"timestamp":"1970-01-01T00:00:10.000Z","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cache_read_input_tokens":25,"output_tokens":10,"reasoning_output_tokens":4,"total_tokens":110}}}}"#;
+
+        let usage = parse_token_count_line(line).expect("token_count line");
+
+        assert_eq!(usage.uncached_input_tokens, 75);
+        assert_eq!(usage.cached_input_tokens, 25);
+        assert_eq!(usage.output_tokens, 10);
+        assert_eq!(usage.reasoning_output_tokens, 4);
+        assert_eq!(usage.total_tokens, 110);
     }
 }

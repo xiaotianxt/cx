@@ -20,6 +20,8 @@ wrappers with a single Rust binary.
   rollout calibration, pricing/cache handling, and aggregation.
 - `envfile`: small parser/writer for `env.conf`.
 - `install`: copy the current `cx` binary into a bin directory.
+- `upgrade`: one-time startup repairs for profile-manager layouts created by
+  already-published versions. See [Startup Upgrade Repairs](upgrades.md).
 
 ## Usage Endpoint
 

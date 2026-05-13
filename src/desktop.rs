@@ -50,6 +50,7 @@ pub fn launch(args: DesktopArgs) -> Result<()> {
     ensure_desktop_not_running(args.allow_parallel)?;
 
     let paths = ManagerPaths::new(args.manager_dir.clone())?;
+    crate::upgrade::run_startup(&paths)?;
     let runtime = run::select_runtime(
         &paths,
         args.slot.as_deref(),

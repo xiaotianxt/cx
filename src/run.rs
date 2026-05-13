@@ -166,6 +166,7 @@ impl CodexCommandSpec {
 pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
     let options = parse_run_args(args)?;
     let paths = ManagerPaths::new(options.manager_dir.clone())?;
+    crate::upgrade::run_startup(&paths)?;
     let real_codex = resolve_codex_bin(options.codex_bin.as_deref())?;
 
     if std::env::var_os("CODEX_HOME").is_some()

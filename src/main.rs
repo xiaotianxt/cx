@@ -14,6 +14,7 @@ mod slot;
 mod stats;
 mod target;
 mod transfer;
+mod upgrade;
 mod usage;
 
 use std::process::ExitCode;
@@ -49,6 +50,7 @@ fn entry() -> Result<()> {
     match cli.command {
         Command::Status(args) => {
             let paths = paths::ManagerPaths::new(args.query.manager_dir.clone())?;
+            upgrade::run_startup(&paths)?;
             let slots = args.slots_or_rotation(&paths)?;
             let mut results = selector::query_slots(&paths, &slots, args.query.timeout)?;
             match args.sort {
@@ -60,6 +62,7 @@ fn entry() -> Result<()> {
         }
         Command::Stats(args) => {
             let paths = paths::ManagerPaths::new(args.manager_dir.clone())?;
+            upgrade::run_startup(&paths)?;
             let mut args = args;
             if let Some(target_name) = args.target.as_deref().filter(|_| args.slots.is_empty()) {
                 args.slots = target::load_target(&paths, target_name)?.slots_or_rotation(&paths)?;
@@ -74,6 +77,7 @@ fn entry() -> Result<()> {
         }
         Command::Select(args) => {
             let paths = paths::ManagerPaths::new(args.manager_dir.clone())?;
+            upgrade::run_startup(&paths)?;
             let slots = args.slots_or_rotation(&paths)?;
             let results = selector::query_slots(&paths, &slots, args.timeout)?;
             let selected = selector::choose_result(&results);
@@ -88,14 +92,17 @@ fn entry() -> Result<()> {
         }
         Command::Add(args) => {
             let paths = paths::ManagerPaths::new(args.manager_dir.clone())?;
+            upgrade::run_startup(&paths)?;
             slot::add_slot(&paths, args)?;
         }
         Command::Remove(args) => {
             let paths = paths::ManagerPaths::new(args.manager_dir.clone())?;
+            upgrade::run_startup(&paths)?;
             slot::remove_slot(&paths, args)?;
         }
         Command::Login(args) => {
             let paths = paths::ManagerPaths::new(args.manager_dir.clone())?;
+            upgrade::run_startup(&paths)?;
             slot::ensure_slot_layout(&paths, &args.slot)?;
             run::exec_slot_login(&paths, args)?;
         }
@@ -103,22 +110,33 @@ fn entry() -> Result<()> {
             desktop::launch(args)?;
         }
         Command::Transfer(args) => match args.command {
-            TransferCommand::Export(args) => transfer::export(args)?,
-            TransferCommand::Import(args) => transfer::import(args)?,
+            TransferCommand::Export(args) => {
+                let paths = paths::ManagerPaths::new(args.manager_dir.clone())?;
+                upgrade::run_startup(&paths)?;
+                transfer::export_with_paths(&paths, args)?
+            }
+            TransferCommand::Import(args) => {
+                let paths = paths::ManagerPaths::new(args.manager_dir.clone())?;
+                upgrade::run_startup(&paths)?;
+                transfer::import_with_paths(&paths, args)?
+            }
         },
         Command::Target(args) => match args.command {
             TargetCommand::List(args) => {
                 let paths = paths::ManagerPaths::new(args.manager_dir)?;
+                upgrade::run_startup(&paths)?;
                 let targets = target::list_targets(&paths)?;
                 output::print_targets(&targets, args.json)?;
             }
             TargetCommand::Show(args) => {
                 let paths = paths::ManagerPaths::new(args.manager_dir)?;
+                upgrade::run_startup(&paths)?;
                 let target = target::load_target(&paths, &args.target)?;
                 output::print_target(&target, args.json)?;
             }
             TargetCommand::Add(args) => {
                 let paths = paths::ManagerPaths::new(args.manager_dir)?;
+                upgrade::run_startup(&paths)?;
                 target::save_target(
                     &paths,
                     target::TargetInput {
@@ -133,6 +151,7 @@ fn entry() -> Result<()> {
             }
             TargetCommand::Remove(args) => {
                 let paths = paths::ManagerPaths::new(args.manager_dir)?;
+                upgrade::run_startup(&paths)?;
                 if target::remove_target(&paths, &args.target)? {
                     println!("removed target: {}", args.target);
                 } else {
@@ -142,6 +161,7 @@ fn entry() -> Result<()> {
         },
         Command::Doctor(args) => {
             let paths = paths::ManagerPaths::new(args.manager_dir)?;
+            upgrade::run_startup(&paths)?;
             let slots = slot::load_rotation(&paths)?;
             output::print_doctor(&paths, &slots)?;
             if args.online {

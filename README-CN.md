@@ -270,6 +270,14 @@ export DEEPSEEK_API_KEY="sk-..."
 - `CX_SLOT_DEBUG`：启动前打印 slot 选择详情。
 - `CX_DEBUG`：打印 stdin pipe 包装调试信息。
 - `CX_BIN`：指定 cx 自身路径，主要用于测试或非标准安装。
+- `CX_DISABLE_STARTUP_REPAIR`：跳过启动时 profile 修复，仅用于调试损坏的本地 profile。
+
+## 升级
+
+cx 会针对已经公开发布过的版本创建的一次性 profile-manager 布局问题做启动修复。
+当前修复覆盖 stats cache schema、slot sqlite 位置，以及 `v0.4.1` 之前移除运行时留下的状态。
+
+公开版本范围和具体修复行为见 [Startup Upgrade Repairs](docs/upgrades.md)。
 
 ## 开发
 

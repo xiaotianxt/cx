@@ -296,6 +296,17 @@ target files with secret env values, `auth.json`, or real `env.conf` values.
 - `CX_DEBUG`: print stdin-wrapper diagnostics.
 - `CX_BIN`: path to the cx binary, mostly useful for tests and non-standard
   installs.
+- `CX_DISABLE_STARTUP_REPAIR`: skip startup profile repair. Intended only for
+  debugging a broken local profile.
+
+## Upgrades
+
+cx runs one-time startup repairs for profile-manager layouts created by already
+published versions. The current repair covers stats cache schemas, slot sqlite
+placement, and removed runtime state from tags through `v0.4.1`.
+
+See [Startup Upgrade Repairs](docs/upgrades.md) for the public version matrix
+and repair behavior.
 
 ## Development
 

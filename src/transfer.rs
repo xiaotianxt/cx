@@ -61,12 +61,11 @@ struct TransferManifest {
     manager_items: Vec<String>,
 }
 
-pub fn export(args: TransferExportArgs) -> Result<()> {
-    let paths = ManagerPaths::new(args.manager_dir.clone())?;
+pub fn export_with_paths(paths: &ManagerPaths, args: TransferExportArgs) -> Result<()> {
     let output_dir = absolute_path(&args.out)?;
-    ensure_export_destination(&paths, &output_dir, args.replace)?;
+    ensure_export_destination(paths, &output_dir, args.replace)?;
 
-    let slots = export_slots(&paths, &args.slots)?;
+    let slots = export_slots(paths, &args.slots)?;
     let bundle = TransferBundle::new(output_dir);
     fs::create_dir_all(bundle.base_dir()).with_context(|| {
         format!(
@@ -89,7 +88,7 @@ pub fn export(args: TransferExportArgs) -> Result<()> {
         true,
     )?;
     write_export_rotation(bundle.profile_manager_dir(), &slots)?;
-    export_slots_to_bundle(&paths, &bundle, &slots)?;
+    export_slots_to_bundle(paths, &bundle, &slots)?;
     write_manifest(&bundle, &slots, base_items, manager_items)?;
 
     println!("exported transfer bundle: {}", bundle.root.display());
@@ -98,15 +97,14 @@ pub fn export(args: TransferExportArgs) -> Result<()> {
     Ok(())
 }
 
-pub fn import(args: TransferImportArgs) -> Result<()> {
-    let paths = ManagerPaths::new(args.manager_dir.clone())?;
+pub fn import_with_paths(paths: &ManagerPaths, args: TransferImportArgs) -> Result<()> {
     let bundle = TransferBundle::new(absolute_path(&args.bundle)?);
     let manifest = read_manifest(&bundle)?;
     validate_manifest(&manifest)?;
     validate_bundle_sources(&bundle, &manifest)?;
 
     if !args.replace {
-        preflight_import(&paths, &bundle, &manifest)?;
+        preflight_import(paths, &bundle, &manifest)?;
     }
 
     fs::create_dir_all(&paths.base_codex_home)
@@ -126,7 +124,8 @@ pub fn import(args: TransferImportArgs) -> Result<()> {
         MANAGER_ITEMS,
         args.replace,
     )?;
-    import_slots_from_bundle(&paths, &bundle, &manifest.slots, args.replace)?;
+    import_slots_from_bundle(paths, &bundle, &manifest.slots, args.replace)?;
+    crate::upgrade::run_after_import(paths)?;
 
     println!("imported transfer bundle: {}", bundle.root.display());
     println!("slots: {}", manifest.slots.join(", "));

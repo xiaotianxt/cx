@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::io::IsTerminal;
-use std::io::Read;
 use std::io::Write;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -34,6 +33,11 @@ const DAILY_BAR_CHART_HEIGHT: usize = 8;
 const MAX_DAILY_CHART_WIDTH: usize = 60;
 const MAX_SELECTED_DAYS: usize = 3_660;
 const MODEL_MIX_LIMIT: usize = 6;
+const WIDE_STATS_LAYOUT_MIN_COLUMNS: usize = 112;
+const WIDE_STATS_MODEL_MIN_COLUMNS: usize = 36;
+const INTERACTIVE_STATS_FOOTER: &str = "q quit · +/- range · a all · 7 last 7d · 3 last 30d";
+#[cfg(unix)]
+const ESC_SEQUENCE_TIMEOUT_MS: i32 = 100;
 const MODEL_COLORS: [(u8, u8, u8); 12] = [
     (124, 156, 255),
     (40, 209, 124),
@@ -420,25 +424,386 @@ fn should_run_interactive_stats() -> bool {
 #[cfg(unix)]
 fn print_stats_interactive(mut report: StatsReport) -> Result<()> {
     let _terminal = TerminalMode::enter()?;
+    let mut scroll_offset = 0;
     loop {
-        print!("\x1b[2J\x1b[H");
-        print_stats_static(&report);
-        println!("q quit · +/- range · a all · 7 last 7d · 3 last 30d");
-        std::io::stdout().flush()?;
+        let frame = print_interactive_stats_screen(&report, scroll_offset)?;
+        scroll_offset = frame.scroll_offset;
 
-        let mut key = [0_u8; 1];
-        std::io::stdin().read_exact(&mut key)?;
-        match key[0] {
-            b'q' | 0x1b => break,
-            b'+' | b'=' => report.range = zoom_stats_range(&report.range, ZoomDirection::In),
-            b'-' | b'_' => report.range = zoom_stats_range(&report.range, ZoomDirection::Out),
-            b'a' | b'A' => report.range = "all".parse().expect("valid built-in stats range"),
-            b'7' => report.range = "7d".parse().expect("valid built-in stats range"),
-            b'3' => report.range = "30d".parse().expect("valid built-in stats range"),
-            _ => {}
+        match read_interactive_stats_key()? {
+            InteractiveStatsKey::Quit => break,
+            InteractiveStatsKey::ZoomIn => {
+                report.range = zoom_stats_range(&report.range, ZoomDirection::In);
+                scroll_offset = 0;
+            }
+            InteractiveStatsKey::ZoomOut => {
+                report.range = zoom_stats_range(&report.range, ZoomDirection::Out);
+                scroll_offset = 0;
+            }
+            InteractiveStatsKey::All => {
+                report.range = "all".parse().expect("valid built-in stats range");
+                scroll_offset = 0;
+            }
+            InteractiveStatsKey::Last7 => {
+                report.range = "7d".parse().expect("valid built-in stats range");
+                scroll_offset = 0;
+            }
+            InteractiveStatsKey::Last30 => {
+                report.range = "30d".parse().expect("valid built-in stats range");
+                scroll_offset = 0;
+            }
+            InteractiveStatsKey::ScrollUp => scroll_offset = scroll_offset.saturating_sub(1),
+            InteractiveStatsKey::ScrollDown => {
+                scroll_offset = scroll_offset.saturating_add(1).min(frame.max_scroll);
+            }
+            InteractiveStatsKey::PageUp => {
+                scroll_offset = scroll_offset.saturating_sub(frame.page_step());
+            }
+            InteractiveStatsKey::PageDown => {
+                scroll_offset = scroll_offset
+                    .saturating_add(frame.page_step())
+                    .min(frame.max_scroll);
+            }
+            InteractiveStatsKey::Home => scroll_offset = 0,
+            InteractiveStatsKey::End => scroll_offset = frame.max_scroll,
+            InteractiveStatsKey::Ignored => {}
         }
     }
     Ok(())
+}
+
+#[cfg(unix)]
+fn print_interactive_stats_screen(
+    report: &StatsReport,
+    scroll_offset: usize,
+) -> Result<InteractiveStatsFrame> {
+    let viewport = terminal_size();
+    let frame = interactive_display_lines(report, viewport, scroll_offset);
+    let mut output = String::from("\x1b[H\x1b[2J");
+    for (index, line) in frame.lines.iter().enumerate() {
+        if index > 0 {
+            output.push_str("\r\n");
+        }
+        output.push_str(line);
+    }
+    let mut stdout = std::io::stdout();
+    stdout.write_all(output.as_bytes())?;
+    stdout.flush()?;
+    Ok(frame)
+}
+
+#[derive(Debug, Clone)]
+struct InteractiveStatsFrame {
+    lines: Vec<String>,
+    scroll_offset: usize,
+    max_scroll: usize,
+    content_rows: usize,
+}
+
+impl InteractiveStatsFrame {
+    fn page_step(&self) -> usize {
+        self.content_rows.saturating_sub(1).max(1)
+    }
+}
+
+fn interactive_display_lines(
+    report: &StatsReport,
+    viewport: TerminalSize,
+    scroll_offset: usize,
+) -> InteractiveStatsFrame {
+    let columns = viewport.render_columns();
+    let rows = viewport.rows.max(1);
+    let content_rows = rows.saturating_sub(1);
+    let content = interactive_stats_lines(report, viewport);
+    let max_scroll = content.len().saturating_sub(content_rows);
+    let scroll_offset = scroll_offset.min(max_scroll);
+    let mut lines = content
+        .iter()
+        .skip(scroll_offset)
+        .take(content_rows)
+        .cloned()
+        .collect::<Vec<_>>();
+    while lines.len() < content_rows {
+        lines.push(String::new());
+    }
+
+    let footer = interactive_stats_footer(scroll_offset, max_scroll, content_rows, content.len());
+    lines.push(footer);
+    let lines = lines
+        .into_iter()
+        .map(|line| truncate_ansi_line(&line, columns))
+        .collect();
+    InteractiveStatsFrame {
+        lines,
+        scroll_offset,
+        max_scroll,
+        content_rows,
+    }
+}
+
+fn interactive_stats_footer(
+    scroll_offset: usize,
+    max_scroll: usize,
+    content_rows: usize,
+    total_rows: usize,
+) -> String {
+    if max_scroll == 0 {
+        return INTERACTIVE_STATS_FOOTER.to_string();
+    }
+    let start = scroll_offset.saturating_add(1).min(total_rows);
+    let end = scroll_offset
+        .saturating_add(content_rows)
+        .min(total_rows)
+        .max(start);
+    format!("Rows {start}-{end}/{total_rows} · ↑/↓ scroll · {INTERACTIVE_STATS_FOOTER}")
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InteractiveStatsKey {
+    Quit,
+    ZoomIn,
+    ZoomOut,
+    All,
+    Last7,
+    Last30,
+    ScrollUp,
+    ScrollDown,
+    PageUp,
+    PageDown,
+    Home,
+    End,
+    Ignored,
+}
+
+#[cfg(unix)]
+fn read_interactive_stats_key() -> Result<InteractiveStatsKey> {
+    let stdin = std::io::stdin();
+    let fd = stdin.as_raw_fd();
+    let first = read_stdin_byte(fd)?;
+    let key = match first {
+        b'q' | b'Q' => InteractiveStatsKey::Quit,
+        b'+' | b'=' => InteractiveStatsKey::ZoomIn,
+        b'-' | b'_' => InteractiveStatsKey::ZoomOut,
+        b'a' | b'A' => InteractiveStatsKey::All,
+        b'7' => InteractiveStatsKey::Last7,
+        b'3' => InteractiveStatsKey::Last30,
+        b'k' | b'K' => InteractiveStatsKey::ScrollUp,
+        b'j' | b'J' => InteractiveStatsKey::ScrollDown,
+        b'b' | b'B' => InteractiveStatsKey::PageUp,
+        b' ' | b'f' | b'F' => InteractiveStatsKey::PageDown,
+        b'g' => InteractiveStatsKey::Home,
+        b'G' => InteractiveStatsKey::End,
+        0x1b => read_escape_key(fd)?,
+        _ => InteractiveStatsKey::Ignored,
+    };
+    Ok(key)
+}
+
+#[cfg(unix)]
+fn read_escape_key(fd: i32) -> Result<InteractiveStatsKey> {
+    let Some(introducer) = read_stdin_byte_timeout(fd, ESC_SEQUENCE_TIMEOUT_MS)? else {
+        return Ok(InteractiveStatsKey::Quit);
+    };
+    match introducer {
+        b'[' => read_csi_key(fd),
+        b'O' => read_ss3_key(fd),
+        _ => Ok(InteractiveStatsKey::Ignored),
+    }
+}
+
+#[cfg(unix)]
+fn read_csi_key(fd: i32) -> Result<InteractiveStatsKey> {
+    let mut sequence = Vec::new();
+    for _ in 0..16 {
+        let Some(byte) = read_stdin_byte_timeout(fd, ESC_SEQUENCE_TIMEOUT_MS)? else {
+            break;
+        };
+        sequence.push(byte);
+        if (0x40..=0x7e).contains(&byte) {
+            break;
+        }
+    }
+    Ok(interactive_key_from_csi_sequence(&sequence))
+}
+
+#[cfg(unix)]
+fn read_ss3_key(fd: i32) -> Result<InteractiveStatsKey> {
+    let Some(byte) = read_stdin_byte_timeout(fd, ESC_SEQUENCE_TIMEOUT_MS)? else {
+        return Ok(InteractiveStatsKey::Ignored);
+    };
+    Ok(interactive_key_from_ss3_final(byte))
+}
+
+#[cfg(unix)]
+fn read_stdin_byte_timeout(fd: i32, timeout_ms: i32) -> Result<Option<u8>> {
+    if !stdin_ready(fd, timeout_ms)? {
+        return Ok(None);
+    }
+    Ok(Some(read_stdin_byte(fd)?))
+}
+
+#[cfg(unix)]
+fn interactive_key_from_csi_sequence(sequence: &[u8]) -> InteractiveStatsKey {
+    let Some(final_byte) = sequence.last().copied() else {
+        return InteractiveStatsKey::Ignored;
+    };
+    match final_byte {
+        b'A' => InteractiveStatsKey::ScrollUp,
+        b'B' => InteractiveStatsKey::ScrollDown,
+        b'H' => InteractiveStatsKey::Home,
+        b'F' => InteractiveStatsKey::End,
+        b'~' => match sequence.split_last().map(|(_last, prefix)| prefix) {
+            Some(prefix) if prefix.starts_with(b"5") => InteractiveStatsKey::PageUp,
+            Some(prefix) if prefix.starts_with(b"6") => InteractiveStatsKey::PageDown,
+            Some(prefix) if prefix.starts_with(b"1") || prefix.starts_with(b"7") => {
+                InteractiveStatsKey::Home
+            }
+            Some(prefix) if prefix.starts_with(b"4") || prefix.starts_with(b"8") => {
+                InteractiveStatsKey::End
+            }
+            _ => InteractiveStatsKey::Ignored,
+        },
+        _ => InteractiveStatsKey::Ignored,
+    }
+}
+
+#[cfg(unix)]
+fn interactive_key_from_ss3_final(final_byte: u8) -> InteractiveStatsKey {
+    match final_byte {
+        b'A' => InteractiveStatsKey::ScrollUp,
+        b'B' => InteractiveStatsKey::ScrollDown,
+        b'H' => InteractiveStatsKey::Home,
+        b'F' => InteractiveStatsKey::End,
+        _ => InteractiveStatsKey::Ignored,
+    }
+}
+
+#[cfg(unix)]
+fn read_stdin_byte(fd: i32) -> Result<u8> {
+    let mut byte = [0_u8; 1];
+    loop {
+        // SAFETY: `byte` is a valid one-byte output buffer for the duration of the call.
+        let result = unsafe { libc::read(fd, byte.as_mut_ptr().cast(), byte.len()) };
+        if result == 1 {
+            return Ok(byte[0]);
+        }
+        if result == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        return Err(error.into());
+    }
+}
+
+#[cfg(unix)]
+fn stdin_ready(fd: i32, timeout_ms: i32) -> Result<bool> {
+    let mut poll_fd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: `poll_fd` points to one valid pollfd and the timeout is bounded.
+    let result = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+    if result < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(result > 0 && (poll_fd.revents & libc::POLLIN) != 0)
+}
+
+fn interactive_stats_lines(report: &StatsReport, viewport: TerminalSize) -> Vec<String> {
+    let columns = viewport.render_columns();
+    let use_color = color_enabled();
+    if let Some(lines) = wide_interactive_stats_lines(report, columns, use_color) {
+        return lines;
+    }
+
+    let mut lines = daily_chart_lines(report, columns, use_color);
+    let model_lines = model_mix_lines(report, columns, use_color, false);
+    if !lines.is_empty() && !model_lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines.extend(model_lines);
+    if report.by_slot && viewport.rows >= 36 {
+        lines.extend(slot_window_lines(report, columns));
+    }
+    lines
+}
+
+fn wide_interactive_stats_lines(
+    report: &StatsReport,
+    columns: usize,
+    use_color: bool,
+) -> Option<Vec<String>> {
+    if columns < WIDE_STATS_LAYOUT_MIN_COLUMNS {
+        return None;
+    }
+
+    let right_width = (columns / 3).clamp(
+        WIDE_STATS_MODEL_MIN_COLUMNS,
+        columns.saturating_sub(64).max(WIDE_STATS_MODEL_MIN_COLUMNS),
+    );
+    let gap = "  │  ";
+    let left_width = columns.saturating_sub(right_width + visible_width(gap));
+    if left_width < 56 {
+        return None;
+    }
+
+    let left = daily_chart_lines(report, left_width, use_color);
+    let right = model_mix_lines(report, right_width, use_color, false);
+    if right.is_empty() {
+        return Some(left);
+    }
+    Some(side_by_side_lines(&left, &right, left_width, columns, gap))
+}
+
+fn side_by_side_lines(
+    left: &[String],
+    right: &[String],
+    left_width: usize,
+    total_width: usize,
+    gap: &str,
+) -> Vec<String> {
+    let gap_width = visible_width(gap);
+    let right_width = total_width.saturating_sub(left_width + gap_width);
+    let row_count = left.len().max(right.len());
+    let mut lines = Vec::with_capacity(row_count);
+    for index in 0..row_count {
+        let left_line = left.get(index).map(String::as_str).unwrap_or("");
+        let right_line = right.get(index).map(String::as_str).unwrap_or("");
+        lines.push(format!(
+            "{}{}{}",
+            pad_visible(&truncate_ansi_line(left_line, left_width), left_width),
+            gap,
+            truncate_ansi_line(right_line, right_width)
+        ));
+    }
+    lines
+}
+
+fn slot_window_lines(report: &StatsReport, columns: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let columns_config = StatsColumns::from_report(report);
+    lines.push(String::new());
+    lines.push("Slot Windows".to_string());
+    lines.push(columns_config.header());
+    for period in &report.periods {
+        lines.push(period_limited_line(
+            columns_config.period_row(period),
+            columns,
+        ));
+        for slot in &period.slots {
+            lines.push(period_limited_line(columns_config.slot_row(slot), columns));
+        }
+    }
+    lines.push(String::new());
+    lines
+}
+
+fn period_limited_line(line: String, columns: usize) -> String {
+    truncate_ansi_line(&line, columns)
 }
 
 #[cfg(not(unix))]
@@ -494,6 +859,9 @@ impl TerminalMode {
         if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &next) } != 0 {
             return Err(std::io::Error::last_os_error().into());
         }
+        let mut stdout = std::io::stdout();
+        stdout.write_all(b"\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H")?;
+        stdout.flush()?;
         Ok(Self { fd, previous })
     }
 }
@@ -503,6 +871,9 @@ impl Drop for TerminalMode {
     fn drop(&mut self) {
         // SAFETY: `previous` was captured from the same live terminal fd.
         let _ = unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.previous) };
+        let mut stdout = std::io::stdout();
+        let _ = stdout.write_all(b"\x1b[?25h\x1b[?1049l");
+        let _ = stdout.flush();
     }
 }
 
@@ -544,20 +915,33 @@ struct ModelVisuals {
 }
 
 fn print_daily_chart(report: &StatsReport) {
+    for line in daily_chart_lines(report, terminal_width(), color_enabled()) {
+        println!("{line}");
+    }
+}
+
+fn daily_chart_lines(report: &StatsReport, columns: usize, use_color: bool) -> Vec<String> {
     let days = selected_daily_days(report);
     if days.is_empty() || days.iter().all(|day| day.tokens == 0) {
-        return;
+        return Vec::new();
     }
 
-    let width = daily_chart_bucket_count();
-    let use_color = color_enabled();
-    let points = chart_points(&days, width);
+    let bucket_count = daily_chart_bucket_count_for_terminal(columns);
+    let chart_width = daily_chart_render_width_for_terminal(columns);
+    let points = chart_points(&days, bucket_count);
     let max_tokens = points.iter().map(|point| point.tokens).max().unwrap_or(0);
     let top_models = top_models_for_stacked_chart(&points, DAILY_CHART_MODEL_LIMIT);
     let visuals = ModelVisuals::from_models(&top_models);
 
-    println!("Tokens per Day");
-    print_stacked_bar_chart(&points, &top_models, &visuals, max_tokens, use_color);
+    let mut lines = vec!["Tokens per Day".to_string()];
+    lines.extend(stacked_bar_chart_lines(
+        &points,
+        &top_models,
+        &visuals,
+        max_tokens,
+        chart_width,
+        use_color,
+    ));
 
     if !top_models.is_empty() {
         let legend = top_models
@@ -566,31 +950,44 @@ fn print_daily_chart(report: &StatsReport) {
                 format!(
                     "{} {}",
                     model_marker_for_key(key, &visuals, use_color),
-                    truncate(&model_label(key), legend_label_width())
+                    truncate(&model_label(key), legend_label_width_for_columns(columns))
                 )
             })
             .collect::<Vec<_>>();
-        print_chart_legend(&legend);
+        lines.extend(chart_legend_lines(&legend, columns));
     }
-    println!();
-    println!("{}", range_label(report.range.label(), use_color));
-    print_wrapped_items(
+
+    lines.push(String::new());
+    lines.push(range_label(report.range.label(), use_color));
+    lines.extend(wrapped_items_lines(
         &range_total_items(&days, report.includes_price_estimates()),
         0,
-    );
-    println!();
+        columns,
+    ));
+    lines.push(String::new());
+    lines
 }
 
 fn print_model_mix(report: &StatsReport) {
+    for line in model_mix_lines(report, terminal_width(), color_enabled(), false) {
+        println!("{line}");
+    }
+}
+
+fn model_mix_lines(
+    report: &StatsReport,
+    columns: usize,
+    use_color: bool,
+    compact: bool,
+) -> Vec<String> {
     let days = selected_daily_days(report);
     let mut models = aggregate_model_usage(&days);
     let total_tokens = models.iter().map(|(_, usage)| usage.tokens).sum::<u64>();
     if total_tokens == 0 {
-        return;
+        return Vec::new();
     }
 
-    let use_color = color_enabled();
-    println!("Model Mix");
+    let mut lines = vec!["Model Mix".to_string()];
     let other = if models.len() > MODEL_MIX_LIMIT {
         Some(combine_model_usage(&models.split_off(MODEL_MIX_LIMIT)))
     } else {
@@ -605,11 +1002,19 @@ fn print_model_mix(report: &StatsReport) {
     let visuals = ModelVisuals::from_models(&visual_keys);
 
     for (key, usage) in &models {
-        print_model_mix_row(key, usage, &visuals, total_tokens, use_color);
+        lines.extend(model_mix_row_lines(
+            key,
+            usage,
+            &visuals,
+            total_tokens,
+            use_color,
+            columns,
+            compact,
+        ));
     }
 
     if let Some(usage) = other {
-        print_model_mix_row(
+        lines.extend(model_mix_row_lines(
             &DisplayModelKey {
                 provider: "other".to_string(),
                 model: "other".to_string(),
@@ -618,26 +1023,74 @@ fn print_model_mix(report: &StatsReport) {
             &visuals,
             total_tokens,
             use_color,
-        );
+            columns,
+            compact,
+        ));
     }
-    println!();
+    lines.push(String::new());
+    lines
 }
 
-fn print_model_mix_row(
+fn model_mix_row_lines(
     key: &DisplayModelKey,
     usage: &DisplayModelUsage,
     visuals: &ModelVisuals,
     total_tokens: u64,
     use_color: bool,
-) {
-    let label_width = text_wrap_width().saturating_sub(4).clamp(8, 48);
-    println!(
+    columns: usize,
+    compact: bool,
+) -> Vec<String> {
+    if compact {
+        return vec![compact_model_mix_row(
+            key,
+            usage,
+            visuals,
+            total_tokens,
+            use_color,
+            columns,
+        )];
+    }
+
+    let label_width = text_wrap_width_for_columns(columns)
+        .saturating_sub(4)
+        .clamp(8, 48);
+    let mut lines = vec![format!(
         "  {} {}",
         model_marker_for_key(key, visuals, use_color),
         truncate(&model_label(key), label_width)
-    );
-    print_wrapped_items(&model_mix_primary_parts(usage, total_tokens), 4);
-    print_wrapped_items(&model_usage_detail_parts(usage), 4);
+    )];
+    lines.extend(wrapped_items_lines(
+        &model_mix_primary_parts(usage, total_tokens),
+        4,
+        columns,
+    ));
+    lines.extend(wrapped_items_lines(
+        &model_usage_detail_parts(usage),
+        4,
+        columns,
+    ));
+    lines
+}
+
+fn compact_model_mix_row(
+    key: &DisplayModelKey,
+    usage: &DisplayModelUsage,
+    visuals: &ModelVisuals,
+    total_tokens: u64,
+    use_color: bool,
+    columns: usize,
+) -> String {
+    let marker = model_marker_for_key(key, visuals, use_color);
+    let metrics = model_mix_primary_parts(usage, total_tokens).join(" · ");
+    let suffix_width = metrics.chars().count();
+    let fixed_width = 4 + visible_width(&marker) + suffix_width;
+    let label_width = columns.saturating_sub(fixed_width).clamp(8, 32);
+    format!(
+        "  {} {} {}",
+        marker,
+        truncate(&model_label(key), label_width),
+        metrics
+    )
 }
 
 fn selected_daily_days(report: &StatsReport) -> Vec<DailyUsage> {
@@ -794,11 +1247,14 @@ fn chart_points(days: &[DailyUsage], width: usize) -> Vec<ChartPoint> {
         return Vec::new();
     }
 
-    let bucket_count = if days.len() > width {
-        width
-    } else {
-        days.len()
-    };
+    if days.len() <= width {
+        return days
+            .iter()
+            .map(|day| combine_days(std::slice::from_ref(day)))
+            .collect();
+    }
+
+    let bucket_count = width;
     let mut compacted = Vec::with_capacity(bucket_count);
     for index in 0..bucket_count {
         let start = index * days.len() / bucket_count;
@@ -817,17 +1273,7 @@ fn chart_points(days: &[DailyUsage], width: usize) -> Vec<ChartPoint> {
             .map(|day| day.date.clone())
             .unwrap_or_else(|| last.date.clone());
     }
-
-    if compacted.len() >= width {
-        return compacted;
-    }
-
-    (0..width)
-        .map(|index| {
-            let source = index * compacted.len() / width;
-            compacted[source].clone()
-        })
-        .collect()
+    compacted
 }
 
 fn combine_days(days: &[DailyUsage]) -> ChartPoint {
@@ -851,25 +1297,25 @@ fn combine_days(days: &[DailyUsage]) -> ChartPoint {
     point
 }
 
-fn print_stacked_bar_chart(
+fn stacked_bar_chart_lines(
     points: &[ChartPoint],
     top_models: &[DisplayModelKey],
     visuals: &ModelVisuals,
     max_tokens: u64,
+    width: usize,
     use_color: bool,
-) {
+) -> Vec<String> {
     if points.is_empty() {
-        return;
+        return Vec::new();
     }
 
-    let width = chart_render_width(points.len());
     let mut grid = vec![vec![ChartCell::blank(); width]; DAILY_BAR_CHART_HEIGHT];
     let visible_models = top_models
         .iter()
         .filter(|key| !key.is_other())
         .collect::<Vec<_>>();
     for (point_index, point) in points.iter().enumerate() {
-        let x = chart_point_x(point_index);
+        let x = chart_point_x(point_index, points.len(), width);
         let values = top_models
             .iter()
             .map(|key| chart_model_tokens(point, key, &visible_models))
@@ -891,18 +1337,20 @@ fn print_stacked_bar_chart(
         }
     }
 
+    let mut lines = Vec::with_capacity(DAILY_BAR_CHART_HEIGHT + 2);
     for (row_index, row) in grid.iter().enumerate() {
         let label = y_axis_label(row_index, max_tokens);
-        println!(
+        lines.push(format!(
             "{:>7} │{}",
             label,
             row.iter()
                 .map(|cell| render_chart_cell(*cell, use_color))
                 .collect::<String>()
-        );
+        ));
     }
-    println!("{:>7} └{}", "", "─".repeat(width));
-    println!("{}", x_axis_labels(points, width));
+    lines.push(format!("{:>7} └{}", "", "─".repeat(width)));
+    lines.push(x_axis_labels(points, width));
+    lines
 }
 
 fn chart_model_tokens(
@@ -1002,24 +1450,36 @@ fn y_axis_label(row_index: usize, max_tokens: u64) -> String {
 
 fn x_axis_labels(points: &[ChartPoint], width: usize) -> String {
     let mut line = vec![' '; width + CHART_PREFIX_WIDTH];
-    if let Some(point) = points.first() {
-        place_label(
-            &mut line,
-            CHART_PREFIX_WIDTH,
-            &short_date_label(&point.date),
-        );
+    if points.is_empty() {
+        return line.into_iter().collect();
     }
-    let midpoint = points.len() / 2;
-    if let Some(point) = points.get(midpoint) {
-        let label = short_date_label(&point.date);
-        let start =
-            CHART_PREFIX_WIDTH + chart_point_x(midpoint).saturating_sub(label.chars().count() / 2);
-        place_label(&mut line, start, &label);
+
+    let mut labels = Vec::<(usize, String)>::new();
+    if points.len() == 1 {
+        let label = short_date_label(&points[0].date);
+        let x = chart_point_x(0, points.len(), width);
+        labels.push((x.saturating_sub(label.chars().count() / 2), label));
+    } else {
+        labels.push((0, short_date_label(&points[0].date)));
+        let midpoint = points.len() / 2;
+        if midpoint > 0 && midpoint + 1 < points.len() {
+            let label = short_date_label(&points[midpoint].date);
+            let x = chart_point_x(midpoint, points.len(), width);
+            labels.push((x.saturating_sub(label.chars().count() / 2), label));
+        }
+        if let Some(point) = points.last() {
+            let label = short_date_label(&point.date);
+            labels.push((width.saturating_sub(label.chars().count()), label));
+        }
     }
-    if let Some(point) = points.last() {
-        let label = short_date_label(&point.date);
-        let start = CHART_PREFIX_WIDTH + width.saturating_sub(label.chars().count());
-        place_label(&mut line, start, &label);
+
+    let mut previous_label = String::new();
+    for (x, label) in labels {
+        if label == previous_label {
+            continue;
+        }
+        previous_label.clone_from(&label);
+        place_label(&mut line, CHART_PREFIX_WIDTH + x, &label);
     }
     line.into_iter().collect()
 }
@@ -1037,16 +1497,11 @@ fn place_label(line: &mut [char], start: usize, label: &str) {
     }
 }
 
-fn chart_render_width(points: usize) -> usize {
-    points.saturating_mul(2).saturating_sub(1).max(1)
-}
-
-fn chart_point_x(index: usize) -> usize {
-    index.saturating_mul(2)
-}
-
-fn daily_chart_bucket_count() -> usize {
-    daily_chart_bucket_count_for_terminal(terminal_width())
+fn chart_point_x(index: usize, point_count: usize, width: usize) -> usize {
+    if width <= 1 || point_count <= 1 {
+        return width / 2;
+    }
+    index.saturating_mul(width.saturating_sub(1)) / point_count.saturating_sub(1)
 }
 
 fn daily_chart_bucket_count_for_terminal(columns: usize) -> usize {
@@ -1059,14 +1514,36 @@ fn daily_chart_render_width_for_terminal(columns: usize) -> usize {
         .clamp(1, MAX_DAILY_CHART_WIDTH)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TerminalSize {
+    columns: usize,
+    rows: usize,
+}
+
+impl TerminalSize {
+    fn render_columns(self) -> usize {
+        self.columns.saturating_sub(1).max(1)
+    }
+}
+
+fn terminal_size() -> TerminalSize {
+    terminal_size_from_ioctl()
+        .or_else(terminal_size_from_env)
+        .unwrap_or(TerminalSize {
+            columns: 100,
+            rows: 24,
+        })
+}
+
 fn terminal_width() -> usize {
-    terminal_width_from_ioctl()
+    terminal_size_from_ioctl()
+        .map(|size| size.columns)
         .or_else(terminal_width_from_env)
         .unwrap_or(100)
 }
 
 #[cfg(unix)]
-fn terminal_width_from_ioctl() -> Option<usize> {
+fn terminal_size_from_ioctl() -> Option<TerminalSize> {
     let stdout = std::io::stdout();
     if !stdout.is_terminal() {
         return None;
@@ -1080,12 +1557,25 @@ fn terminal_width_from_ioctl() -> Option<usize> {
     }
     // SAFETY: a successful TIOCGWINSZ call initialized the winsize struct.
     let size = unsafe { size.assume_init() };
-    (size.ws_col > 0).then_some(size.ws_col as usize)
+    (size.ws_col > 0 && size.ws_row > 0).then_some(TerminalSize {
+        columns: size.ws_col as usize,
+        rows: size.ws_row as usize,
+    })
 }
 
 #[cfg(not(unix))]
-fn terminal_width_from_ioctl() -> Option<usize> {
+fn terminal_size_from_ioctl() -> Option<TerminalSize> {
     None
+}
+
+fn terminal_size_from_env() -> Option<TerminalSize> {
+    Some(TerminalSize {
+        columns: terminal_width_from_env()?,
+        rows: std::env::var("ROWS")
+            .ok()
+            .and_then(|rows| rows.parse::<usize>().ok())
+            .filter(|rows| *rows > 0)?,
+    })
 }
 
 fn terminal_width_from_env() -> Option<usize> {
@@ -1095,12 +1585,14 @@ fn terminal_width_from_env() -> Option<usize> {
         .filter(|columns| *columns > 0)
 }
 
-fn text_wrap_width() -> usize {
-    terminal_width().clamp(1, 96)
+fn text_wrap_width_for_columns(columns: usize) -> usize {
+    columns.clamp(1, 96)
 }
 
-fn legend_label_width() -> usize {
-    text_wrap_width().saturating_sub(4).clamp(4, 24)
+fn legend_label_width_for_columns(columns: usize) -> usize {
+    text_wrap_width_for_columns(columns)
+        .saturating_sub(4)
+        .clamp(4, 24)
 }
 
 fn range_label(label: String, use_color: bool) -> String {
@@ -1145,14 +1637,17 @@ fn range_total_items(days: &[DailyUsage], includes_price_estimates: bool) -> Vec
     parts
 }
 
-fn print_wrapped_items(items: &[String], indent: usize) {
+fn wrapped_items_lines(items: &[String], indent: usize, columns: usize) -> Vec<String> {
     if items.is_empty() {
-        return;
+        return Vec::new();
     }
 
-    let width = text_wrap_width().saturating_sub(indent).max(1);
+    let width = text_wrap_width_for_columns(columns)
+        .saturating_sub(indent)
+        .max(1);
     let indent = " ".repeat(indent);
     let mut line = String::new();
+    let mut lines = Vec::new();
     for item in items {
         let next_len = if line.is_empty() {
             item.chars().count()
@@ -1160,7 +1655,7 @@ fn print_wrapped_items(items: &[String], indent: usize) {
             line.chars().count() + 3 + item.chars().count()
         };
         if !line.is_empty() && next_len > width {
-            println!("{indent}{line}");
+            lines.push(format!("{indent}{line}"));
             line.clear();
         }
         if !line.is_empty() {
@@ -1169,15 +1664,20 @@ fn print_wrapped_items(items: &[String], indent: usize) {
         line.push_str(item);
     }
     if !line.is_empty() {
-        println!("{indent}{line}");
+        lines.push(format!("{indent}{line}"));
     }
+    lines
 }
 
-fn print_chart_legend(items: &[String]) {
-    let width = text_wrap_width().saturating_sub(2).max(1);
+fn chart_legend_lines(items: &[String], columns: usize) -> Vec<String> {
+    let width = text_wrap_width_for_columns(columns)
+        .saturating_sub(2)
+        .max(1);
+    let mut lines = Vec::new();
     for row in balanced_item_rows(items, width) {
-        println!("  {}", row.join(" · "));
+        lines.push(format!("  {}", row.join(" · ")));
     }
+    lines
 }
 
 fn balanced_item_rows(items: &[String], width: usize) -> Vec<Vec<String>> {
@@ -1225,18 +1725,34 @@ fn joined_items_len(items: &[String]) -> usize {
 }
 
 fn print_wrapped_text(text: &str, indent: usize) {
-    let width = text_wrap_width().saturating_sub(indent).max(1);
-    let indent = " ".repeat(indent);
-    let mut line = String::new();
-    for word in text.split_whitespace() {
-        append_wrapped_word(&indent, width, &mut line, word);
-    }
-    if !line.is_empty() {
-        println!("{indent}{line}");
+    for line in wrapped_text_lines(text, indent, terminal_width()) {
+        println!("{line}");
     }
 }
 
-fn append_wrapped_word(indent: &str, width: usize, line: &mut String, word: &str) {
+fn wrapped_text_lines(text: &str, indent: usize, columns: usize) -> Vec<String> {
+    let width = text_wrap_width_for_columns(columns)
+        .saturating_sub(indent)
+        .max(1);
+    let indent = " ".repeat(indent);
+    let mut line = String::new();
+    let mut lines = Vec::new();
+    for word in text.split_whitespace() {
+        append_wrapped_word(&indent, width, &mut line, word, &mut lines);
+    }
+    if !line.is_empty() {
+        lines.push(format!("{indent}{line}"));
+    }
+    lines
+}
+
+fn append_wrapped_word(
+    indent: &str,
+    width: usize,
+    line: &mut String,
+    word: &str,
+    lines: &mut Vec<String>,
+) {
     let mut pending = word;
     loop {
         let word_len = pending.chars().count();
@@ -1253,13 +1769,13 @@ fn append_wrapped_word(indent: &str, width: usize, line: &mut String, word: &str
             return;
         }
         if !line.is_empty() {
-            println!("{indent}{line}");
+            lines.push(format!("{indent}{line}"));
             line.clear();
             continue;
         }
 
         let (head, tail) = split_word_at(pending, width);
-        println!("{indent}{head}");
+        lines.push(format!("{indent}{head}"));
         if tail.is_empty() {
             return;
         }
@@ -1280,6 +1796,64 @@ fn split_word_at(value: &str, max_chars: usize) -> (&str, &str) {
         end = index + ch.len_utf8();
     }
     value.split_at(end)
+}
+
+fn pad_visible(value: &str, width: usize) -> String {
+    let visible = visible_width(value);
+    if visible >= width {
+        return value.to_string();
+    }
+    format!("{value}{}", " ".repeat(width - visible))
+}
+
+fn truncate_ansi_line(value: &str, max_visible: usize) -> String {
+    if max_visible == 0 {
+        return String::new();
+    }
+
+    let mut output = String::new();
+    let mut visible = 0;
+    let mut chars = value.chars().peekable();
+    let mut copied_escape = false;
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' && chars.peek() == Some(&'[') {
+            copied_escape = true;
+            output.push(ch);
+            for next in chars.by_ref() {
+                output.push(next);
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        if visible >= max_visible {
+            break;
+        }
+        output.push(ch);
+        visible += 1;
+    }
+    if copied_escape && visible_width(value) > max_visible {
+        output.push_str("\x1b[0m");
+    }
+    output
+}
+
+fn visible_width(value: &str) -> usize {
+    let mut width = 0;
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' && chars.peek() == Some(&'[') {
+            for next in chars.by_ref() {
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        width += 1;
+    }
+    width
 }
 
 fn accent(value: &str, use_color: bool) -> String {
@@ -2148,7 +2722,7 @@ mod tests {
     }
 
     #[test]
-    fn chart_points_stretch_short_ranges_horizontally() {
+    fn chart_points_keep_short_ranges_sparse() {
         let mut first = daily_usage(None);
         first.date = "2026-05-10".to_string();
         first.tokens = 100;
@@ -2160,11 +2734,30 @@ mod tests {
 
         let points = chart_points(&[first, second], 6);
 
-        assert_eq!(points.len(), 6);
+        assert_eq!(points.len(), 2);
         assert_eq!(points[0].date, "2026-05-10");
-        assert_eq!(points[2].tokens, 100);
-        assert_eq!(points[3].date, "2026-05-11");
-        assert_eq!(points[5].tokens, 200);
+        assert_eq!(points[0].tokens, 100);
+        assert_eq!(points[1].date, "2026-05-11");
+        assert_eq!(points[1].tokens, 200);
+    }
+
+    #[test]
+    fn sparse_chart_uses_full_axis_without_repeating_single_day() {
+        let mut day = daily_usage(None);
+        day.tokens = 100;
+        day.models[0].tokens = 100;
+        let points = chart_points(&[day], 30);
+        let models = top_models_for_stacked_chart(&points, 5);
+        let visuals = ModelVisuals::from_models(&models);
+
+        let lines = stacked_bar_chart_lines(&points, &models, &visuals, 100, 60, false);
+        let glyphs = ['█', '▓', '▒', '░', '■', '□', '●', '○', '◆', '◇', '▲', '△'];
+
+        assert_eq!(points.len(), 1);
+        assert!(lines
+            .iter()
+            .take(DAILY_BAR_CHART_HEIGHT)
+            .all(|line| { line.chars().filter(|ch| glyphs.contains(ch)).count() <= 1 }));
     }
 
     #[test]
@@ -2186,7 +2779,7 @@ mod tests {
             20
         );
         assert_eq!(
-            chart_render_width(daily_chart_bucket_count_for_terminal(40)) + CHART_PREFIX_WIDTH,
+            daily_chart_render_width_for_terminal(40) + CHART_PREFIX_WIDTH,
             40
         );
     }
@@ -2210,6 +2803,94 @@ mod tests {
             ]
         );
         assert!(rows.iter().all(|row| joined_items_len(row) <= 32));
+    }
+
+    #[test]
+    fn interactive_display_lines_fit_viewport_height_and_width() {
+        let report = stats_report(Some(1.25));
+        let viewport = TerminalSize {
+            columns: 72,
+            rows: 10,
+        };
+
+        let frame = interactive_display_lines(&report, viewport, 0);
+
+        assert_eq!(frame.lines.len(), viewport.rows);
+        assert_eq!(frame.scroll_offset, 0);
+        assert!(frame
+            .lines
+            .iter()
+            .all(|line| visible_width(line) <= viewport.render_columns()));
+        assert!(frame
+            .lines
+            .last()
+            .is_some_and(|line| line.contains("q quit")));
+        assert!(!frame
+            .lines
+            .iter()
+            .any(|line| line.contains("resize") || line.contains("narrow")));
+    }
+
+    #[test]
+    fn interactive_display_lines_scroll_through_overflow() {
+        let report = stats_report(Some(1.25));
+        let viewport = TerminalSize {
+            columns: 72,
+            rows: 8,
+        };
+
+        let top = interactive_display_lines(&report, viewport, 0);
+        let scrolled = interactive_display_lines(&report, viewport, 2);
+
+        assert!(top.max_scroll > 0);
+        assert_eq!(scrolled.scroll_offset, 2.min(scrolled.max_scroll));
+        assert_ne!(top.lines[0], scrolled.lines[0]);
+        assert!(scrolled
+            .lines
+            .last()
+            .is_some_and(|line| line.contains("Rows")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interactive_escape_parser_supports_csi_and_ss3_arrows() {
+        assert_eq!(
+            interactive_key_from_csi_sequence(b"A"),
+            InteractiveStatsKey::ScrollUp
+        );
+        assert_eq!(
+            interactive_key_from_csi_sequence(b"B"),
+            InteractiveStatsKey::ScrollDown
+        );
+        assert_eq!(
+            interactive_key_from_csi_sequence(b"1;2A"),
+            InteractiveStatsKey::ScrollUp
+        );
+        assert_eq!(
+            interactive_key_from_ss3_final(b'A'),
+            InteractiveStatsKey::ScrollUp
+        );
+        assert_eq!(
+            interactive_key_from_ss3_final(b'B'),
+            InteractiveStatsKey::ScrollDown
+        );
+    }
+
+    #[test]
+    fn wide_interactive_layout_places_model_mix_next_to_chart() {
+        let report = stats_report(Some(1.25));
+        let viewport = TerminalSize {
+            columns: 140,
+            rows: 24,
+        };
+
+        let lines = interactive_stats_lines(&report, viewport);
+
+        assert!(lines
+            .iter()
+            .take(2)
+            .any(|line| line.contains("Tokens per Day") && line.contains("Model Mix")));
+        assert!(lines.iter().any(|line| line.contains("│")));
     }
 
     #[test]

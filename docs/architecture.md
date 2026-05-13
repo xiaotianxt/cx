@@ -8,8 +8,9 @@ wrappers with a single Rust binary.
 - `cli`: typed clap commands for management operations.
 - `cx`: default launcher and stdin pipe wrapper.
 - `run`: argument parsing and `exec` into the real Codex binary.
-- `slot`: slot layout, rotation file, overrides, auth copying, shared sqlite links.
-  Internally this is split into config, rotation, and sqlite repair helpers.
+- `slot`: slot layout, rotation file, overrides, auth copying, and shared
+  Codex resource links. Internally this is split into config, rotation, and
+  shared resource materialization.
 - `target`: named target-specific slot groups, Codex config overrides, and env
   overlays from `targets/<name>.toml`.
 - `auth`: `auth.json` parsing.

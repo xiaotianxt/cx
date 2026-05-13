@@ -25,14 +25,8 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Clippy service feature
-        run: cargo clippy --all-targets --features service -- -D warnings
-
       - name: Test
         run: cargo test
-
-      - name: Test service feature
-        run: cargo test --features service
 
       - name: Build
         run: cargo build --release

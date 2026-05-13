@@ -821,28 +821,9 @@ mod tests {
         let _ = fs::remove_dir_all(&paths.manager_dir);
     }
 
-    #[cfg(feature = "service")]
     #[test]
-    fn launcher_options_include_experimental_service_remote() {
-        let paths = temp_paths("service-remote-option");
-
-        let candidates = complete(&["cx"], "--cx-s", &paths);
-
-        assert_eq!(
-            candidates,
-            vec![Candidate {
-                value: "--cx-service-remote".to_string(),
-                description: "Use experimental cx service remote".to_string(),
-            }]
-        );
-
-        let _ = fs::remove_dir_all(&paths.manager_dir);
-    }
-
-    #[cfg(not(feature = "service"))]
-    #[test]
-    fn launcher_options_omit_service_remote_without_feature() {
-        let paths = temp_paths("no-service-remote-option");
+    fn launcher_options_ignore_unknown_cx_prefix() {
+        let paths = temp_paths("unknown-cx-prefix");
 
         let candidates = complete(&["cx"], "--cx-s", &paths);
 

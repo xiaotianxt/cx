@@ -19,16 +19,6 @@ wrappers with a single Rust binary.
 - `stats`: local usage reporting. Internally this separates SQLite reads,
   rollout calibration, pricing/cache handling, and aggregation.
 - `envfile`: small parser/writer for `env.conf`.
-- `app_server`: minimal loopback WebSocket transport and protocol probe client
-  for Codex app-server.
-- `control`: private local Unix socket daemon and versioned JSON line protocol
-  for future cx-owned adapters.
-- `serve`: foreground app-server supervision, lifecycle state, stop, and
-  readiness probe.
-- `session`: cx-owned session identifiers, channel identifiers, persistent
-  session registry, and append-only event journal.
-- `protocol_export`: delegates version-matched app-server schema export to the
-  selected Codex binary.
 - `install`: copy the current `cx` binary into a bin directory.
 
 ## Usage Endpoint
@@ -67,16 +57,10 @@ rate_limit.limit_reached == true
 
 It intentionally ignores `credits.has_credits=false` as an exhaustion signal.
 
-## Remote-First Launch And Local Fallback
+## Local Launch
 
-For normal interactive launches, `cx` first tries to connect the real Codex TUI
-to the cx service broker with `--remote`. The service broker owns global thread
-routing and schedules slot workers. cx prepares the remote arguments and
-supervises short remote-client restarts for stale TUI exits.
-
-If the service broker is missing, stale, or cannot resolve the target
-thread, cx prints a warning and falls back to a local launch. On Unix the local
-fallback uses `exec`, so the final process is the real Codex binary with:
+For normal interactive launches, `cx` selects a slot and then uses `exec` on
+Unix so the final process is the real Codex binary with:
 
 - `CODEX_HOME=<slot>/home`
 - variables from `<slot>/env.conf`
@@ -84,11 +68,6 @@ fallback uses `exec`, so the final process is the real Codex binary with:
 - variables from `targets/<target>.toml` `[env]`, when `--target` is used
 - repeated target `set`/`overrides` lines, appended after slot overrides
 - the user's original Codex args
-
-The remote path is used for clean TUI launches and explicit `resume` commands.
-Prompt-bearing launches fall back to the local path until the service broker can
-own turn submission directly. Other explicit Codex subcommands, help/version,
-and user-supplied `--remote` launches bypass cx's remote attach policy.
 
 Target-specific execution resolves in this order:
 
@@ -118,57 +97,3 @@ When stdin is piped, `cx` reads it into memory and turns it into:
 ```
 
 It then reattaches the TUI to `/dev/tty`, using `script` when available.
-
-## App Server Control Plane Direction
-
-The current `serve` implementation is intentionally a foreground foundation. It
-selects a slot through the same runtime policy as the launcher, spawns:
-
-```text
-codex app-server --listen ws://127.0.0.1:<port>
-```
-
-and records only non-secret process state under:
-
-```text
-<profile-manager>/serve/default.json
-```
-
-The first invariant is local containment: `cx serve start` and `cx serve probe`
-accept only loopback `ws://127.0.0.1:<port>` or `ws://localhost:<port>` URLs.
-Raw app-server WebSocket endpoints are not a stable public control surface for
-Telegram, WeChat, remote terminals, or future web adapters.
-
-The second invariant is process ownership: the state file is an observation of
-one cx-started process, not a service registry. `cx serve stop` treats a missing
-process or dead ready endpoint as stale state and removes only the state file.
-It sends signals only after the recorded pid still looks like an app-server
-process and the ready endpoint is still live.
-
-The intended staged direction is:
-
-1. Keep raw Codex app-server private to cx.
-2. Make process lifecycle explicit: status, stop, stale cleanup, and supervised
-   restart behavior.
-3. Add a cx-owned daemon/control socket. The socket supports `ping`,
-   `shutdown`, and session registry commands; it establishes the private local
-   transport and protocol versioning for adapters.
-4. Persist a session registry and event journal. The current registry stores
-   cx-owned `session_id`, `primary_channel_id`, `current_channel_id`,
-   `lease_epoch`, optional `active_lease`, and timestamps. The journal currently
-   records `session-created`, `lease-acquired`, and `lease-released` events as
-   NDJSON.
-   Lease acquisition refuses to overwrite an active lease unless the caller
-   explicitly asks to steal it, which increments the epoch and creates a new
-   fencing token. Event listing is exposed through the same control socket so
-   adapters do not read cx-owned files directly.
-5. Add lease tokens for terminal, Telegram, WeChat, and other channel owners.
-6. Route approvals through cx-owned policy before any adapter sees them.
-7. Route app-server traffic through the cx broker, which keeps thread identity
-   global and treats slots as worker capacity.
-8. Rotate slots by starting or moving work through cx state, not by letting
-   adapters connect directly to Codex app-server.
-
-Channel adapters should use a cx API that carries `session_id`, `thread_id`,
-`turn_id`, and a lease token. They should not be handed the raw worker
-app-server address.

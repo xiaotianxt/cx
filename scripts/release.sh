@@ -10,15 +10,8 @@ RUN_TESTS=1
 UPDATE_TAP=1
 BREW_VERIFY=1
 WATCH_RELEASE=1
-RESTART_LOCAL_SERVICE=0
 BUMP_KIND="patch"
 VERSION_OVERRIDE=""
-
-LOCAL_SERVICE_LAUNCHD=0
-LOCAL_SERVICE_SHOULD_START=0
-LOCAL_SERVICE_REFRESHED=0
-LOCAL_SERVICE_STATE=""
-LOCAL_SERVICE_ARGS=()
 
 usage() {
   cat <<'USAGE'
@@ -35,11 +28,6 @@ Options:
   --skip-tests         Do not run cargo test before tagging.
   --skip-tap           Do not update the Homebrew tap formula.
   --skip-brew-verify   Do not run brew update/upgrade/test after tap update.
-  --service-restart    Stop/reinstall/start the local cx service after
-                       Homebrew verification. Default: disabled.
-  --skip-service-restart
-                       Do not stop/reinstall/start the local cx service during
-                       Homebrew verification.
   --no-watch           Push the tag but do not wait for the release workflow.
   -h, --help           Show this help.
 
@@ -131,118 +119,6 @@ tag_commit() {
   printf '%s' "$sha"
 }
 
-local_service_plist() {
-  printf '%s/Library/LaunchAgents/dev.xiaotian.cx.service.plist\n' "$HOME"
-}
-
-local_cx_available() {
-  command -v cx >/dev/null 2>&1
-}
-
-local_service_state() {
-  cx service status --json 2>/dev/null \
-    | ruby -rjson -e 'print(JSON.parse(STDIN.read).fetch("state", ""))' 2>/dev/null \
-    || true
-}
-
-read_launchd_service_args() {
-  local plist="$1"
-  ruby - "$plist" <<'RB'
-require "rexml/document"
-
-plist = ARGV.fetch(0)
-doc = REXML::Document.new(File.read(plist))
-key = nil
-args = nil
-
-doc.elements.each("plist/dict/*") do |element|
-  if element.name == "key"
-    key = element.text
-  elsif key == "ProgramArguments" && element.name == "array"
-    args = element.elements.select { |child| child.name == "string" }.map { |child| child.text.to_s }
-    break
-  end
-end
-
-exit 0 if args.nil? || args.length < 3
-args.drop(3).each do |arg|
-  STDOUT.write(arg)
-  STDOUT.write("\0")
-end
-RB
-}
-
-load_launchd_service_args() {
-  local plist="$1"
-
-  LOCAL_SERVICE_ARGS=()
-  while IFS= read -r -d '' arg; do
-    LOCAL_SERVICE_ARGS+=("$arg")
-  done < <(read_launchd_service_args "$plist")
-}
-
-prepare_local_service_refresh() {
-  local plist
-
-  LOCAL_SERVICE_LAUNCHD=0
-  LOCAL_SERVICE_SHOULD_START=0
-  LOCAL_SERVICE_REFRESHED=0
-  LOCAL_SERVICE_STATE=""
-  LOCAL_SERVICE_ARGS=()
-
-  [[ "$RESTART_LOCAL_SERVICE" -eq 1 ]] || return 0
-
-  plist="$(local_service_plist)"
-  if [[ -f "$plist" ]]; then
-    LOCAL_SERVICE_LAUNCHD=1
-    LOCAL_SERVICE_SHOULD_START=1
-    load_launchd_service_args "$plist"
-  fi
-
-  if local_cx_available; then
-    LOCAL_SERVICE_STATE="$(local_service_state)"
-    if [[ "$LOCAL_SERVICE_STATE" == "running" || "$LOCAL_SERVICE_STATE" == "stale" ]]; then
-      LOCAL_SERVICE_SHOULD_START=1
-    fi
-  elif [[ "$LOCAL_SERVICE_LAUNCHD" -eq 1 ]]; then
-    log "cx is not on PATH; local launchd service will be refreshed after brew install"
-  fi
-}
-
-refresh_local_service_after_reinstall() {
-  [[ "$RESTART_LOCAL_SERVICE" -eq 1 ]] || return 0
-  [[ "$LOCAL_SERVICE_SHOULD_START" -eq 1 ]] || return 0
-
-  if [[ "$LOCAL_SERVICE_LAUNCHD" -eq 1 ]]; then
-    log "reinstalling and starting local launchd service"
-    if [[ "${#LOCAL_SERVICE_ARGS[@]}" -gt 0 ]]; then
-      cx service install "${LOCAL_SERVICE_ARGS[@]}" --start
-    else
-      cx service install --start
-    fi
-  else
-    log "starting local cx service"
-    cx service start
-  fi
-  LOCAL_SERVICE_REFRESHED=1
-}
-
-restore_local_service_on_exit() {
-  local status=$?
-
-  if [[ "$LOCAL_SERVICE_SHOULD_START" -eq 1 && "$LOCAL_SERVICE_REFRESHED" -eq 0 ]]; then
-    if [[ "$status" -eq 0 ]]; then
-      refresh_local_service_after_reinstall
-      status=$?
-    else
-      log "release failed; attempting to restore local cx service"
-      refresh_local_service_after_reinstall || true
-    fi
-  fi
-
-  exit "$status"
-}
-
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --bump)
@@ -269,12 +145,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-brew-verify)
       BREW_VERIFY=0
-      ;;
-    --service-restart)
-      RESTART_LOCAL_SERVICE=1
-      ;;
-    --skip-service-restart)
-      RESTART_LOCAL_SERVICE=0
       ;;
     --no-watch)
       WATCH_RELEASE=0
@@ -357,8 +227,6 @@ fi
 if [[ "$RUN_TESTS" -eq 1 ]]; then
   log "running cargo test"
   cargo test
-  log "running cargo test --features service"
-  cargo test --features service
 fi
 
 if ! git diff --quiet -- Cargo.toml Cargo.lock; then
@@ -483,16 +351,10 @@ fi
 
 if [[ "$BREW_VERIFY" -eq 1 ]]; then
   log "verifying Homebrew install"
-  prepare_local_service_refresh
   brew update
   brew upgrade "$FORMULA_REF" || brew reinstall "$FORMULA_REF"
   cx --help >/dev/null
   brew test "$FORMULA_REF"
-  if [[ "$LOCAL_SERVICE_SHOULD_START" -eq 1 ]]; then
-    trap restore_local_service_on_exit EXIT
-    refresh_local_service_after_reinstall
-    trap - EXIT
-  fi
 fi
 
 log "release ${TAG} complete"

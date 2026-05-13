@@ -17,8 +17,7 @@ use crate::cli::TransferImportArgs;
 use crate::paths::ManagerPaths;
 use crate::slot;
 
-// TODO: Add focused transfer round-trip tests once the current app-server/channel
-// changes compile again.
+// TODO: Add focused transfer round-trip tests.
 const MANIFEST_NAME: &str = "cx-transfer.json";
 const MANIFEST_SCHEMA_VERSION: u32 = 1;
 

@@ -5,10 +5,6 @@ use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
-#[cfg(feature = "service")]
-use std::thread;
-#[cfg(feature = "service")]
-use std::time::Duration;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -20,26 +16,14 @@ use clap::ArgAction;
 use clap::Command as ClapCommand;
 use clap::ValueHint;
 
-#[cfg(feature = "service")]
-use crate::app_server::AppServerClient;
 use crate::cli::LoginArgs;
 use crate::envfile;
 use crate::paths;
 use crate::paths::ManagerPaths;
 use crate::resume_id::ExplicitResumeId;
 use crate::selector;
-#[cfg(feature = "service")]
-use crate::serve;
-#[cfg(feature = "service")]
-use crate::serve::ServeEndpointKind;
 use crate::slot;
 use crate::target::TargetSpec;
-#[cfg(feature = "service")]
-use crate::thread_resolver;
-#[cfg(feature = "service")]
-use crate::thread_resolver::ThreadResolverDecision;
-#[cfg(feature = "service")]
-use crate::thread_resolver::ThreadResolverScope;
 
 const BYPASS_SUBCOMMANDS: &[&str] = &[
     "login",
@@ -47,13 +31,10 @@ const BYPASS_SUBCOMMANDS: &[&str] = &[
     "completion",
     "plugin",
     "mcp",
-    "mcp-server",
-    "app-server",
     "app",
     "sandbox",
     "debug",
     "apply",
-    "exec-server",
     "features",
     "help",
 ];
@@ -66,9 +47,6 @@ const ARG_MANAGER_DIR: &str = "manager-dir";
 const ARG_CODEX_BIN: &str = "codex-bin";
 const ARG_CX_QUIET: &str = "cx-quiet";
 const ARG_CX_DEBUG: &str = "cx-debug";
-#[cfg(feature = "service")]
-const ARG_CX_SERVICE_REMOTE: &str = "cx-service-remote";
-const ARG_MANAGED: &str = "managed";
 const ARG_CODEX_ARGS: &str = "codex-args";
 
 pub(crate) fn launcher_command() -> ClapCommand {
@@ -119,29 +97,15 @@ pub(crate) fn launcher_command() -> ClapCommand {
                 .action(ArgAction::SetTrue)
                 .help("Print slot selection details"),
         );
-    #[cfg(feature = "service")]
-    let command = command.arg(
-        Arg::new(ARG_CX_SERVICE_REMOTE)
-            .long(ARG_CX_SERVICE_REMOTE)
-            .action(ArgAction::SetTrue)
-            .help("Use experimental cx service remote"),
-    );
-    command
-        .arg(
-            Arg::new(ARG_MANAGED)
-                .long(ARG_MANAGED)
-                .hide(true)
-                .action(ArgAction::SetTrue),
-        )
-        .arg(
-            Arg::new(ARG_CODEX_ARGS)
-                .value_name("CODEX_ARGS")
-                .value_parser(OsStringValueParser::new())
-                .num_args(0..)
-                .allow_hyphen_values(true)
-                .last(true)
-                .help("Arguments passed verbatim to Codex after `--`"),
-        )
+    command.arg(
+        Arg::new(ARG_CODEX_ARGS)
+            .value_name("CODEX_ARGS")
+            .value_parser(OsStringValueParser::new())
+            .num_args(0..)
+            .allow_hyphen_values(true)
+            .last(true)
+            .help("Arguments passed verbatim to Codex after `--`"),
+    )
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -152,8 +116,6 @@ struct RunOptions {
     codex_bin: Option<PathBuf>,
     quiet: bool,
     debug: bool,
-    #[cfg(feature = "service")]
-    service_remote: bool,
     codex_args: Vec<OsString>,
 }
 
@@ -181,8 +143,6 @@ pub(crate) struct CodexCommandSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CodexLaunchContext {
     Slot,
-    #[cfg(feature = "service")]
-    ServiceBroker,
 }
 
 impl CodexCommandSpec {
@@ -222,41 +182,6 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
             .is_some_and(|arg| BYPASS_SUBCOMMANDS.contains(&arg))
     {
         return exec_real_codex(&real_codex, options.codex_args);
-    }
-
-    #[cfg(feature = "service")]
-    let clean_tui_launch = options.codex_args.is_empty();
-    #[cfg(feature = "service")]
-    let workspace = resolve_workspace_from_args(&options.codex_args)?;
-    #[cfg(feature = "service")]
-    let requested_resume_id = explicit_resume_id(&options.codex_args);
-    #[cfg(feature = "service")]
-    if should_try_service_remote(&options) {
-        match remote_attach_spec(
-            &paths,
-            real_codex.clone(),
-            &options.codex_args,
-            &workspace,
-            requested_resume_id,
-            clean_tui_launch,
-        ) {
-            Ok(Some(spec)) => {
-                warn_remote_ignores_local_selection(&options, &spec);
-                let resumed_id = explicit_resume_id(&spec.args);
-                print_launch(
-                    &spec,
-                    resumed_id.as_ref().map(ExplicitResumeId::as_str),
-                    options.quiet,
-                );
-                if let Err(err) = supervise_remote_tui(&paths, spec) {
-                    warn_remote_fallback(&err);
-                } else {
-                    return Ok(());
-                }
-            }
-            Ok(None) => {}
-            Err(err) => warn_remote_fallback(&err),
-        }
     }
 
     let target = crate::target::load_optional_target(&paths, options.target.as_deref())?;
@@ -309,9 +234,6 @@ pub fn exec_slot_login(paths: &ManagerPaths, args: LoginArgs) -> Result<()> {
 }
 
 pub(crate) fn should_skip_stdin_wrapper(args: &[OsString]) -> bool {
-    if args.iter().any(|arg| arg == "--managed") {
-        return true;
-    }
     let Ok(options) = parse_run_args(args.to_vec()) else {
         return true;
     };
@@ -435,274 +357,12 @@ fn print_launch(spec: &CodexCommandSpec, resumed_id: Option<&str>, quiet: bool) 
     }
     match spec.launch_context {
         CodexLaunchContext::Slot => eprintln!("codex slot: {}", spec.slot()),
-        #[cfg(feature = "service")]
-        CodexLaunchContext::ServiceBroker => eprintln!("codex service: broker"),
     }
     if let Some(target) = spec.target_name() {
         eprintln!("codex target: {target}");
     }
     if let Some(resumed_id) = resumed_id {
         eprintln!("codex resume: {resumed_id}");
-    }
-}
-
-#[cfg(feature = "service")]
-fn warn_remote_fallback(err: &anyhow::Error) {
-    eprintln!("cx warning: service remote unavailable ({err:#}); falling back to local Codex");
-}
-
-#[cfg(feature = "service")]
-fn should_try_service_remote(options: &RunOptions) -> bool {
-    options.service_remote && options.slot.is_none() && options.target.is_none()
-}
-
-#[cfg(feature = "service")]
-fn warn_remote_ignores_local_selection(options: &RunOptions, spec: &CodexCommandSpec) {
-    if options.quiet {
-        return;
-    }
-    if let Some(slot) = options.slot.as_deref() {
-        match spec.launch_context {
-            CodexLaunchContext::Slot if slot != spec.slot() => {
-                eprintln!(
-                    "cx warning: --slot {slot} ignored because service remote is using slot {}",
-                    spec.slot()
-                );
-            }
-            CodexLaunchContext::ServiceBroker => {
-                eprintln!(
-                    "cx warning: --slot {slot} ignored because service remote is using broker"
-                );
-            }
-            _ => {}
-        }
-    }
-    if let Some(target) = options
-        .target
-        .as_deref()
-        .filter(|target| Some(*target) != spec.target_name())
-    {
-        eprintln!(
-            "cx warning: --target {target} ignored because service remote is using target {}",
-            spec.target_name().unwrap_or("<none>")
-        );
-    }
-}
-
-#[cfg(feature = "service")]
-const MAX_REMOTE_TUI_RESTARTS: u64 = 3;
-
-#[cfg(feature = "service")]
-fn supervise_remote_tui(paths: &ManagerPaths, spec: CodexCommandSpec) -> Result<()> {
-    let mut restarts = 0_u64;
-    loop {
-        preload_remote_thread(paths, &spec)?;
-        let status = spec
-            .clone()
-            .into_command()
-            .status()
-            .context("run remote Codex TUI")?;
-        if status.success() {
-            return Ok(());
-        }
-        restarts = restarts
-            .checked_add(1)
-            .context("remote TUI restart counter overflow")?;
-        if serve::ready_app_server(paths).is_err() {
-            anyhow::bail!("remote Codex TUI exited with {status} and cx service is not ready");
-        }
-        if restarts >= MAX_REMOTE_TUI_RESTARTS {
-            anyhow::bail!(
-                "remote Codex TUI exited with {status} after {restarts} attempts; \
-                 the cached session may be stale (e.g. after a codex upgrade). \
-                 Try `cx service restart`."
-            );
-        }
-        eprintln!(
-            "cx remote tui exited with {status}; restarting on same app-server thread (attempt {restarts})"
-        );
-        thread::sleep(Duration::from_millis(500));
-    }
-}
-
-#[cfg(feature = "service")]
-fn preload_remote_thread(paths: &ManagerPaths, spec: &CodexCommandSpec) -> Result<()> {
-    let Some(app_server_url) = remote_arg_value(&spec.args, "--remote") else {
-        return Ok(());
-    };
-    let Some(resume_id) = remote_resume_id(&spec.args) else {
-        return Ok(());
-    };
-    let workspace = resolve_workspace_from_args(&spec.args)?;
-    let server = serve::ready_app_server(paths).context("service app-server is not ready")?;
-    let mut client = AppServerClient::connect(app_server_url, Duration::from_secs(5))
-        .context("connect app-server before remote TUI resume")?;
-    client.initialize("cx-tui", env!("CARGO_PKG_VERSION"))?;
-    let outcome = thread_resolver::resolve_app_thread(
-        paths,
-        &mut client,
-        ThreadResolverScope {
-            cwd: workspace,
-            channel_id: None,
-            explicit_resume_id: Some(resume_id),
-            slot: server.app_slot(),
-            generation: 0,
-        },
-    )?;
-    if let ThreadResolverDecision::Refuse { reason } = outcome.decision {
-        anyhow::bail!("{reason}");
-    }
-    Ok(())
-}
-
-#[cfg(feature = "service")]
-fn remote_arg_value<'a>(args: &'a [OsString], name: &str) -> Option<&'a str> {
-    let mut index = 0;
-    while index < args.len() {
-        let Some(arg) = args[index].to_str() else {
-            index += 1;
-            continue;
-        };
-        if arg == name {
-            return args.get(index + 1).and_then(|value| value.to_str());
-        }
-        if let Some(value) = arg.strip_prefix(&format!("{name}=")) {
-            return Some(value);
-        }
-        index += 1;
-    }
-    None
-}
-
-#[cfg(feature = "service")]
-fn remote_resume_id(args: &[OsString]) -> Option<ExplicitResumeId> {
-    let mut index = 0;
-    while index < args.len() {
-        let arg = args[index].to_string_lossy();
-        if arg.starts_with('-') {
-            match codex_option_kind(arg.as_ref()) {
-                CodexOptionKind::Value if !arg.contains('=') => index += 2,
-                _ => index += 1,
-            }
-            continue;
-        }
-        if arg == "resume" {
-            return args
-                .get(index + 1)
-                .and_then(|value| value.to_str())
-                .map(ExplicitResumeId::parse);
-        }
-        index += 1;
-    }
-    None
-}
-
-#[cfg(feature = "service")]
-fn remote_attach_spec(
-    paths: &ManagerPaths,
-    real_codex: PathBuf,
-    base_args: &[OsString],
-    workspace: &Path,
-    explicit_resume_id: Option<ExplicitResumeId>,
-    clean_tui_launch: bool,
-) -> Result<Option<CodexCommandSpec>> {
-    if explicit_resume_id.is_none() && !clean_tui_launch {
-        return Ok(None);
-    }
-    let server = serve::ready_app_server(paths).context("cx service app-server is not ready")?;
-    if !remote_attach_supports_resume(server.kind, explicit_resume_id.as_ref()) {
-        return Ok(None);
-    }
-
-    let mut client =
-        AppServerClient::connect(&server.listen_url, std::time::Duration::from_secs(5))
-            .context("connect ready app-server for remote attach")?;
-    client.initialize("cx-tui", env!("CARGO_PKG_VERSION"))?;
-    let scope = ThreadResolverScope {
-        cwd: workspace.to_path_buf(),
-        channel_id: None,
-        explicit_resume_id,
-        slot: server.app_slot(),
-        generation: 0,
-    };
-    let outcome = thread_resolver::resolve_app_thread(paths, &mut client, scope)?;
-    let thread_id = match outcome.decision {
-        ThreadResolverDecision::AttachExisting { thread_id } => thread_id,
-        ThreadResolverDecision::StartNew { .. } => outcome
-            .thread_id
-            .context("thread resolver started a thread without returning its id")?,
-        ThreadResolverDecision::Refuse { reason } => anyhow::bail!("{reason}"),
-    };
-
-    Ok(Some(build_remote_tui_command_spec(
-        paths, real_codex, &server, base_args, workspace, &thread_id,
-    )?))
-}
-
-#[cfg(feature = "service")]
-fn build_remote_tui_command_spec(
-    paths: &ManagerPaths,
-    real_codex: PathBuf,
-    server: &serve::ReadyAppServer,
-    base_args: &[OsString],
-    workspace: &Path,
-    thread_id: &str,
-) -> Result<CodexCommandSpec> {
-    let (codex_home, slot, launch_context) = remote_launch_home(paths, server);
-    let envs = remote_tui_env(paths, launch_context, &codex_home)?;
-    Ok(CodexCommandSpec {
-        program: real_codex,
-        codex_home,
-        envs,
-        args: remote_tui_args(base_args, &server.listen_url, workspace, thread_id),
-        slot,
-        target_name: server.target.clone(),
-        launch_context,
-    })
-}
-
-#[cfg(feature = "service")]
-fn remote_attach_supports_resume(
-    server_kind: ServeEndpointKind,
-    explicit_resume_id: Option<&ExplicitResumeId>,
-) -> bool {
-    explicit_resume_id.is_none() || server_kind == ServeEndpointKind::Broker
-}
-
-#[cfg(feature = "service")]
-fn remote_tui_env(
-    paths: &ManagerPaths,
-    launch_context: CodexLaunchContext,
-    codex_home: &Path,
-) -> Result<BTreeMap<String, String>> {
-    let sqlite_home = match launch_context {
-        CodexLaunchContext::Slot => codex_home.join("sqlite"),
-        CodexLaunchContext::ServiceBroker => paths.remote_tui_sqlite_home(),
-    };
-    let mut envs = BTreeMap::new();
-    insert_sqlite_home_env(&mut envs, sqlite_home)?;
-    Ok(envs)
-}
-
-#[cfg(feature = "service")]
-fn remote_launch_home(
-    paths: &ManagerPaths,
-    server: &serve::ReadyAppServer,
-) -> (PathBuf, String, CodexLaunchContext) {
-    match server.kind {
-        ServeEndpointKind::AppServer => {
-            let codex_home = server
-                .codex_home
-                .as_deref()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| paths.slot_home(&server.slot));
-            (codex_home, server.slot.clone(), CodexLaunchContext::Slot)
-        }
-        ServeEndpointKind::Broker => (
-            paths.base_codex_home.clone(),
-            String::from("service-broker"),
-            CodexLaunchContext::ServiceBroker,
-        ),
     }
 }
 
@@ -718,60 +378,6 @@ fn insert_sqlite_home_env(envs: &mut BTreeMap<String, String>, sqlite_home: Path
 fn ensure_sqlite_home(sqlite_home: &Path) -> Result<()> {
     fs::create_dir_all(sqlite_home)
         .with_context(|| format!("create sqlite home {}", sqlite_home.display()))
-}
-
-#[cfg(feature = "service")]
-fn remote_tui_args(
-    base_args: &[OsString],
-    app_server_url: &str,
-    workspace: &Path,
-    thread_id: &str,
-) -> Vec<OsString> {
-    let mut args = strip_resume_subcommand(base_args);
-    args.push(OsString::from("--remote"));
-    args.push(OsString::from(app_server_url));
-    args.push(OsString::from("-C"));
-    args.push(OsString::from(workspace.as_os_str()));
-    args.push(OsString::from("resume"));
-    args.push(OsString::from(thread_id));
-    args
-}
-
-#[cfg(feature = "service")]
-fn strip_resume_subcommand(base_args: &[OsString]) -> Vec<OsString> {
-    let mut args = Vec::new();
-    let mut index = 0;
-    while index < base_args.len() {
-        let arg = &base_args[index];
-        let arg_text = arg.to_string_lossy();
-        if arg_text.starts_with('-') {
-            args.push(arg.clone());
-            match codex_option_kind(arg_text.as_ref()) {
-                CodexOptionKind::Value if !arg_text.contains('=') => {
-                    if let Some(value) = base_args.get(index + 1) {
-                        args.push(value.clone());
-                    }
-                    index += 2;
-                }
-                _ => index += 1,
-            }
-            continue;
-        }
-        if arg_text == "resume" {
-            index += if base_args
-                .get(index + 1)
-                .is_some_and(|value| !value.to_string_lossy().starts_with('-'))
-            {
-                2
-            } else {
-                1
-            };
-            continue;
-        }
-        args.push(arg.clone());
-        index += 1;
-    }
-    args
 }
 
 fn exec_real_codex(real_codex: &Path, args: Vec<OsString>) -> Result<()> {
@@ -852,7 +458,7 @@ fn first_forwarded_non_option(args: &[OsString]) -> Option<String> {
             "--slot" | "--target" | "--manager-dir" | "--codex-bin" | "-s" => {
                 let _ = iter.next();
             }
-            "--managed" | "--cx-quiet" | "--cx-debug" | "--cx-service-remote" => {}
+            "--cx-quiet" | "--cx-debug" => {}
             _ if arg_text.starts_with("--slot=")
                 || arg_text.starts_with("--target=")
                 || arg_text.starts_with("--manager-dir=")
@@ -916,46 +522,6 @@ pub(crate) fn codex_option_kind(arg: &str) -> CodexOptionKind {
     }
 }
 
-#[cfg(feature = "service")]
-fn resolve_workspace(workspace: Option<PathBuf>) -> Result<PathBuf> {
-    let cwd = std::env::current_dir().context("resolve current directory")?;
-    let workspace = match workspace {
-        Some(workspace) if workspace.is_absolute() => workspace,
-        Some(workspace) => cwd.join(workspace),
-        None => cwd,
-    };
-    match std::fs::canonicalize(&workspace) {
-        Ok(path) => Ok(path),
-        Err(_) => Ok(workspace),
-    }
-}
-
-#[cfg(feature = "service")]
-pub(crate) fn resolve_workspace_from_args(args: &[OsString]) -> Result<PathBuf> {
-    let mut workspace = None;
-    let mut index = 0;
-    while index < args.len() {
-        let arg = &args[index];
-        let arg_text = arg.to_string_lossy();
-        if matches!(arg_text.as_ref(), "-C" | "--cd") {
-            index += 1;
-            let value = args
-                .get(index)
-                .with_context(|| format!("{arg_text} requires a value"))?;
-            workspace = Some(PathBuf::from(value));
-            index += 1;
-            continue;
-        }
-        if let Some(value) = arg_text.strip_prefix("--cd=") {
-            workspace = Some(PathBuf::from(value));
-            index += 1;
-            continue;
-        }
-        index += 1;
-    }
-    resolve_workspace(workspace)
-}
-
 pub(crate) fn explicit_resume_id(args: &[OsString]) -> Option<ExplicitResumeId> {
     let mut index = 0;
     while index < args.len() {
@@ -1009,10 +575,6 @@ fn parse_run_args(args: Vec<OsString>) -> Result<RunOptions> {
         }
     };
 
-    if matches.get_flag(ARG_MANAGED) {
-        anyhow::bail!("{}", removed_managed_message());
-    }
-
     Ok(RunOptions {
         slot: matches.get_one::<String>(ARG_SLOT).cloned(),
         target: matches.get_one::<String>(ARG_TARGET).cloned(),
@@ -1020,24 +582,11 @@ fn parse_run_args(args: Vec<OsString>) -> Result<RunOptions> {
         codex_bin: matches.get_one::<PathBuf>(ARG_CODEX_BIN).cloned(),
         quiet: matches.get_flag(ARG_CX_QUIET),
         debug: matches.get_flag(ARG_CX_DEBUG),
-        #[cfg(feature = "service")]
-        service_remote: matches.get_flag(ARG_CX_SERVICE_REMOTE),
         codex_args: matches
             .get_many::<OsString>(ARG_CODEX_ARGS)
             .map(|values| values.cloned().collect())
             .unwrap_or_default(),
     })
-}
-
-fn removed_managed_message() -> &'static str {
-    #[cfg(feature = "service")]
-    {
-        "`cx --managed` was removed; service remote is experimental. Start the service with `cx service start --no-telegram`, then opt in with `cx --cx-service-remote`."
-    }
-    #[cfg(not(feature = "service"))]
-    {
-        "`cx --managed` was removed; service remote is not compiled into this build. Rebuild cx with `--features service` to use service remote."
-    }
 }
 
 pub(crate) fn split_launcher_args(args: &[OsString]) -> Result<LauncherArgsSplit> {
@@ -1096,71 +645,6 @@ mod tests {
             options.codex_args,
             vec![OsString::from("-m"), OsString::from("gpt-5.5")]
         );
-    }
-
-    #[cfg(feature = "service")]
-    #[test]
-    fn service_remote_is_skipped_for_explicit_slot() {
-        let options =
-            parse_run_args(vec![OsString::from("--slot"), OsString::from("deepseek")]).unwrap();
-
-        assert_eq!(options.slot, Some(String::from("deepseek")));
-        assert!(!should_try_service_remote(&options));
-    }
-
-    #[cfg(feature = "service")]
-    #[test]
-    fn service_remote_is_skipped_for_explicit_target() {
-        let options =
-            parse_run_args(vec![OsString::from("--target"), OsString::from("research")]).unwrap();
-
-        assert_eq!(options.target, Some(String::from("research")));
-        assert!(!should_try_service_remote(&options));
-    }
-
-    #[cfg(feature = "service")]
-    #[test]
-    fn service_remote_is_skipped_for_plain_launch_by_default() {
-        let options = parse_run_args(Vec::new()).unwrap();
-
-        assert!(!options.service_remote);
-        assert!(!should_try_service_remote(&options));
-    }
-
-    #[cfg(feature = "service")]
-    #[test]
-    fn service_remote_requires_explicit_experimental_opt_in() {
-        let options = parse_run_args(vec![OsString::from("--cx-service-remote")]).unwrap();
-
-        assert!(options.service_remote);
-        assert!(should_try_service_remote(&options));
-    }
-
-    #[test]
-    fn managed_flag_is_rejected() {
-        let err = parse_run_args(vec![OsString::from("--managed")]).unwrap_err();
-
-        assert!(format!("{err:#}").contains("was removed"));
-    }
-
-    #[test]
-    fn app_server_subcommand_skips_stdin_wrapper() {
-        assert!(should_skip_stdin_wrapper(&[
-            OsString::from("--slot"),
-            OsString::from("bus1"),
-            OsString::from("--"),
-            OsString::from("app-server"),
-            OsString::from("--help"),
-        ]));
-    }
-
-    #[test]
-    fn removed_managed_flag_skips_stdin_wrapper_for_error_reporting() {
-        assert!(should_skip_stdin_wrapper(&[
-            OsString::from("--managed"),
-            OsString::from("resume"),
-            OsString::from("sid"),
-        ]));
     }
 
     #[test]
@@ -1238,78 +722,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "service")]
-    #[test]
-    fn remote_tui_args_injects_remote_cd_and_resume() {
-        let args = remote_tui_args(
-            &[OsString::from("-c"), OsString::from("model=\"gpt-5.5\"")],
-            "ws://127.0.0.1:17654",
-            Path::new("/tmp/project"),
-            "thread-1",
-        );
-
-        assert_eq!(
-            args,
-            vec![
-                OsString::from("-c"),
-                OsString::from("model=\"gpt-5.5\""),
-                OsString::from("--remote"),
-                OsString::from("ws://127.0.0.1:17654"),
-                OsString::from("-C"),
-                OsString::from("/tmp/project"),
-                OsString::from("resume"),
-                OsString::from("thread-1"),
-            ]
-        );
-    }
-
-    #[cfg(feature = "service")]
-    #[test]
-    fn remote_tui_args_replaces_explicit_resume() {
-        let args = remote_tui_args(
-            &[OsString::from("resume"), OsString::from("old-thread")],
-            "ws://127.0.0.1:17654",
-            Path::new("/tmp/project"),
-            "new-thread",
-        );
-
-        assert_eq!(
-            args,
-            vec![
-                OsString::from("--remote"),
-                OsString::from("ws://127.0.0.1:17654"),
-                OsString::from("-C"),
-                OsString::from("/tmp/project"),
-                OsString::from("resume"),
-                OsString::from("new-thread"),
-            ]
-        );
-    }
-
-    #[cfg(feature = "service")]
-    #[test]
-    fn remote_resume_id_skips_root_options() {
-        let args = vec![
-            OsString::from("--remote"),
-            OsString::from("ws://127.0.0.1:17654"),
-            OsString::from("-C"),
-            OsString::from("/tmp/project"),
-            OsString::from("resume"),
-            OsString::from("thread-1"),
-        ];
-
-        assert_eq!(
-            remote_arg_value(&args, "--remote"),
-            Some("ws://127.0.0.1:17654")
-        );
-        assert_eq!(
-            remote_resume_id(&args),
-            Some(ExplicitResumeId::AppThreadOrCodexSession(
-                "thread-1".to_string()
-            ))
-        );
-    }
-
     #[test]
     fn slot_command_spec_injects_slot_sqlite_home() {
         let paths = test_paths("slot-sqlite-home");
@@ -1338,99 +750,6 @@ mod tests {
 
         let _ = fs::remove_dir_all(&paths.manager_dir);
         let _ = fs::remove_dir_all(&paths.base_codex_home);
-    }
-
-    #[cfg(feature = "service")]
-    #[test]
-    fn broker_remote_launch_uses_base_home_not_broker_slot_home() {
-        let paths = test_paths("broker-home");
-        let server = serve::ReadyAppServer {
-            kind: ServeEndpointKind::Broker,
-            listen_url: String::from("ws://127.0.0.1:17654"),
-            slot: String::from("broker"),
-            codex_home: None,
-            target: None,
-        };
-
-        let (codex_home, slot, launch_context) = remote_launch_home(&paths, &server);
-
-        assert_eq!(codex_home, paths.base_codex_home);
-        assert_ne!(codex_home, paths.slot_home("broker"));
-        assert_eq!(slot, "service-broker");
-        assert_eq!(launch_context, CodexLaunchContext::ServiceBroker);
-        assert_eq!(server.app_slot(), None);
-    }
-
-    #[cfg(feature = "service")]
-    #[test]
-    fn broker_remote_tui_command_spec_injects_client_sqlite_home() {
-        let paths = test_paths("broker-remote-sqlite-home");
-        let server = serve::ReadyAppServer {
-            kind: ServeEndpointKind::Broker,
-            listen_url: String::from("ws://127.0.0.1:17654"),
-            slot: String::from("broker"),
-            codex_home: None,
-            target: None,
-        };
-
-        let spec = build_remote_tui_command_spec(
-            &paths,
-            PathBuf::from("/bin/codex"),
-            &server,
-            &[],
-            Path::new("/tmp/project"),
-            "thread-1",
-        )
-        .unwrap();
-        let sqlite_home = PathBuf::from(spec.envs.get(CODEX_SQLITE_HOME).unwrap());
-
-        assert_eq!(spec.codex_home, paths.base_codex_home);
-        assert_eq!(spec.slot, "service-broker");
-        assert_eq!(spec.launch_context, CodexLaunchContext::ServiceBroker);
-        assert_ne!(sqlite_home, paths.base_codex_home);
-        assert!(sqlite_home.starts_with(paths.serve_dir()));
-        assert!(sqlite_home.is_dir());
-
-        let _ = fs::remove_dir_all(&paths.manager_dir);
-    }
-
-    #[cfg(feature = "service")]
-    #[test]
-    fn app_server_remote_launch_uses_recorded_slot_home() {
-        let paths = test_paths("app-server-home");
-        let server = serve::ReadyAppServer {
-            kind: ServeEndpointKind::AppServer,
-            listen_url: String::from("ws://127.0.0.1:17654"),
-            slot: String::from("dia4"),
-            codex_home: None,
-            target: None,
-        };
-
-        let (codex_home, slot, launch_context) = remote_launch_home(&paths, &server);
-
-        assert_eq!(codex_home, paths.slot_home("dia4"));
-        assert_eq!(slot, "dia4");
-        assert_eq!(launch_context, CodexLaunchContext::Slot);
-        assert_eq!(server.app_slot(), Some(String::from("dia4")));
-    }
-
-    #[cfg(feature = "service")]
-    #[test]
-    fn explicit_resume_requires_broker_remote() {
-        let resume_id = ExplicitResumeId::AppThreadOrCodexSession(String::from("thread-1"));
-
-        assert!(!remote_attach_supports_resume(
-            ServeEndpointKind::AppServer,
-            Some(&resume_id)
-        ));
-        assert!(remote_attach_supports_resume(
-            ServeEndpointKind::Broker,
-            Some(&resume_id)
-        ));
-        assert!(remote_attach_supports_resume(
-            ServeEndpointKind::AppServer,
-            None
-        ));
     }
 
     #[test]

@@ -14,6 +14,7 @@ mod selector;
 mod slot;
 mod stats;
 mod target;
+mod terminal_resume;
 mod transfer;
 mod upgrade;
 mod usage;
@@ -43,6 +44,9 @@ fn main() -> ExitCode {
 fn entry() -> Result<()> {
     let raw_args = std::env::args_os().collect::<Vec<_>>();
     let first_arg = raw_args.get(1).and_then(|arg| arg.to_str());
+    if first_arg == Some(terminal_resume::WATCH_SESSION_ARG) {
+        return terminal_resume::run_internal_watcher(raw_args.into_iter().skip(2).collect());
+    }
     if !is_management_entry_arg(first_arg) {
         return cx::run_from_args(raw_args.into_iter().skip(1).collect());
     }

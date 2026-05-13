@@ -24,6 +24,9 @@ use crate::resume_id::ExplicitResumeId;
 use crate::selector;
 use crate::slot;
 use crate::target::TargetSpec;
+use crate::terminal_resume;
+use crate::terminal_resume::ResumeState;
+use crate::terminal_resume::TerminalKey;
 
 const BYPASS_SUBCOMMANDS: &[&str] = &[
     "login",
@@ -47,6 +50,7 @@ const ARG_MANAGER_DIR: &str = "manager-dir";
 const ARG_CODEX_BIN: &str = "codex-bin";
 const ARG_CX_QUIET: &str = "cx-quiet";
 const ARG_CX_DEBUG: &str = "cx-debug";
+const ARG_NEW_SESSION: &str = "new";
 const ARG_CODEX_ARGS: &str = "codex-args";
 
 pub(crate) fn launcher_command() -> ClapCommand {
@@ -96,6 +100,12 @@ pub(crate) fn launcher_command() -> ClapCommand {
                 .long(ARG_CX_DEBUG)
                 .action(ArgAction::SetTrue)
                 .help("Print slot selection details"),
+        )
+        .arg(
+            Arg::new(ARG_NEW_SESSION)
+                .long(ARG_NEW_SESSION)
+                .action(ArgAction::SetTrue)
+                .help("Start a fresh Codex session instead of auto-resuming this terminal"),
         );
     command.arg(
         Arg::new(ARG_CODEX_ARGS)
@@ -116,6 +126,7 @@ struct RunOptions {
     codex_bin: Option<PathBuf>,
     quiet: bool,
     debug: bool,
+    new_session: bool,
     codex_args: Vec<OsString>,
 }
 
@@ -127,6 +138,14 @@ pub(crate) struct LauncherArgsSplit {
 pub(crate) struct RuntimeSelection {
     pub slot: String,
     pub target: Option<TargetSpec>,
+}
+
+#[derive(Debug, Clone)]
+struct TerminalResumeLaunch {
+    cwd: PathBuf,
+    key: Option<TerminalKey>,
+    auto_state: Option<ResumeState>,
+    direct_launch: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -168,6 +187,25 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
     let paths = ManagerPaths::new(options.manager_dir.clone())?;
     crate::upgrade::run_startup(&paths)?;
     let real_codex = resolve_codex_bin(options.codex_bin.as_deref())?;
+    let launch_cwd = std::env::current_dir().context("resolve current directory")?;
+    let direct_launch = options.codex_args.is_empty();
+    let explicit_resume = explicit_resume_id(&options.codex_args);
+    let terminal_key = (direct_launch || explicit_resume.is_some())
+        .then(terminal_resume::current_terminal_key)
+        .flatten();
+    let auto_resume_state = if direct_launch
+        && !options.new_session
+        && std::env::var_os("CX_NO_AUTO_RESUME").is_none()
+        && options.target.is_none()
+    {
+        terminal_key
+            .as_ref()
+            .map(|key| terminal_resume::load_resume_state(&paths, key, &launch_cwd))
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
 
     if std::env::var_os("CODEX_HOME").is_some()
         && options.slot.is_none()
@@ -191,12 +229,17 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
     } else {
         slot::load_rotation(&paths)?
     };
-    if candidates.is_empty() && options.slot.is_none() {
+    if candidates.is_empty() && options.slot.is_none() && auto_resume_state.is_none() {
         return exec_real_codex(&real_codex, options.codex_args);
     }
 
     let selected_slot = if let Some(slot) = options.slot.clone() {
         slot
+    } else if let Some(state) = auto_resume_state
+        .as_ref()
+        .filter(|state| paths.slot_home(&state.slot).is_dir())
+    {
+        state.slot.clone()
     } else {
         let results = selector::query_slots(&paths, &candidates, usage_query_options())?;
         let selected = selector::choose_result(&results);
@@ -218,6 +261,12 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
         &selected_slot,
         target.as_ref(),
         options,
+        TerminalResumeLaunch {
+            cwd: launch_cwd,
+            key: terminal_key,
+            auto_state: auto_resume_state,
+            direct_launch,
+        },
     )
 }
 
@@ -335,15 +384,55 @@ fn exec_slot_codex(
     selected_slot: &str,
     target: Option<&TargetSpec>,
     options: RunOptions,
+    resume_launch: TerminalResumeLaunch,
 ) -> Result<()> {
-    let spec = build_slot_command_spec(
+    let mut spec = build_slot_command_spec(
         paths,
         real_codex.to_path_buf(),
         selected_slot,
         target,
         options.codex_args,
     )?;
-    let resumed_id = explicit_resume_id(&spec.args);
+    let explicit_resume = explicit_resume_id(&spec.args);
+    let mut resumed_id = explicit_resume.clone();
+    if explicit_resume.is_none() {
+        if let Some(state) = resume_launch
+            .auto_state
+            .as_ref()
+            .filter(|state| state.slot == selected_slot)
+        {
+            spec.args.push(OsString::from("resume"));
+            spec.args.push(OsString::from(state.session_id.clone()));
+            resumed_id = Some(ExplicitResumeId::parse(state.session_id.clone()));
+        }
+    }
+
+    if let (Some(key), Some(resume_id)) = (resume_launch.key.as_ref(), explicit_resume.as_ref()) {
+        let _ = terminal_resume::record_resume_state(
+            paths,
+            key,
+            selected_slot,
+            &resume_launch.cwd,
+            resume_id.as_str(),
+            None,
+        );
+    }
+
+    if resume_launch.direct_launch || explicit_resume.is_some() {
+        if let Some(key) = resume_launch.key.as_ref() {
+            let launch_started_unix_ms = terminal_resume::now_unix_ms();
+            let _ = terminal_resume::spawn_session_watcher(
+                paths,
+                &spec.codex_home,
+                selected_slot,
+                &resume_launch.cwd,
+                key,
+                launch_started_unix_ms,
+                std::process::id(),
+            );
+        }
+    }
+
     print_launch(
         &spec,
         resumed_id.as_ref().map(ExplicitResumeId::as_str),
@@ -595,6 +684,7 @@ fn parse_run_args(args: Vec<OsString>) -> Result<RunOptions> {
         codex_bin: matches.get_one::<PathBuf>(ARG_CODEX_BIN).cloned(),
         quiet: matches.get_flag(ARG_CX_QUIET),
         debug: matches.get_flag(ARG_CX_DEBUG),
+        new_session: matches.get_flag(ARG_NEW_SESSION),
         codex_args: matches
             .get_many::<OsString>(ARG_CODEX_ARGS)
             .map(|values| values.cloned().collect())
@@ -691,6 +781,14 @@ mod tests {
                 OsString::from("hello")
             ]
         );
+    }
+
+    #[test]
+    fn new_flag_disables_launcher_auto_resume_policy() {
+        let options = parse_run_args(vec![OsString::from("--new")]).unwrap();
+
+        assert!(options.new_session);
+        assert!(options.codex_args.is_empty());
     }
 
     #[test]

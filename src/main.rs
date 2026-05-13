@@ -176,6 +176,9 @@ fn entry() -> Result<()> {
         Command::Completions(args) => {
             completion::print_script(args.shell)?;
         }
+        Command::Complete(args) => {
+            completion::print_candidates(args)?;
+        }
     }
     Ok(())
 }
@@ -199,6 +202,7 @@ mod tests {
     #[test]
     fn management_entry_args_come_from_clap_subcommands() {
         assert!(is_management_entry_arg(Some("status")));
+        assert!(is_management_entry_arg(Some("__complete")));
         assert!(is_management_entry_arg(Some("--help")));
         assert!(!is_management_entry_arg(Some("prompt")));
         assert!(!is_management_entry_arg(None));

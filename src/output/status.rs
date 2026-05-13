@@ -68,6 +68,9 @@ pub fn print_report(results: &[SlotResult], selected: Option<&str>, json: bool) 
         if result.five_hour_used_percent.is_none() && result.weekly_used_percent.is_none() {
             println!("  note    {}", result.summary);
         }
+        if let Some(note) = cache_note(result) {
+            println!("  note    {note}");
+        }
         println!();
     }
     if transient_failures > 0 {
@@ -96,4 +99,20 @@ fn transient_failure_count(results: &[SlotResult]) -> usize {
         .iter()
         .filter(|result| result.is_transient())
         .count()
+}
+
+fn cache_note(result: &SlotResult) -> Option<String> {
+    let age = result.cache_age_seconds?;
+    let mut note = if result.stale {
+        format!("stale cache {age}s old")
+    } else {
+        format!("cached {age}s ago")
+    };
+    if let Some(refresh_status) = result.refresh_status.as_deref() {
+        note.push_str(&format!("; refresh {refresh_status}"));
+    }
+    if let Some(retry_after) = result.retry_after_seconds {
+        note.push_str(&format!("; retry after {retry_after}s"));
+    }
+    Some(note)
 }

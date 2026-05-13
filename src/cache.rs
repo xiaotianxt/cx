@@ -16,6 +16,8 @@ pub(crate) mod entries {
     pub(crate) const STATS_CALIBRATION: &str = "stats-calibration.json";
     pub(crate) const STATS_ROLLOUT_SQLITE: &str = "stats-rollout-cache.sqlite";
     pub(crate) const LEGACY_STATS_ROLLOUT_JSON: &str = "stats-rollout-cache.json";
+    pub(crate) const USAGE_RATE_STATE: &str = "usage-rate-state.json";
+    pub(crate) const USAGE_SLOT_CACHE_DIR: &str = "usage-cache/slots";
 }
 
 #[derive(Debug, Clone)]

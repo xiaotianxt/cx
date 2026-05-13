@@ -1,12 +1,17 @@
 use std::time::Duration;
+use std::time::SystemTime;
 
 use anyhow::Result;
 use reqwest::blocking::Client;
 use reqwest::header::HeaderMap;
 use reqwest::header::HeaderValue;
 use reqwest::header::AUTHORIZATION;
+use reqwest::header::RETRY_AFTER;
+use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
+use time::format_description::well_known::Rfc2822;
+use time::OffsetDateTime;
 
 use crate::auth;
 use crate::paths::ManagerPaths;
@@ -26,7 +31,7 @@ pub struct UsageChecker {
     client: Client,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct SlotResult {
     pub slot: String,
     #[serde(rename = "account")]
@@ -49,9 +54,17 @@ pub struct SlotResult {
     pub plan_type: Option<String>,
     #[serde(rename = "rateLimitReachedType")]
     pub rate_limit_reached_type: Option<String>,
+    #[serde(rename = "cacheAgeSeconds", skip_serializing_if = "Option::is_none")]
+    pub cache_age_seconds: Option<i64>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stale: bool,
+    #[serde(rename = "refreshStatus", skip_serializing_if = "Option::is_none")]
+    pub refresh_status: Option<String>,
+    #[serde(rename = "retryAfterSeconds", skip_serializing_if = "Option::is_none")]
+    pub retry_after_seconds: Option<i64>,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum SlotStatus {
     Available,
@@ -62,6 +75,7 @@ pub enum SlotStatus {
     NoAuth,
     Missing,
     HttpError,
+    RateLimited,
     Error,
     BadJson,
 }
@@ -170,6 +184,18 @@ impl UsageChecker {
             )
             .with_account_label(account_label));
         }
+        if status == 429 {
+            let retry_after_seconds = response.headers().get(RETRY_AFTER).and_then(retry_after);
+            let summary = match retry_after_seconds {
+                Some(seconds) => format!("usage check rate limited; retry after {seconds}s"),
+                None => "usage check rate limited".to_string(),
+            };
+            return Ok(
+                SlotResult::new(slot, index, SlotStatus::RateLimited, -1.0, summary)
+                    .with_account_label(account_label)
+                    .with_retry_after_seconds(retry_after_seconds),
+            );
+        }
         if !status.is_success() {
             return Ok(SlotResult::new(
                 slot,
@@ -218,11 +244,56 @@ impl SlotResult {
             weekly_refresh_at: None,
             plan_type: None,
             rate_limit_reached_type: None,
+            cache_age_seconds: None,
+            stale: false,
+            refresh_status: None,
+            retry_after_seconds: None,
         }
     }
 
     pub fn with_account_label(mut self, account_label: Option<String>) -> Self {
         self.account_label = account_label;
+        self
+    }
+
+    pub fn with_retry_after_seconds(mut self, retry_after_seconds: Option<i64>) -> Self {
+        self.retry_after_seconds = retry_after_seconds;
+        self
+    }
+
+    pub fn with_refresh_status(mut self, refresh_status: impl Into<String>) -> Self {
+        self.refresh_status = Some(refresh_status.into());
+        self
+    }
+
+    pub fn mark_cached(
+        mut self,
+        index: usize,
+        age_seconds: i64,
+        stale: bool,
+        refresh_status: Option<String>,
+        retry_after_seconds: Option<i64>,
+    ) -> Self {
+        let age_seconds = age_seconds.max(0);
+        self.index = index;
+        self.cache_age_seconds = Some(age_seconds);
+        self.stale = stale;
+        self.refresh_status = refresh_status;
+        self.retry_after_seconds = retry_after_seconds;
+        if stale {
+            self.summary = format!("{}; stale cache {age_seconds}s old", self.summary);
+        } else {
+            self.summary = format!("{}; cached {age_seconds}s ago", self.summary);
+        }
+        self
+    }
+
+    pub fn for_cache(mut self) -> Self {
+        self.index = 0;
+        self.cache_age_seconds = None;
+        self.stale = false;
+        self.refresh_status = None;
+        self.retry_after_seconds = None;
         self
     }
 
@@ -236,8 +307,24 @@ impl SlotResult {
     pub fn is_transient(&self) -> bool {
         matches!(
             self.status,
+            SlotStatus::HttpError
+                | SlotStatus::RateLimited
+                | SlotStatus::Error
+                | SlotStatus::BadJson
+        )
+    }
+
+    pub fn is_retryable_transient(&self) -> bool {
+        matches!(
+            self.status,
             SlotStatus::HttpError | SlotStatus::Error | SlotStatus::BadJson
         )
+    }
+
+    pub fn is_cacheable_usage(&self) -> bool {
+        matches!(self.status, SlotStatus::Available | SlotStatus::Exhausted)
+            && self.cache_age_seconds.is_none()
+            && self.refresh_status.is_none()
     }
 }
 
@@ -252,10 +339,33 @@ impl SlotStatus {
             SlotStatus::NoAuth => "no_auth",
             SlotStatus::Missing => "missing",
             SlotStatus::HttpError => "http_error",
+            SlotStatus::RateLimited => "rate_limited",
             SlotStatus::Error => "error",
             SlotStatus::BadJson => "bad_json",
         }
     }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn retry_after(value: &HeaderValue) -> Option<i64> {
+    let raw = value.to_str().ok()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Ok(seconds) = raw.parse::<i64>() {
+        return Some(seconds.max(0));
+    }
+
+    let retry_at = OffsetDateTime::parse(raw, &Rfc2822).ok()?;
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_else(|| OffsetDateTime::now_utc().unix_timestamp());
+    Some(retry_at.unix_timestamp().saturating_sub(now).max(0))
 }
 
 fn read_slot_base_url(slot_dir: &std::path::Path, slot_home: &std::path::Path) -> Result<String> {
@@ -325,6 +435,13 @@ mod tests {
             result.rate_limit_reached_type,
             Some("workspace_member_credits_depleted".to_string())
         );
+    }
+
+    #[test]
+    fn retry_after_parses_delay_seconds() {
+        let value = HeaderValue::from_static("12");
+
+        assert_eq!(retry_after(&value), Some(12));
     }
 
     #[test]

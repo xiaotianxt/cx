@@ -60,6 +60,16 @@ rate_limit.limit_reached == true
 
 It intentionally ignores `credits.has_credits=false` as an exhaustion signal.
 
+## Usage Refresh Control
+
+Usage refresh is cached per slot, not per `status` command. Fresh cache entries
+are valid for 30 seconds. Live refreshes go through a persisted adaptive pacer:
+successful refreshes recover the request interval additively, while observed
+`429` responses double the interval and set a short cooldown. `Retry-After`
+wins over the local fallback cooldown. During cooldown, cx does not start new
+usage requests and falls back to stale per-slot cache entries for up to 10
+minutes.
+
 ## Local Launch
 
 For normal interactive launches, `cx` selects a slot and then uses `exec` on

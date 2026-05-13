@@ -77,12 +77,18 @@ masked account label, using a masked email plus a short account-id suffix when
 available, so accounts can be distinguished without printing full email
 addresses.
 
-Usage checks are live, not cached. To avoid burst failures with many accounts,
-`cx status`, `cx select`, and automatic slot selection query at most 4 slots at
-once and retry transient refresh failures once by default. Use `--jobs`,
-`--retries`, and `--timeout` on status/select/doctor online checks when the
-local network needs different limits. Automatic launcher selection also honors
-`CX_SLOT_USAGE_JOBS`, `CX_SLOT_USAGE_RETRIES`, and `CX_SLOT_USAGE_TIMEOUT`.
+Usage checks use a per-slot 30 second cache. Cache misses are refreshed through
+an adaptive scheduler: `--jobs` caps local in-flight work, while a persisted
+request pacer controls how quickly new usage requests start. The pacer starts at
+125ms between live requests, recovers additively after successful refreshes, and
+backs off multiplicatively when the endpoint returns `429`. `Retry-After` is
+honored when present; otherwise cx writes a short cooldown and uses stale
+per-slot cache entries for up to 10 minutes. `cx status`, `cx select`, and
+automatic slot selection retry non-rate-limit transient refresh failures once by
+default. Use `--jobs`, `--retries`, and `--timeout` on status/select/doctor
+online checks when the local network needs different limits. Automatic launcher
+selection also honors `CX_SLOT_USAGE_JOBS`, `CX_SLOT_USAGE_RETRIES`, and
+`CX_SLOT_USAGE_TIMEOUT`.
 Human `cx status` also shows a temporary progress line on stderr when both
 stdout and stderr are interactive terminals. The line is cleared before the
 final report and is disabled for `--json`, pipes, redirects, `--no-progress`,
@@ -155,28 +161,32 @@ cx stats
 cx stats --target research
 cx stats --by-slot
 cx stats bus3
-cx stats --price
-cx stats --price --refresh-prices
+cx stats --refresh-prices
 cx stats --json
-cx stats --price --json
+cx stats --json --refresh-prices
 cx stats --calibrate
 ```
 
 `cx stats` reads Codex's local `state_5.sqlite` and, when rollout JSONL files
-are available, buckets timestamped `token_count` deltas for `1h`, `24h`,
-`today`, `week`, `month`, and `year`. If a rollout is missing or cannot be
-parsed, it falls back to bucketing `threads.tokens_used` by `threads.updated_at`.
-Human output auto-scales token units and stays local-only by default. Price
-estimates are opt-in with `--price`; cx fetches and caches OpenAI's public API
-pricing table, then uses exact rollout token categories when available or the
-saved token mix from `cx stats --calibrate` as a fallback. Calibration is
+are available, buckets timestamped `token_count` deltas by day for the selected
+range. If a rollout is missing or cannot be parsed, it falls back to bucketing
+`threads.tokens_used` by `threads.updated_at`. Rollout parsing is cached in
+`stats-rollout-cache.sqlite` and invalidated by file fingerprint, so hot stats
+runs avoid full JSONL rescans.
+
+Human output auto-scales token units and includes best-effort price estimates by
+default. It uses the cached OpenAI public API pricing table when available, exact
+rollout token categories when available, and the saved token mix from
+`cx stats --calibrate` as a fallback. Use `--no-price` for token-only human
+output, or `--refresh-prices` to force a pricing table refresh. Calibration is
 explicit because it scans rollout JSONL files.
 
-`cx stats --json` emits schema v2. Token-only JSON omits cost fields entirely;
-`cx stats --price --json` adds a `priceEstimate` object plus per-period,
-per-slot, and per-model cost fields. cx-owned `price-cache.json` and
-`stats-calibration.json` include `schemaVersion`. cx never rewrites Codex's
-upstream `state_5.sqlite`.
+`cx stats --json` emits schema v2 and stays token-only by default, omitting cost
+fields entirely. `cx stats --json --refresh-prices` adds a `priceEstimate` object
+plus per-period, per-slot, and per-model cost fields. cx-owned
+`price-cache.json`, `stats-calibration.json`, and `stats-rollout-cache.sqlite`
+live under the profile-manager directory. cx never rewrites Codex's upstream
+`state_5.sqlite`.
 
 Create and authenticate a slot:
 

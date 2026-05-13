@@ -62,10 +62,13 @@ ChatGPT-Account-ID: <account_id>
 reset 时间，summary 会显示下一次 refresh 还要多久。状态行也会展示脱敏账号标识：优先使用
 脱敏 email，并在可用时补一个短 account id 后缀，这样能区分账号，但不会打印完整邮箱地址。
 
-用量检查是实时结果，不做缓存。为了避免账号较多时出现突发请求失败，`cx status`、`cx select`
-和自动 slot 选择默认最多同时查询 4 个 slot，并对临时刷新失败重试 1 次。status/select/doctor
-online 检查可以用 `--jobs`、`--retries` 和 `--timeout` 调整本地网络策略；自动启动选择也支持
-`CX_SLOT_USAGE_JOBS`、`CX_SLOT_USAGE_RETRIES` 和 `CX_SLOT_USAGE_TIMEOUT`。
+用量检查使用 per-slot 30 秒缓存。cache miss 会进入自适应调度器：`--jobs` 只限制本地同时
+进行的刷新数，持久化 request pacer 负责控制新请求启动速度。pacer 默认 live request 间隔
+125ms；成功刷新后加性恢复，接口返回 `429` 时乘性降速。接口带 `Retry-After` 时直接遵守；
+没有时写入短 cooldown，并在最多 10 分钟内用 stale per-slot cache 兜底。`cx status`、
+`cx select` 和自动 slot 选择默认会对非 rate-limit 的临时刷新失败重试 1 次。status/select/
+doctor online 检查可以用 `--jobs`、`--retries` 和 `--timeout` 调整本地网络策略；自动启动
+选择也支持 `CX_SLOT_USAGE_JOBS`、`CX_SLOT_USAGE_RETRIES` 和 `CX_SLOT_USAGE_TIMEOUT`。
 human `cx status` 在 stdout 和 stderr 都是交互式终端时，会在 stderr 显示一行临时进度。
 最终报告打印前会清掉这行；`--json`、pipe、redirect、`--no-progress` 或 `CX_NO_PROGRESS`
 都会禁用它。
@@ -140,24 +143,27 @@ cx stats
 cx stats --target research
 cx stats --by-slot
 cx stats bus3
-cx stats --price
-cx stats --price --refresh-prices
+cx stats --refresh-prices
 cx stats --json
-cx stats --price --json
+cx stats --json --refresh-prices
 cx stats --calibrate
 ```
 
-`cx stats` 读取 Codex 本地维护的 `state_5.sqlite`，按 `threads.updated_at`
-把 `threads.tokens_used` 汇总到 `1h`、`24h`、`today`、`week`、`month`、`year`。
-人类可读输出会自动缩放 token 单位，并且默认只读取本地数据。价格估算需要显式传
-`--price`：cx 会抓取并缓存 OpenAI 公开 API pricing 表，并优先使用
-`cx stats --calibrate` 保存的 token mix。校准是显式触发的，因为它需要扫描 rollout
-JSONL；普通 `cx stats --price` 只读取小的校准文件，或回退到内置 token mix。
+`cx stats` 读取 Codex 本地维护的 `state_5.sqlite`；如果 rollout JSONL 存在，就按选中
+range 聚合 timestamped `token_count` delta。rollout 缺失或无法解析时，才回退到
+`threads.updated_at` 上的 `threads.tokens_used`。rollout 解析结果会缓存在
+`stats-rollout-cache.sqlite`，用文件 fingerprint 失效，热路径不会反复全量扫描 JSONL。
 
-`cx stats --json` 输出 schema v2。默认 token-only JSON 完全不输出成本字段；
-`cx stats --price --json` 会增加 `priceEstimate`，并在 period、slot、model 上输出成本字段。
-cx 自己拥有的 `price-cache.json` 和 `stats-calibration.json` 都带 `schemaVersion`。
-cx 不会改写 Codex 上游的 `state_5.sqlite`。
+人类可读输出会自动缩放 token 单位，并默认展示 best-effort 价格估算。它会优先使用
+已缓存的 OpenAI 公开 API pricing 表、可用时的精确 rollout token 分类，以及
+`cx stats --calibrate` 保存的 token mix。需要 token-only 输出时用 `--no-price`；需要强制刷新
+pricing 表时用 `--refresh-prices`。校准是显式触发的，因为它需要扫描 rollout JSONL。
+
+`cx stats --json` 输出 schema v2，并默认保持 token-only，完全不输出成本字段；
+`cx stats --json --refresh-prices` 会增加 `priceEstimate`，并在 period、slot、model 上输出
+成本字段。cx 自己拥有的 `price-cache.json`、`stats-calibration.json` 和
+`stats-rollout-cache.sqlite` 都位于 profile-manager 目录下。cx 不会改写 Codex 上游的
+`state_5.sqlite`。
 
 新增一个 slot：
 

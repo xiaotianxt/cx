@@ -11,7 +11,6 @@ use serde::Serialize;
 use crate::cli::StatsArgs;
 use crate::paths::ManagerPaths;
 
-use super::legacy_file_schema_version;
 use super::unix_now;
 use super::TokenMix;
 use super::TokenTotals;
@@ -46,7 +45,7 @@ pub(super) enum PriceCachePolicy {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct PriceCache {
-    #[serde(rename = "schemaVersion", default = "legacy_file_schema_version")]
+    #[serde(rename = "schemaVersion")]
     pub(super) schema_version: u64,
     #[serde(rename = "fetchedAt")]
     fetched_at: i64,
@@ -102,22 +101,6 @@ impl PriceCache {
             source_url,
             prices,
         }
-    }
-
-    fn supports_schema_version(&self) -> bool {
-        matches!(
-            self.schema_version,
-            super::LEGACY_FILE_SCHEMA_VERSION | PRICE_CACHE_SCHEMA_VERSION
-        )
-    }
-
-    fn needs_normalization(&self) -> bool {
-        self.schema_version != PRICE_CACHE_SCHEMA_VERSION
-    }
-
-    fn normalized(mut self) -> Self {
-        self.schema_version = PRICE_CACHE_SCHEMA_VERSION;
-        self
     }
 }
 
@@ -223,8 +206,7 @@ fn fetch_prices(price_url: &str) -> Result<BTreeMap<String, ModelPrice>> {
 pub(super) fn read_price_cache(paths: &ManagerPaths) -> Option<PriceCache> {
     let path = paths.manager_dir.join(PRICE_CACHE_FILE);
     let content = fs::read_to_string(&path).ok()?;
-    let cache = parse_price_cache(&content)?;
-    Some(normalize_price_cache_if_needed(paths, cache))
+    parse_price_cache(&content)
 }
 
 fn write_price_cache(paths: &ManagerPaths, cache: &PriceCache) -> Result<()> {
@@ -237,18 +219,7 @@ fn write_price_cache(paths: &ManagerPaths, cache: &PriceCache) -> Result<()> {
 
 pub(super) fn parse_price_cache(content: &str) -> Option<PriceCache> {
     let cache = serde_json::from_str::<PriceCache>(content).ok()?;
-    cache.supports_schema_version().then_some(cache)
-}
-
-fn normalize_price_cache_if_needed(paths: &ManagerPaths, cache: PriceCache) -> PriceCache {
-    if !cache.needs_normalization() {
-        return cache;
-    }
-    let normalized = cache.normalized();
-    if let Err(_err) = write_price_cache(paths, &normalized) {
-        // Cache normalization is best-effort; the parsed cache remains valid for this run.
-    }
-    normalized
+    (cache.schema_version == PRICE_CACHE_SCHEMA_VERSION).then_some(cache)
 }
 
 fn fallback_price_book(token_mix: TokenMix, token_mix_source: &str, reason: &str) -> PriceBook {

@@ -165,9 +165,8 @@ explicit because it scans rollout JSONL files.
 `cx stats --json` emits schema v2. Token-only JSON omits cost fields entirely;
 `cx stats --price --json` adds a `priceEstimate` object plus per-period,
 per-slot, and per-model cost fields. cx-owned `price-cache.json` and
-`stats-calibration.json` are versioned with `schemaVersion` and are normalized
-to the current file schema the first time cx reads them. cx never rewrites
-Codex's upstream `state_5.sqlite`.
+`stats-calibration.json` include `schemaVersion`. cx never rewrites Codex's
+upstream `state_5.sqlite`.
 
 Create and authenticate a slot:
 

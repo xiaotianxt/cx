@@ -30,13 +30,13 @@ pub(super) fn state_db_paths(
             {
                 let entry = entry?;
                 if entry.file_type()?.is_dir() {
-                    candidates.extend(slot_home_state_db_candidates(entry.path().join("home")));
+                    candidates.push(slot_home_state_db_path(entry.path().join("home")));
                 }
             }
         }
     } else {
         for slot in slot_filters {
-            candidates.extend(slot_state_db_candidates(paths, slot));
+            candidates.push(slot_state_db_path(paths, slot));
         }
     }
 
@@ -56,15 +56,12 @@ pub(super) fn state_db_paths(
     Ok(db_paths)
 }
 
-fn slot_state_db_candidates(paths: &ManagerPaths, slot: &str) -> [PathBuf; 2] {
-    slot_home_state_db_candidates(paths.slot_home(slot))
+fn slot_state_db_path(paths: &ManagerPaths, slot: &str) -> PathBuf {
+    slot_home_state_db_path(paths.slot_home(slot))
 }
 
-fn slot_home_state_db_candidates(slot_home: PathBuf) -> [PathBuf; 2] {
-    [
-        slot_home.join("sqlite").join(STATE_DB),
-        slot_home.join(STATE_DB),
-    ]
+fn slot_home_state_db_path(slot_home: PathBuf) -> PathBuf {
+    slot_home.join("sqlite").join(STATE_DB)
 }
 
 pub(super) fn read_threads(
@@ -73,21 +70,12 @@ pub(super) fn read_threads(
     min_since: i64,
 ) -> Result<Vec<ThreadUsage>> {
     let conn = open_state_connection(db_path)?;
-    let columns = thread_columns(&conn)?;
-    if !columns.contains("updated_at") || !columns.contains("tokens_used") {
-        return Ok(Vec::new());
-    }
-
-    let model_provider_expr = optional_column(&columns, "model_provider");
-    let model_expr = optional_column(&columns, "model");
-    let rollout_path_expr = optional_column(&columns, "rollout_path");
-    let sql = format!(
-        "SELECT id, updated_at, tokens_used, {model_provider_expr}, {model_expr}, {rollout_path_expr} \
-         FROM threads \
-         WHERE tokens_used > 0 AND updated_at >= ?1"
-    );
     let mut statement = conn
-        .prepare(&sql)
+        .prepare(
+            "SELECT id, updated_at, tokens_used, model_provider, model, rollout_path
+             FROM threads
+             WHERE tokens_used > 0 AND updated_at >= ?1",
+        )
         .with_context(|| format!("prepare stats query for {}", db_path.display()))?;
     let rows = statement.query_map(params![min_since], |row| {
         let rollout_path: String = row.get(5)?;
@@ -115,11 +103,6 @@ pub(super) fn read_rollout_paths(
     slot_filters: &BTreeSet<String>,
 ) -> Result<Vec<PathBuf>> {
     let conn = open_state_connection(db_path)?;
-    let columns = thread_columns(&conn)?;
-    if !columns.contains("rollout_path") {
-        return Ok(Vec::new());
-    }
-
     let mut statement = conn
         .prepare("SELECT rollout_path FROM threads WHERE rollout_path <> ''")
         .with_context(|| format!("prepare calibration query for {}", db_path.display()))?;
@@ -177,24 +160,6 @@ fn validate_connection(conn: &Connection) -> std::result::Result<(), Error> {
 
 fn is_cannot_open(err: &Error) -> bool {
     matches!(err, Error::SqliteFailure(error, _) if error.code == ErrorCode::CannotOpen)
-}
-
-fn thread_columns(conn: &Connection) -> Result<BTreeSet<String>> {
-    let mut statement = conn.prepare("PRAGMA table_info(threads)")?;
-    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
-    let mut columns = BTreeSet::new();
-    for row in rows {
-        columns.insert(row?);
-    }
-    Ok(columns)
-}
-
-fn optional_column(columns: &BTreeSet<String>, name: &str) -> String {
-    if columns.contains(name) {
-        name.to_string()
-    } else {
-        format!("'' AS {name}")
-    }
 }
 
 fn empty_as_unknown(value: String) -> String {
@@ -279,24 +244,6 @@ mod tests {
         let _ = fs::remove_dir_all(&paths.base_codex_home);
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn state_db_paths_deduplicates_new_and_legacy_slot_paths() {
-        let paths = temp_paths("slot-sqlite-dedupe");
-        let db_path = paths.slot_sqlite_home("dia1").join(STATE_DB);
-        let legacy_path = paths.slot_home("dia1").join(STATE_DB);
-        fs::create_dir_all(db_path.parent().unwrap()).expect("create slot sqlite home");
-        fs::write(&db_path, "").expect("write slot state db");
-        std::os::unix::fs::symlink(&db_path, &legacy_path).expect("link legacy state db");
-
-        let db_paths = state_db_paths(&paths, &slot_filter("dia1")).expect("find db paths");
-
-        assert_eq!(db_paths, vec![fs::canonicalize(&db_path).unwrap()]);
-
-        let _ = fs::remove_dir_all(&paths.manager_dir);
-        let _ = fs::remove_dir_all(&paths.base_codex_home);
-    }
-
     #[test]
     fn reads_wal_database_when_sidecars_are_missing() {
         let paths = temp_paths("missing-wal-sidecars");
@@ -309,10 +256,15 @@ mod tests {
                  CREATE TABLE threads (
                    id TEXT PRIMARY KEY,
                    updated_at INTEGER NOT NULL,
-                   tokens_used INTEGER NOT NULL
+                   tokens_used INTEGER NOT NULL,
+                   model_provider TEXT NOT NULL,
+                   model TEXT NOT NULL,
+                   rollout_path TEXT NOT NULL
                  );
-                 INSERT INTO threads (id, updated_at, tokens_used)
-                 VALUES ('thread-1', 123, 456);
+                 INSERT INTO threads (
+                   id, updated_at, tokens_used, model_provider, model, rollout_path
+                 )
+                 VALUES ('thread-1', 123, 456, 'openai', 'gpt-5.5', '');
                  PRAGMA wal_checkpoint(TRUNCATE);",
             )
             .expect("seed db");

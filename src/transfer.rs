@@ -46,7 +46,6 @@ const SLOT_ROOT_FILES: &[&str] = &["env.conf", "overrides.conf"];
 
 const SLOT_HOME_FILES: &[&str] = &[
     "auth.json",
-    ".personality_migration",
     ".codex-global-state.json",
     ".codex-global-state.json.bak",
 ];

@@ -1,8 +1,6 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashSet;
-#[cfg(test)]
-use std::fs;
 use std::path::PathBuf;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -28,7 +26,6 @@ use pricing::StatsPricePolicy;
 const STATE_DB: &str = "state_5.sqlite";
 const CALIBRATION_FILE: &str = "stats-calibration.json";
 const CALIBRATION_SCHEMA_VERSION: u64 = 2;
-const LEGACY_FILE_SCHEMA_VERSION: u64 = 1;
 
 pub const STATS_JSON_SCHEMA_VERSION: u64 = 2;
 
@@ -499,10 +496,6 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
-fn legacy_file_schema_version() -> u64 {
-    LEGACY_FILE_SCHEMA_VERSION
-}
-
 pub(crate) fn human_tokens(tokens: u64) -> String {
     let value = tokens as f64;
     if tokens >= 1_000_000_000 {
@@ -522,25 +515,18 @@ pub(crate) fn human_tokens(tokens: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::time::SystemTime;
-    use std::time::UNIX_EPOCH;
-
     use clap::Parser;
 
     use crate::cli::Cli;
     use crate::cli::Command;
 
     use super::calibration::parse_mix_calibration;
-    use super::calibration::read_mix_calibration;
     use super::db::infer_slot_from_rollout_path;
     use super::pricing::parse_price_cache;
     use super::pricing::parse_pricing_page;
-    use super::pricing::read_price_cache;
     use super::pricing::PriceCachePolicy;
     use super::pricing::StatsPricePolicy;
     use super::pricing::DEFAULT_PRICE_URL;
-    use super::pricing::PRICE_CACHE_FILE;
-    use super::pricing::PRICE_CACHE_SCHEMA_VERSION;
     use super::rollout::parse_token_count_line;
     use super::*;
 
@@ -552,24 +538,6 @@ mod tests {
             panic!("expected stats command");
         };
         args
-    }
-
-    fn temp_paths(name: &str) -> ManagerPaths {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "cx-stats-test-{name}-{}-{unique}",
-            std::process::id()
-        ));
-        ManagerPaths {
-            base_codex_home: root.join("codex"),
-            manager_dir: root.join("profile-manager"),
-            slots_dir: root.join("profile-manager/slots"),
-            targets_dir: root.join("profile-manager/targets"),
-            rotation_file: root.join("profile-manager/rotation.txt"),
-        }
     }
 
     #[test]
@@ -632,69 +600,26 @@ mod tests {
     }
 
     #[test]
-    fn legacy_price_cache_normalizes_on_read() {
-        let paths = temp_paths("legacy-price-cache");
-        fs::create_dir_all(&paths.manager_dir).expect("create manager dir");
-        let path = paths.manager_dir.join(PRICE_CACHE_FILE);
-        fs::write(
-            &path,
-            r#"{
-              "fetchedAt": 123,
-              "sourceUrl": "https://example.test/pricing",
-              "prices": {
-                "gpt-5.5": {
-                  "inputPerMillion": 1.0,
-                  "cachedInputPerMillion": 0.1,
-                  "outputPerMillion": 2.0
-                }
-              }
-            }"#,
-        )
-        .expect("write legacy price cache");
+    fn owned_file_schema_versions_are_required() {
+        let price_cache = r#"{
+          "fetchedAt": 123,
+          "sourceUrl": "https://example.test/pricing",
+          "prices": {}
+        }"#;
+        let calibration = r#"{
+          "calibratedAt": 123,
+          "samples": 1,
+          "sourceRollouts": 1,
+          "totalTokens": 1,
+          "tokenMix": {
+            "uncachedInputShare": 1.0,
+            "cachedInputShare": 0.0,
+            "outputShare": 0.0
+          }
+        }"#;
 
-        let cache = read_price_cache(&paths).expect("read price cache");
-        let persisted = fs::read_to_string(&path).expect("read normalized price cache");
-        let persisted: serde_json::Value =
-            serde_json::from_str(&persisted).expect("parse normalized price cache");
-
-        assert_eq!(cache.schema_version, PRICE_CACHE_SCHEMA_VERSION);
-        assert_eq!(
-            persisted["schemaVersion"],
-            serde_json::json!(PRICE_CACHE_SCHEMA_VERSION)
-        );
-    }
-
-    #[test]
-    fn legacy_mix_calibration_normalizes_on_read() {
-        let paths = temp_paths("legacy-mix-calibration");
-        fs::create_dir_all(&paths.manager_dir).expect("create manager dir");
-        let path = paths.manager_dir.join(CALIBRATION_FILE);
-        fs::write(
-            &path,
-            r#"{
-              "calibratedAt": 123,
-              "samples": 1,
-              "sourceRollouts": 1,
-              "totalTokens": 1050,
-              "tokenMix": {
-                "uncachedInputShare": 0.1,
-                "cachedInputShare": 0.85,
-                "outputShare": 0.05
-              }
-            }"#,
-        )
-        .expect("write legacy calibration");
-
-        let calibration = read_mix_calibration(&path).expect("read calibration");
-        let persisted = fs::read_to_string(&path).expect("read normalized calibration");
-        let persisted: serde_json::Value =
-            serde_json::from_str(&persisted).expect("parse normalized calibration");
-
-        assert_eq!(calibration.schema_version, CALIBRATION_SCHEMA_VERSION);
-        assert_eq!(
-            persisted["schemaVersion"],
-            serde_json::json!(CALIBRATION_SCHEMA_VERSION)
-        );
+        assert!(parse_price_cache(price_cache).is_none());
+        assert!(parse_mix_calibration(calibration).is_none());
     }
 
     #[test]

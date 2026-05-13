@@ -148,9 +148,8 @@ JSONL；普通 `cx stats --price` 只读取小的校准文件，或回退到内�
 
 `cx stats --json` 输出 schema v2。默认 token-only JSON 完全不输出成本字段；
 `cx stats --price --json` 会增加 `priceEstimate`，并在 period、slot、model 上输出成本字段。
-cx 自己拥有的 `price-cache.json` 和 `stats-calibration.json` 都带 `schemaVersion`，
-并会在 cx 第一次读取旧格式时 normalize 到当前文件 schema。cx 不会改写 Codex 上游的
-`state_5.sqlite`。
+cx 自己拥有的 `price-cache.json` 和 `stats-calibration.json` 都带 `schemaVersion`。
+cx 不会改写 Codex 上游的 `state_5.sqlite`。
 
 新增一个 slot：
 

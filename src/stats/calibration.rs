@@ -13,7 +13,6 @@ use crate::cli::StatsArgs;
 use crate::paths::ManagerPaths;
 
 use super::db;
-use super::legacy_file_schema_version;
 use super::rollout;
 use super::CalibrationReport;
 use super::TokenMix;
@@ -21,13 +20,12 @@ use super::TokenTotals;
 use super::CALIBRATION_FILE;
 use super::CALIBRATION_SCHEMA_VERSION;
 use super::FALLBACK_TOKEN_MIX;
-use super::LEGACY_FILE_SCHEMA_VERSION;
 use super::STATE_DB;
 use super::STATS_JSON_SCHEMA_VERSION;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) struct MixCalibration {
-    #[serde(rename = "schemaVersion", default = "legacy_file_schema_version")]
+    #[serde(rename = "schemaVersion")]
     pub(super) schema_version: u64,
     #[serde(rename = "calibratedAt")]
     calibrated_at: i64,
@@ -50,22 +48,6 @@ impl MixCalibration {
             total_tokens: totals.total_tokens,
             token_mix,
         }
-    }
-
-    fn supports_schema_version(&self) -> bool {
-        matches!(
-            self.schema_version,
-            LEGACY_FILE_SCHEMA_VERSION | CALIBRATION_SCHEMA_VERSION
-        )
-    }
-
-    fn needs_normalization(&self) -> bool {
-        self.schema_version != CALIBRATION_SCHEMA_VERSION
-    }
-
-    fn normalized(mut self) -> Self {
-        self.schema_version = CALIBRATION_SCHEMA_VERSION;
-        self
     }
 }
 
@@ -140,8 +122,7 @@ pub(super) fn load_token_mix(paths: &ManagerPaths) -> (TokenMix, String) {
 
 pub(super) fn read_mix_calibration(path: &Path) -> Option<MixCalibration> {
     let content = fs::read_to_string(path).ok()?;
-    let calibration = parse_mix_calibration(&content)?;
-    Some(normalize_mix_calibration_if_needed(path, calibration))
+    parse_mix_calibration(&content)
 }
 
 fn write_mix_calibration(paths: &ManagerPaths, calibration: &MixCalibration) -> Result<PathBuf> {
@@ -159,16 +140,5 @@ fn write_mix_calibration_path(path: &Path, calibration: &MixCalibration) -> Resu
 
 pub(super) fn parse_mix_calibration(content: &str) -> Option<MixCalibration> {
     let calibration = serde_json::from_str::<MixCalibration>(content).ok()?;
-    calibration.supports_schema_version().then_some(calibration)
-}
-
-fn normalize_mix_calibration_if_needed(path: &Path, calibration: MixCalibration) -> MixCalibration {
-    if !calibration.needs_normalization() {
-        return calibration;
-    }
-    let normalized = calibration.normalized();
-    if let Err(_err) = write_mix_calibration_path(path, &normalized) {
-        // Calibration normalization is best-effort; the parsed calibration remains valid.
-    }
-    normalized
+    (calibration.schema_version == CALIBRATION_SCHEMA_VERSION).then_some(calibration)
 }

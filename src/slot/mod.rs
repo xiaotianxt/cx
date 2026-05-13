@@ -78,7 +78,6 @@ impl<'a> SlotMaterializer<'a> {
 
     fn repair(&self) -> Result<()> {
         self.create_home()?;
-        self.remove_legacy_sqlite_links()?;
         for resource in self.profile.resources() {
             self.repair_resource(*resource)?;
         }
@@ -210,19 +209,6 @@ impl<'a> SlotMaterializer<'a> {
             &resource.canonical_path(self.paths),
             &resource.slot_path(self.paths, self.slot),
         )
-    }
-
-    fn remove_legacy_sqlite_links(&self) -> Result<()> {
-        for name in ["state_5.sqlite", "logs_2.sqlite"] {
-            for suffix in ["", "-wal", "-shm"] {
-                let path = self.slot_home.join(format!("{name}{suffix}"));
-                if is_symlink(&path) {
-                    fs::remove_file(&path)
-                        .with_context(|| format!("remove legacy sqlite link {}", path.display()))?;
-                }
-            }
-        }
-        Ok(())
     }
 }
 
@@ -597,35 +583,6 @@ mod tests {
             &paths.base_codex_home.join("sessions")
         )
         .unwrap());
-
-        let _ = fs::remove_dir_all(&paths.manager_dir);
-        let _ = fs::remove_dir_all(&paths.base_codex_home);
-    }
-
-    #[test]
-    fn repair_slot_layout_removes_legacy_sqlite_symlinks() {
-        let paths = temp_paths("repair-sqlite-links");
-        fs::create_dir_all(&paths.base_codex_home).unwrap();
-        fs::create_dir_all(paths.slot_home("dia1")).unwrap();
-        fs::write(paths.base_codex_home.join("state_5.sqlite"), "").unwrap();
-        fs::write(paths.base_codex_home.join("logs_2.sqlite"), "").unwrap();
-        link_if_safe(
-            &paths.base_codex_home.join("state_5.sqlite"),
-            &paths.slot_home("dia1").join("state_5.sqlite"),
-        )
-        .unwrap();
-        link_if_safe(
-            &paths.base_codex_home.join("logs_2.sqlite"),
-            &paths.slot_home("dia1").join("logs_2.sqlite"),
-        )
-        .unwrap();
-
-        repair_slot_layout(&paths, "dia1").unwrap();
-
-        assert!(!paths.slot_home("dia1").join("state_5.sqlite").exists());
-        assert!(!paths.slot_home("dia1").join("logs_2.sqlite").exists());
-        assert!(paths.base_codex_home.join("state_5.sqlite").exists());
-        assert!(paths.base_codex_home.join("logs_2.sqlite").exists());
 
         let _ = fs::remove_dir_all(&paths.manager_dir);
         let _ = fs::remove_dir_all(&paths.base_codex_home);

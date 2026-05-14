@@ -229,17 +229,19 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
     } else {
         slot::load_rotation(&paths)?
     };
-    if candidates.is_empty() && options.slot.is_none() && auto_resume_state.is_none() {
-        return exec_real_codex(&real_codex, options.codex_args);
+    if candidates.is_empty() && options.slot.is_none() {
+        let mut codex_args = options.codex_args;
+        append_auto_resume_args_if_missing(
+            &mut codex_args,
+            auto_resume_state
+                .as_ref()
+                .map(|state| state.session_id.as_str()),
+        );
+        return exec_real_codex(&real_codex, codex_args);
     }
 
     let selected_slot = if let Some(slot) = options.slot.clone() {
         slot
-    } else if let Some(state) = auto_resume_state
-        .as_ref()
-        .filter(|state| paths.slot_home(&state.slot).is_dir())
-    {
-        state.slot.clone()
     } else {
         let results = selector::query_slots(&paths, &candidates, usage_query_options())?;
         let selected = selector::choose_result(&results);
@@ -394,18 +396,13 @@ fn exec_slot_codex(
         options.codex_args,
     )?;
     let explicit_resume = explicit_resume_id(&spec.args);
-    let mut resumed_id = explicit_resume.clone();
-    if explicit_resume.is_none() {
-        if let Some(state) = resume_launch
+    let resumed_id = append_auto_resume_args_if_missing(
+        &mut spec.args,
+        resume_launch
             .auto_state
             .as_ref()
-            .filter(|state| state.slot == selected_slot)
-        {
-            spec.args.push(OsString::from("resume"));
-            spec.args.push(OsString::from(state.session_id.clone()));
-            resumed_id = Some(ExplicitResumeId::parse(state.session_id.clone()));
-        }
-    }
+            .map(|state| state.session_id.as_str()),
+    );
 
     if let (Some(key), Some(resume_id)) = (resume_launch.key.as_ref(), explicit_resume.as_ref()) {
         let _ = terminal_resume::record_resume_state(
@@ -439,6 +436,23 @@ fn exec_slot_codex(
         options.quiet,
     );
     exec(spec.into_command())
+}
+
+fn append_resume_args(args: &mut Vec<OsString>, session_id: &str) {
+    args.push(OsString::from("resume"));
+    args.push(OsString::from(session_id));
+}
+
+fn append_auto_resume_args_if_missing(
+    args: &mut Vec<OsString>,
+    auto_session_id: Option<&str>,
+) -> Option<ExplicitResumeId> {
+    if let Some(resume_id) = explicit_resume_id(args) {
+        return Some(resume_id);
+    }
+    let session_id = auto_session_id?;
+    append_resume_args(args, session_id);
+    Some(ExplicitResumeId::parse(session_id))
 }
 
 fn print_launch(spec: &CodexCommandSpec, resumed_id: Option<&str>, quiet: bool) {
@@ -830,6 +844,47 @@ mod tests {
             Some(ExplicitResumeId::AppThreadOrCodexSession(String::from(
                 "019dfdd3-debc-7da2-88fc-b15b73f5e138"
             )))
+        );
+    }
+
+    #[test]
+    fn auto_resume_args_append_session_without_slot_gate() {
+        let mut args = vec![OsString::from("-m"), OsString::from("gpt-5.5")];
+
+        let resumed = append_auto_resume_args_if_missing(&mut args, Some("thread-1"));
+
+        assert_eq!(
+            resumed,
+            Some(ExplicitResumeId::AppThreadOrCodexSession(String::from(
+                "thread-1"
+            )))
+        );
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("-m"),
+                OsString::from("gpt-5.5"),
+                OsString::from("resume"),
+                OsString::from("thread-1"),
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_resume_args_win_over_auto_resume() {
+        let mut args = vec![OsString::from("resume"), OsString::from("thread-explicit")];
+
+        let resumed = append_auto_resume_args_if_missing(&mut args, Some("thread-auto"));
+
+        assert_eq!(
+            resumed,
+            Some(ExplicitResumeId::AppThreadOrCodexSession(String::from(
+                "thread-explicit"
+            )))
+        );
+        assert_eq!(
+            args,
+            vec![OsString::from("resume"), OsString::from("thread-explicit"),]
         );
     }
 

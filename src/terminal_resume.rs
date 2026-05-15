@@ -139,7 +139,7 @@ pub(crate) fn load_resume_state_for_cwd(
     Ok(Some(state))
 }
 
-pub(crate) fn has_active_session(paths: &ManagerPaths) -> bool {
+pub(crate) fn has_active_session_in_cwd(paths: &ManagerPaths, cwd: &Path) -> bool {
     let Ok(entries) = fs::read_dir(watch_request_dir(paths)) else {
         return false;
     };
@@ -148,7 +148,8 @@ pub(crate) fn has_active_session(paths: &ManagerPaths) -> bool {
         if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
             return false;
         }
-        read_watch_request(&path).is_ok_and(|request| watch_request_is_active(&request))
+        read_watch_request(&path)
+            .is_ok_and(|request| request.cwd == cwd && watch_request_is_active(&request))
     })
 }
 
@@ -1111,12 +1112,24 @@ mod tests {
     }
 
     #[test]
-    fn active_session_detects_live_watch_request() {
+    fn active_session_detects_live_watch_request_in_cwd() {
         let paths = test_paths("active-watch");
         let cwd = paths.base_codex_home.join("project");
         let path = test_write_watch_request(&paths, &cwd, std::process::id()).unwrap();
 
-        assert!(has_active_session(&paths));
+        assert!(has_active_session_in_cwd(&paths, &cwd));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn active_session_ignores_live_watch_request_in_other_cwd() {
+        let paths = test_paths("active-watch-other-cwd");
+        let cwd = paths.base_codex_home.join("project");
+        let other_cwd = paths.base_codex_home.join("other-project");
+        let path = test_write_watch_request(&paths, &other_cwd, std::process::id()).unwrap();
+
+        assert!(!has_active_session_in_cwd(&paths, &cwd));
 
         let _ = fs::remove_file(path);
     }
@@ -1127,7 +1140,7 @@ mod tests {
         let cwd = paths.base_codex_home.join("project");
         let _path = test_write_watch_request(&paths, &cwd, 0).unwrap();
 
-        assert!(!has_active_session(&paths));
+        assert!(!has_active_session_in_cwd(&paths, &cwd));
     }
 
     #[test]

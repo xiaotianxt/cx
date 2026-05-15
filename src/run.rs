@@ -469,7 +469,7 @@ fn auto_resume_candidate_for_launch(
     cwd: &Path,
     hint: Option<&terminal_resume::ResumeState>,
 ) -> Result<Option<ResumeCandidate>> {
-    if terminal_resume::has_active_session(paths) {
+    if terminal_resume::has_active_session_in_cwd(paths, cwd) {
         return Ok(None);
     }
     terminal_resume::latest_cwd_resume_candidate(paths, cwd, hint)
@@ -998,6 +998,31 @@ mod tests {
         assert!(auto_resume_candidate_for_launch(&paths, &cwd, Some(&state))
             .unwrap()
             .is_none());
+
+        let _ = fs::remove_file(watch_request);
+        let _ = fs::remove_dir_all(&paths.manager_dir);
+        let _ = fs::remove_dir_all(&paths.base_codex_home);
+    }
+
+    #[test]
+    fn active_session_in_other_cwd_does_not_block_auto_resume_candidate() {
+        let paths = test_paths("auto-resume-other-cwd");
+        let cwd = paths.base_codex_home.join("project");
+        let other_cwd = paths.base_codex_home.join("other-project");
+        let state = crate::terminal_resume::test_resume_state("dia7", cwd.clone());
+        let watch_request = crate::terminal_resume::test_write_watch_request(
+            &paths,
+            &other_cwd,
+            std::process::id(),
+        )
+        .unwrap();
+
+        let candidate = auto_resume_candidate_for_launch(&paths, &cwd, Some(&state))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(candidate.slot, "dia7");
+        assert_eq!(candidate.session_id, "session-1");
 
         let _ = fs::remove_file(watch_request);
         let _ = fs::remove_dir_all(&paths.manager_dir);

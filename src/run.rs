@@ -242,11 +242,11 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
 
     let selected_slot = if let Some(slot) = options.slot.clone() {
         slot
-    } else if let Some(slot) = auto_resume_slot(&paths, auto_resume_state.as_ref()) {
-        slot
     } else {
-        let results = selector::query_slots(&paths, &candidates, usage_query_options())?;
-        let selected = selector::choose_result(&results);
+        let query_candidates =
+            auto_resume_query_candidates(&paths, &candidates, auto_resume_state.as_ref());
+        let results = selector::query_slots(&paths, &query_candidates, usage_query_options())?;
+        let selected = choose_launch_result(&results, auto_resume_state.as_ref());
         if options.debug || std::env::var_os("CX_SLOT_DEBUG").is_some() {
             crate::output::print_report(
                 &results,
@@ -258,6 +258,7 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
             .map(|result| result.slot.clone())
             .context("no usable Codex slot found")?
     };
+    let auto_resume_state = auto_resume_state_for_selected_slot(auto_resume_state, &selected_slot);
 
     exec_slot_codex(
         &paths,
@@ -457,15 +458,42 @@ fn append_auto_resume_args_if_missing(
     Some(ExplicitResumeId::parse(session_id))
 }
 
-fn auto_resume_slot(
+fn auto_resume_query_candidates(
     paths: &ManagerPaths,
+    candidates: &[String],
     auto_resume_state: Option<&ResumeState>,
-) -> Option<String> {
-    let state = auto_resume_state?;
-    paths
-        .slot_home(&state.slot)
-        .is_dir()
-        .then(|| state.slot.clone())
+) -> Vec<String> {
+    let mut query_candidates = candidates.to_vec();
+    if let Some(state) = auto_resume_state {
+        if paths.slot_home(&state.slot).is_dir()
+            && !query_candidates.iter().any(|slot| slot == &state.slot)
+        {
+            query_candidates.push(state.slot.clone());
+        }
+    }
+    query_candidates
+}
+
+fn choose_launch_result<'a>(
+    results: &'a [crate::usage::SlotResult],
+    auto_resume_state: Option<&ResumeState>,
+) -> Option<&'a crate::usage::SlotResult> {
+    if let Some(state) = auto_resume_state {
+        if let Some(result) = results
+            .iter()
+            .find(|result| result.slot == state.slot && result.is_available())
+        {
+            return Some(result);
+        }
+    }
+    selector::choose_result(results)
+}
+
+fn auto_resume_state_for_selected_slot(
+    auto_resume_state: Option<ResumeState>,
+    selected_slot: &str,
+) -> Option<ResumeState> {
+    auto_resume_state.filter(|state| state.slot == selected_slot)
 }
 
 fn print_launch(spec: &CodexCommandSpec, resumed_id: Option<&str>, quiet: bool) {
@@ -902,8 +930,8 @@ mod tests {
     }
 
     #[test]
-    fn auto_resume_slot_uses_recorded_slot_when_home_exists() {
-        let paths = test_paths("auto-resume-slot");
+    fn auto_resume_query_includes_recorded_slot_when_home_exists() {
+        let paths = test_paths("auto-resume-query-slot");
         fs::create_dir_all(paths.slot_home("dia7")).unwrap();
         let state = crate::terminal_resume::test_resume_state(
             "dia7",
@@ -911,8 +939,8 @@ mod tests {
         );
 
         assert_eq!(
-            auto_resume_slot(&paths, Some(&state)),
-            Some("dia7".to_string())
+            auto_resume_query_candidates(&paths, &[String::from("bus1")], Some(&state)),
+            vec![String::from("bus1"), String::from("dia7")]
         );
 
         let _ = fs::remove_dir_all(&paths.manager_dir);
@@ -920,17 +948,92 @@ mod tests {
     }
 
     #[test]
-    fn auto_resume_slot_returns_none_when_home_is_missing() {
-        let paths = test_paths("auto-resume-missing-slot");
+    fn auto_resume_query_skips_recorded_slot_when_home_is_missing() {
+        let paths = test_paths("auto-resume-query-missing-slot");
         let state = crate::terminal_resume::test_resume_state(
             "dia7",
             paths.base_codex_home.join("project"),
         );
 
-        assert_eq!(auto_resume_slot(&paths, Some(&state)), None);
+        assert_eq!(
+            auto_resume_query_candidates(&paths, &[String::from("bus1")], Some(&state)),
+            vec![String::from("bus1")]
+        );
 
         let _ = fs::remove_dir_all(&paths.manager_dir);
         let _ = fs::remove_dir_all(&paths.base_codex_home);
+    }
+
+    #[test]
+    fn auto_resume_prefers_recorded_slot_only_when_available() {
+        let state = crate::terminal_resume::test_resume_state(
+            "dia7",
+            PathBuf::from("/tmp/cx-run-test-project"),
+        );
+        let results = vec![
+            crate::usage::SlotResult::new(
+                "bus1",
+                0,
+                crate::usage::SlotStatus::Available,
+                95.0,
+                "fresh",
+            ),
+            crate::usage::SlotResult::new(
+                "dia7",
+                1,
+                crate::usage::SlotStatus::Available,
+                10.0,
+                "resume",
+            ),
+        ];
+
+        assert_eq!(
+            choose_launch_result(&results, Some(&state)).map(|result| result.slot.as_str()),
+            Some("dia7")
+        );
+    }
+
+    #[test]
+    fn auto_resume_skips_recorded_slot_when_exhausted() {
+        let state = crate::terminal_resume::test_resume_state(
+            "dia7",
+            PathBuf::from("/tmp/cx-run-test-project"),
+        );
+        let results = vec![
+            crate::usage::SlotResult::new(
+                "dia7",
+                0,
+                crate::usage::SlotStatus::Exhausted,
+                0.0,
+                "done",
+            ),
+            crate::usage::SlotResult::new(
+                "bus1",
+                1,
+                crate::usage::SlotStatus::Available,
+                80.0,
+                "fresh",
+            ),
+        ];
+
+        assert_eq!(
+            choose_launch_result(&results, Some(&state)).map(|result| result.slot.as_str()),
+            Some("bus1")
+        );
+    }
+
+    #[test]
+    fn auto_resume_state_is_kept_only_for_selected_slot() {
+        let state = crate::terminal_resume::test_resume_state(
+            "dia7",
+            PathBuf::from("/tmp/cx-run-test-project"),
+        );
+
+        assert!(auto_resume_state_for_selected_slot(Some(state.clone()), "bus1").is_none());
+        assert_eq!(
+            auto_resume_state_for_selected_slot(Some(state), "dia7").map(|state| state.slot),
+            Some(String::from("dia7"))
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "cx"
-version = "0.4.10"
+version = "0.4.11"
 edition = "2021"
 description = "Fast local Codex launcher, stdin wrapper, and slot manager"
 authors = ["yupeit"]

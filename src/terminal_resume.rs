@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs;
 use std::io::BufRead;
+use std::io::ErrorKind;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -51,6 +52,14 @@ pub(crate) struct ResumeState {
     recorded_at_unix_ms: u128,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResumeCandidate {
+    pub(crate) slot: String,
+    pub(crate) cwd: PathBuf,
+    pub(crate) session_id: String,
+    pub(crate) rollout_path: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WatchRequest {
     version: u32,
@@ -69,6 +78,12 @@ struct WatchRequest {
 struct CandidateSession {
     session_id: String,
     rollout_path: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DbResumeCandidate {
+    candidate: ResumeCandidate,
+    updated_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,23 +116,59 @@ pub(crate) fn load_resume_state(
     cwd: &Path,
 ) -> Result<Option<ResumeState>> {
     let path = state_path(paths, key);
-    let Ok(text) = fs::read_to_string(&path) else {
+    let Some(state) = read_resume_state(&path)? else {
         return Ok(None);
     };
-    let Ok(state) = serde_json::from_str::<ResumeState>(&text) else {
-        return Ok(None);
-    };
-    if state.version != STATE_VERSION || state.terminal_key != *key || state.cwd != cwd {
-        return Ok(None);
-    }
-    if state
-        .rollout_path
-        .as_deref()
-        .is_some_and(|path| !path.exists())
-    {
+    if state.terminal_key != *key || !resume_state_matches_cwd(&state, cwd) {
         return Ok(None);
     }
     Ok(Some(state))
+}
+
+pub(crate) fn load_resume_state_for_cwd(
+    paths: &ManagerPaths,
+    cwd: &Path,
+) -> Result<Option<ResumeState>> {
+    let path = cwd_state_path(paths, cwd);
+    let Some(state) = read_resume_state(&path)? else {
+        return Ok(None);
+    };
+    if !resume_state_matches_cwd(&state, cwd) {
+        return Ok(None);
+    }
+    Ok(Some(state))
+}
+
+pub(crate) fn has_active_session(paths: &ManagerPaths) -> bool {
+    let Ok(entries) = fs::read_dir(watch_request_dir(paths)) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            return false;
+        }
+        read_watch_request(&path).is_ok_and(|request| watch_request_is_active(&request))
+    })
+}
+
+pub(crate) fn latest_cwd_resume_candidate(
+    paths: &ManagerPaths,
+    cwd: &Path,
+    hint: Option<&ResumeState>,
+) -> Result<Option<ResumeCandidate>> {
+    let mut latest = latest_cwd_db_candidate(paths, cwd)?;
+    if let Some(state) = load_resume_state_for_cwd(paths, cwd)? {
+        if let Some(candidate) = resume_candidate_from_state_with_time(&state, cwd) {
+            keep_newest_candidate(&mut latest, candidate);
+        }
+    }
+    if let Some(state) = hint {
+        if let Some(candidate) = resume_candidate_from_state_with_time(state, cwd) {
+            keep_newest_candidate(&mut latest, candidate);
+        }
+    }
+    Ok(latest.map(|candidate| candidate.candidate))
 }
 
 pub(crate) fn record_resume_state(
@@ -198,6 +249,29 @@ pub(crate) fn test_resume_state(slot: &str, cwd: PathBuf) -> ResumeState {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn test_write_watch_request(
+    paths: &ManagerPaths,
+    cwd: &Path,
+    launch_pid: u32,
+) -> Result<PathBuf> {
+    let request = WatchRequest {
+        version: WATCH_REQUEST_VERSION,
+        terminal_key: TerminalKey {
+            source: "test".to_string(),
+            value: "tty-1".to_string(),
+        },
+        manager_dir: paths.manager_dir.clone(),
+        codex_home: paths.base_codex_home.clone(),
+        sqlite_home: None,
+        slot: "dia1".to_string(),
+        cwd: cwd.to_path_buf(),
+        launch_started_unix_ms: now_unix_ms(),
+        launch_pid,
+    };
+    write_watch_request(paths, &request)
+}
+
 fn watch_for_session(request: &WatchRequest) -> Result<()> {
     if request.version != WATCH_REQUEST_VERSION {
         return Ok(());
@@ -233,6 +307,175 @@ fn watch_for_session(request: &WatchRequest) -> Result<()> {
         }
         thread::sleep(WATCH_POLL_INTERVAL);
     }
+}
+
+fn latest_cwd_db_candidate(paths: &ManagerPaths, cwd: &Path) -> Result<Option<DbResumeCandidate>> {
+    let mut latest = None;
+    for slot in state_db_slot_names(paths)? {
+        let Some(candidate) = latest_cwd_db_candidate_for_slot(paths, &slot, cwd)? else {
+            continue;
+        };
+        if latest
+            .as_ref()
+            .is_none_or(|current| db_candidate_is_newer(&candidate, current))
+        {
+            latest = Some(candidate);
+        }
+    }
+    Ok(latest)
+}
+
+fn state_db_slot_names(paths: &ManagerPaths) -> Result<Vec<String>> {
+    let entries = match fs::read_dir(&paths.slots_dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err).with_context(|| format!("read {}", paths.slots_dir.display())),
+    };
+    let mut slots = Vec::new();
+    for entry in entries.flatten() {
+        if !entry.path().join("home").is_dir() {
+            continue;
+        }
+        slots.push(entry.file_name().to_string_lossy().to_string());
+    }
+    slots.sort();
+    Ok(slots)
+}
+
+fn latest_cwd_db_candidate_for_slot(
+    paths: &ManagerPaths,
+    slot: &str,
+    cwd: &Path,
+) -> Result<Option<DbResumeCandidate>> {
+    let path = paths.slot_sqlite_home(slot).join(STATE_DB_FILENAME);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let Ok(conn) = Connection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return Ok(None);
+    };
+    let candidate = query_latest_cwd_db_candidate(&conn, slot, cwd, UpdatedAtColumn::Millis)?;
+    if candidate.is_some() {
+        return Ok(candidate);
+    }
+    query_latest_cwd_db_candidate(&conn, slot, cwd, UpdatedAtColumn::Seconds)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum UpdatedAtColumn {
+    Millis,
+    Seconds,
+}
+
+fn query_latest_cwd_db_candidate(
+    conn: &Connection,
+    slot: &str,
+    cwd: &Path,
+    updated_at_column: UpdatedAtColumn,
+) -> Result<Option<DbResumeCandidate>> {
+    let sql = match updated_at_column {
+        UpdatedAtColumn::Millis => {
+            "SELECT id, rollout_path, updated_at_ms
+             FROM threads
+             WHERE archived = 0
+               AND cwd = ?1
+               AND rollout_path <> ''
+             ORDER BY updated_at_ms DESC, id DESC
+             LIMIT 16"
+        }
+        UpdatedAtColumn::Seconds => {
+            "SELECT id, rollout_path, updated_at
+             FROM threads
+             WHERE archived = 0
+               AND cwd = ?1
+               AND rollout_path <> ''
+             ORDER BY updated_at DESC, id DESC
+             LIMIT 16"
+        }
+    };
+    let Ok(mut stmt) = conn.prepare(sql) else {
+        return Ok(None);
+    };
+    let Ok(rows) = stmt.query_map(params![cwd.display().to_string()], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            PathBuf::from(row.get::<_, String>(1)?),
+            row.get::<_, i64>(2)?,
+        ))
+    }) else {
+        return Ok(None);
+    };
+
+    for row in rows {
+        let Ok((session_id, rollout_path, raw_updated_at)) = row else {
+            continue;
+        };
+        if !rollout_path.exists() {
+            continue;
+        }
+        let updated_at = match updated_at_column {
+            UpdatedAtColumn::Millis => raw_updated_at,
+            UpdatedAtColumn::Seconds => raw_updated_at.saturating_mul(1000),
+        };
+        return Ok(Some(DbResumeCandidate {
+            candidate: ResumeCandidate {
+                slot: slot.to_string(),
+                cwd: cwd.to_path_buf(),
+                session_id,
+                rollout_path: Some(rollout_path),
+            },
+            updated_at,
+        }));
+    }
+    Ok(None)
+}
+
+fn keep_newest_candidate(latest: &mut Option<DbResumeCandidate>, candidate: DbResumeCandidate) {
+    if latest
+        .as_ref()
+        .is_none_or(|current| db_candidate_is_newer(&candidate, current))
+    {
+        *latest = Some(candidate);
+    }
+}
+
+fn db_candidate_is_newer(candidate: &DbResumeCandidate, current: &DbResumeCandidate) -> bool {
+    candidate.updated_at > current.updated_at
+        || (candidate.updated_at == current.updated_at
+            && candidate.candidate.session_id > current.candidate.session_id)
+}
+
+fn resume_candidate_from_state_with_time(
+    state: &ResumeState,
+    cwd: &Path,
+) -> Option<DbResumeCandidate> {
+    let updated_at = state.recorded_at_unix_ms.min(i64::MAX as u128) as i64;
+    resume_candidate_from_state(state, cwd).map(|candidate| DbResumeCandidate {
+        candidate,
+        updated_at,
+    })
+}
+
+fn resume_candidate_from_state(state: &ResumeState, cwd: &Path) -> Option<ResumeCandidate> {
+    if state.cwd != cwd {
+        return None;
+    }
+    if state
+        .rollout_path
+        .as_deref()
+        .is_some_and(|path| !path.exists())
+    {
+        return None;
+    }
+    Some(ResumeCandidate {
+        slot: state.slot.clone(),
+        cwd: state.cwd.clone(),
+        session_id: state.session_id.clone(),
+        rollout_path: state.rollout_path.clone(),
+    })
 }
 
 fn scan_for_current_session(request: &WatchRequest) -> CandidateScan {
@@ -475,17 +718,68 @@ fn state_path(paths: &ManagerPaths, key: &TerminalKey) -> PathBuf {
         .join(format!("{}.json", key.fingerprint()))
 }
 
+fn cwd_state_path(paths: &ManagerPaths, cwd: &Path) -> PathBuf {
+    paths
+        .manager_dir
+        .join("terminal-resume")
+        .join("by-cwd")
+        .join(format!(
+            "{}.json",
+            fingerprint_text(&cwd.display().to_string())
+        ))
+}
+
+fn read_resume_state(path: &Path) -> Result<Option<ResumeState>> {
+    let Ok(text) = fs::read_to_string(path) else {
+        return Ok(None);
+    };
+    let Ok(state) = serde_json::from_str::<ResumeState>(&text) else {
+        return Ok(None);
+    };
+    Ok(Some(state))
+}
+
+fn resume_state_matches_cwd(state: &ResumeState, cwd: &Path) -> bool {
+    state.version == STATE_VERSION
+        && state.cwd == cwd
+        && state
+            .rollout_path
+            .as_deref()
+            .is_none_or(|path| path.exists())
+}
+
+fn watch_request_dir(paths: &ManagerPaths) -> PathBuf {
+    paths.manager_dir.join(".tmp").join("session-watch")
+}
+
+fn watch_request_is_active(request: &WatchRequest) -> bool {
+    if request.version != WATCH_REQUEST_VERSION {
+        return false;
+    }
+    if now_unix_ms().saturating_sub(request.launch_started_unix_ms) > WATCH_MAX_RUNTIME.as_millis()
+    {
+        return false;
+    }
+    // Occupation is represented by cx watcher requests. Direct `codex` launches
+    // do not write these requests, so they are not visible to this guard.
+    process_alive(request.launch_pid)
+}
+
 fn write_resume_state(paths: &ManagerPaths, state: &ResumeState) -> Result<()> {
-    let path = state_path(paths, &state.terminal_key);
+    write_resume_state_path(&state_path(paths, &state.terminal_key), state)?;
+    write_resume_state_path(&cwd_state_path(paths, &state.cwd), state)
+}
+
+fn write_resume_state_path(path: &Path, state: &ResumeState) -> Result<()> {
     let parent = path
         .parent()
         .context("terminal resume state path has no parent")?;
     fs::create_dir_all(parent)?;
-    atomic_write_json(&path, state)
+    atomic_write_json(path, state)
 }
 
 fn write_watch_request(paths: &ManagerPaths, request: &WatchRequest) -> Result<PathBuf> {
-    let dir = paths.manager_dir.join(".tmp").join("session-watch");
+    let dir = watch_request_dir(paths);
     fs::create_dir_all(&dir)?;
     let path = dir.join(format!(
         "{}-{}.json",
@@ -513,13 +807,21 @@ fn atomic_write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 
 impl TerminalKey {
     fn fingerprint(&self) -> String {
-        let mut hash = 0xcbf29ce484222325_u64;
-        for byte in self.source.bytes().chain([0]).chain(self.value.bytes()) {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        format!("{hash:016x}")
+        fingerprint_bytes(self.source.bytes().chain([0]).chain(self.value.bytes()))
     }
+}
+
+fn fingerprint_text(value: &str) -> String {
+    fingerprint_bytes(value.bytes())
+}
+
+fn fingerprint_bytes(bytes: impl IntoIterator<Item = u8>) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
 }
 
 #[cfg(unix)]
@@ -648,6 +950,42 @@ mod tests {
         .unwrap();
     }
 
+    fn write_state_thread_seconds(
+        paths: &ManagerPaths,
+        slot: &str,
+        id: &str,
+        rollout_path: &Path,
+        cwd: &Path,
+        updated_at: i64,
+    ) {
+        let db_path = paths.slot_sqlite_home(slot).join(STATE_DB_FILENAME);
+        fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS threads (
+                id TEXT PRIMARY KEY,
+                rollout_path TEXT NOT NULL,
+                cwd TEXT NOT NULL,
+                archived INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO threads
+             (id, rollout_path, cwd, archived, updated_at)
+             VALUES (?1, ?2, ?3, 0, ?4)",
+            params![
+                id,
+                rollout_path.display().to_string(),
+                cwd.display().to_string(),
+                updated_at,
+            ],
+        )
+        .unwrap();
+    }
+
     #[test]
     fn terminal_key_fingerprint_is_stable() {
         assert_eq!(terminal_key().fingerprint(), terminal_key().fingerprint());
@@ -671,9 +1009,125 @@ mod tests {
         fs::write(paths.base_codex_home.join("rollout.jsonl"), "").unwrap();
 
         let state = load_resume_state(&paths, &key, &cwd).unwrap().unwrap();
+        let cwd_state = load_resume_state_for_cwd(&paths, &cwd).unwrap().unwrap();
 
         assert_eq!(state.slot, "dia1");
         assert_eq!(state.session_id, "session-1");
+        assert_eq!(cwd_state.slot, "dia1");
+        assert_eq!(cwd_state.session_id, "session-1");
+    }
+
+    #[test]
+    fn latest_cwd_resume_candidate_prefers_newest_thread_across_slots() {
+        let paths = test_paths("latest-cwd");
+        let cwd = paths.base_codex_home.join("project");
+        let other_cwd = paths.base_codex_home.join("other-project");
+        let older = write_rollout(
+            &paths.slot_home("dia1"),
+            "2026-05-13T21:40:06.000Z",
+            "session-old",
+            &cwd,
+        );
+        let newer = write_rollout(
+            &paths.slot_home("bus1"),
+            "2026-05-13T21:41:06.000Z",
+            "session-new",
+            &cwd,
+        );
+        let other = write_rollout(
+            &paths.slot_home("bus2"),
+            "2026-05-13T21:42:06.000Z",
+            "session-other-cwd",
+            &other_cwd,
+        );
+        write_state_thread(
+            &paths,
+            "dia1",
+            "session-old",
+            &older,
+            &cwd,
+            1_778_704_801_000,
+        );
+        write_state_thread(
+            &paths,
+            "bus1",
+            "session-new",
+            &newer,
+            &cwd,
+            1_778_704_802_000,
+        );
+        write_state_thread(
+            &paths,
+            "bus2",
+            "session-other-cwd",
+            &other,
+            &other_cwd,
+            1_778_704_803_000,
+        );
+
+        let candidate = latest_cwd_resume_candidate(&paths, &cwd, None)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(candidate.slot, "bus1");
+        assert_eq!(candidate.session_id, "session-new");
+        assert_eq!(candidate.rollout_path, Some(newer));
+    }
+
+    #[test]
+    fn latest_cwd_resume_candidate_accepts_updated_at_seconds() {
+        let paths = test_paths("latest-cwd-seconds");
+        let cwd = paths.base_codex_home.join("project");
+        let rollout = write_rollout(
+            &paths.slot_home("dia1"),
+            "2026-05-13T21:40:06.000Z",
+            "session-seconds",
+            &cwd,
+        );
+        write_state_thread_seconds(&paths, "dia1", "session-seconds", &rollout, &cwd, 1_778_704);
+
+        let candidate = latest_cwd_resume_candidate(&paths, &cwd, None)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(candidate.slot, "dia1");
+        assert_eq!(candidate.session_id, "session-seconds");
+        assert_eq!(candidate.rollout_path, Some(rollout));
+    }
+
+    #[test]
+    fn latest_cwd_resume_candidate_uses_terminal_state_as_fallback() {
+        let paths = test_paths("latest-cwd-fallback");
+        let cwd = paths.base_codex_home.join("project");
+        let state = test_resume_state("dia1", cwd.clone());
+
+        let candidate = latest_cwd_resume_candidate(&paths, &cwd, Some(&state))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(candidate.slot, "dia1");
+        assert_eq!(candidate.session_id, "session-1");
+        assert_eq!(candidate.rollout_path, None);
+    }
+
+    #[test]
+    fn active_session_detects_live_watch_request() {
+        let paths = test_paths("active-watch");
+        let cwd = paths.base_codex_home.join("project");
+        let path = test_write_watch_request(&paths, &cwd, std::process::id()).unwrap();
+
+        assert!(has_active_session(&paths));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn active_session_ignores_dead_watch_request() {
+        let paths = test_paths("dead-watch");
+        let cwd = paths.base_codex_home.join("project");
+        let _path = test_write_watch_request(&paths, &cwd, 0).unwrap();
+
+        assert!(!has_active_session(&paths));
     }
 
     #[test]

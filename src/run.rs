@@ -25,7 +25,7 @@ use crate::selector;
 use crate::slot;
 use crate::target::TargetSpec;
 use crate::terminal_resume;
-use crate::terminal_resume::ResumeState;
+use crate::terminal_resume::ResumeCandidate;
 use crate::terminal_resume::TerminalKey;
 
 const BYPASS_SUBCOMMANDS: &[&str] = &[
@@ -144,7 +144,7 @@ pub(crate) struct RuntimeSelection {
 struct TerminalResumeLaunch {
     cwd: PathBuf,
     key: Option<TerminalKey>,
-    auto_state: Option<ResumeState>,
+    auto_candidate: Option<ResumeCandidate>,
     direct_launch: bool,
 }
 
@@ -209,7 +209,7 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
         return exec_real_codex(&real_codex, options.codex_args);
     }
 
-    let auto_resume_state = if direct_launch
+    let auto_resume_state_hint = if direct_launch
         && !options.new_session
         && std::env::var_os("CX_NO_AUTO_RESUME").is_none()
         && options.target.is_none()
@@ -219,6 +219,15 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
             .map(|key| terminal_resume::load_resume_state(&paths, key, &launch_cwd))
             .transpose()?
             .flatten()
+    } else {
+        None
+    };
+    let auto_resume_candidate = if direct_launch
+        && !options.new_session
+        && std::env::var_os("CX_NO_AUTO_RESUME").is_none()
+        && options.target.is_none()
+    {
+        auto_resume_candidate_for_launch(&paths, &launch_cwd, auto_resume_state_hint.as_ref())?
     } else {
         None
     };
@@ -233,9 +242,9 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
         let mut codex_args = options.codex_args;
         append_auto_resume_args_if_missing(
             &mut codex_args,
-            auto_resume_state
+            auto_resume_candidate
                 .as_ref()
-                .map(|state| state.session_id.as_str()),
+                .map(|candidate| candidate.session_id.as_str()),
         );
         return exec_real_codex(&real_codex, codex_args);
     }
@@ -243,10 +252,8 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
     let selected_slot = if let Some(slot) = options.slot.clone() {
         slot
     } else {
-        let query_candidates =
-            auto_resume_query_candidates(&paths, &candidates, auto_resume_state.as_ref());
-        let results = selector::query_slots(&paths, &query_candidates, usage_query_options())?;
-        let selected = choose_launch_result(&results, auto_resume_state.as_ref());
+        let results = selector::query_slots(&paths, &candidates, usage_query_options())?;
+        let selected = choose_launch_result(&results);
         if options.debug || std::env::var_os("CX_SLOT_DEBUG").is_some() {
             crate::output::print_report(
                 &results,
@@ -258,7 +265,6 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
             .map(|result| result.slot.clone())
             .context("no usable Codex slot found")?
     };
-    let auto_resume_state = auto_resume_state_for_selected_slot(auto_resume_state, &selected_slot);
 
     exec_slot_codex(
         &paths,
@@ -269,7 +275,7 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
         TerminalResumeLaunch {
             cwd: launch_cwd,
             key: terminal_key,
-            auto_state: auto_resume_state,
+            auto_candidate: auto_resume_candidate,
             direct_launch,
         },
     )
@@ -402,9 +408,9 @@ fn exec_slot_codex(
     let resumed_id = append_auto_resume_args_if_missing(
         &mut spec.args,
         resume_launch
-            .auto_state
+            .auto_candidate
             .as_ref()
-            .map(|state| state.session_id.as_str()),
+            .map(|candidate| candidate.session_id.as_str()),
     );
 
     if let (Some(key), Some(resume_id)) = (resume_launch.key.as_ref(), explicit_resume.as_ref()) {
@@ -458,42 +464,19 @@ fn append_auto_resume_args_if_missing(
     Some(ExplicitResumeId::parse(session_id))
 }
 
-fn auto_resume_query_candidates(
+fn auto_resume_candidate_for_launch(
     paths: &ManagerPaths,
-    candidates: &[String],
-    auto_resume_state: Option<&ResumeState>,
-) -> Vec<String> {
-    let mut query_candidates = candidates.to_vec();
-    if let Some(state) = auto_resume_state {
-        if paths.slot_home(&state.slot).is_dir()
-            && !query_candidates.iter().any(|slot| slot == &state.slot)
-        {
-            query_candidates.push(state.slot.clone());
-        }
+    cwd: &Path,
+    hint: Option<&terminal_resume::ResumeState>,
+) -> Result<Option<ResumeCandidate>> {
+    if terminal_resume::has_active_session(paths) {
+        return Ok(None);
     }
-    query_candidates
+    terminal_resume::latest_cwd_resume_candidate(paths, cwd, hint)
 }
 
-fn choose_launch_result<'a>(
-    results: &'a [crate::usage::SlotResult],
-    auto_resume_state: Option<&ResumeState>,
-) -> Option<&'a crate::usage::SlotResult> {
-    if let Some(state) = auto_resume_state {
-        if let Some(result) = results
-            .iter()
-            .find(|result| result.slot == state.slot && result.is_available())
-        {
-            return Some(result);
-        }
-    }
+fn choose_launch_result(results: &[crate::usage::SlotResult]) -> Option<&crate::usage::SlotResult> {
     selector::choose_result(results)
-}
-
-fn auto_resume_state_for_selected_slot(
-    auto_resume_state: Option<ResumeState>,
-    selected_slot: &str,
-) -> Option<ResumeState> {
-    auto_resume_state.filter(|state| state.slot == selected_slot)
 }
 
 fn print_launch(spec: &CodexCommandSpec, resumed_id: Option<&str>, quiet: bool) {
@@ -930,42 +913,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_resume_query_includes_recorded_slot_when_home_exists() {
-        let paths = test_paths("auto-resume-query-slot");
-        fs::create_dir_all(paths.slot_home("dia7")).unwrap();
-        let state = crate::terminal_resume::test_resume_state(
-            "dia7",
-            paths.base_codex_home.join("project"),
-        );
-
-        assert_eq!(
-            auto_resume_query_candidates(&paths, &[String::from("bus1")], Some(&state)),
-            vec![String::from("bus1"), String::from("dia7")]
-        );
-
-        let _ = fs::remove_dir_all(&paths.manager_dir);
-        let _ = fs::remove_dir_all(&paths.base_codex_home);
-    }
-
-    #[test]
-    fn auto_resume_query_skips_recorded_slot_when_home_is_missing() {
-        let paths = test_paths("auto-resume-query-missing-slot");
-        let state = crate::terminal_resume::test_resume_state(
-            "dia7",
-            paths.base_codex_home.join("project"),
-        );
-
-        assert_eq!(
-            auto_resume_query_candidates(&paths, &[String::from("bus1")], Some(&state)),
-            vec![String::from("bus1")]
-        );
-
-        let _ = fs::remove_dir_all(&paths.manager_dir);
-        let _ = fs::remove_dir_all(&paths.base_codex_home);
-    }
-
-    #[test]
-    fn auto_resume_prefers_recorded_slot_only_when_available() {
+    fn auto_resume_does_not_bias_slot_selection() {
         let state = crate::terminal_resume::test_resume_state(
             "dia7",
             PathBuf::from("/tmp/cx-run-test-project"),
@@ -988,13 +936,14 @@ mod tests {
         ];
 
         assert_eq!(
-            choose_launch_result(&results, Some(&state)).map(|result| result.slot.as_str()),
-            Some("dia7")
+            choose_launch_result(&results).map(|result| result.slot.as_str()),
+            Some("bus1")
         );
+        assert_eq!(state.slot, "dia7");
     }
 
     #[test]
-    fn auto_resume_skips_recorded_slot_when_exhausted() {
+    fn auto_resume_args_survive_rotated_selected_slot() {
         let state = crate::terminal_resume::test_resume_state(
             "dia7",
             PathBuf::from("/tmp/cx-run-test-project"),
@@ -1003,9 +952,9 @@ mod tests {
             crate::usage::SlotResult::new(
                 "dia7",
                 0,
-                crate::usage::SlotStatus::Exhausted,
-                0.0,
-                "done",
+                crate::usage::SlotStatus::Available,
+                10.0,
+                "resume",
             ),
             crate::usage::SlotResult::new(
                 "bus1",
@@ -1017,23 +966,42 @@ mod tests {
         ];
 
         assert_eq!(
-            choose_launch_result(&results, Some(&state)).map(|result| result.slot.as_str()),
+            choose_launch_result(&results).map(|result| result.slot.as_str()),
             Some("bus1")
+        );
+        let mut args = Vec::new();
+
+        let resumed =
+            append_auto_resume_args_if_missing(&mut args, Some(state.session_id.as_str()));
+
+        assert_eq!(
+            resumed,
+            Some(ExplicitResumeId::AppThreadOrCodexSession(String::from(
+                "session-1"
+            )))
+        );
+        assert_eq!(
+            args,
+            vec![OsString::from("resume"), OsString::from("session-1")]
         );
     }
 
     #[test]
-    fn auto_resume_state_is_kept_only_for_selected_slot() {
-        let state = crate::terminal_resume::test_resume_state(
-            "dia7",
-            PathBuf::from("/tmp/cx-run-test-project"),
-        );
+    fn active_session_blocks_auto_resume_candidate() {
+        let paths = test_paths("auto-resume-active-block");
+        let cwd = paths.base_codex_home.join("project");
+        let state = crate::terminal_resume::test_resume_state("dia7", cwd.clone());
+        let watch_request =
+            crate::terminal_resume::test_write_watch_request(&paths, &cwd, std::process::id())
+                .unwrap();
 
-        assert!(auto_resume_state_for_selected_slot(Some(state.clone()), "bus1").is_none());
-        assert_eq!(
-            auto_resume_state_for_selected_slot(Some(state), "dia7").map(|state| state.slot),
-            Some(String::from("dia7"))
-        );
+        assert!(auto_resume_candidate_for_launch(&paths, &cwd, Some(&state))
+            .unwrap()
+            .is_none());
+
+        let _ = fs::remove_file(watch_request);
+        let _ = fs::remove_dir_all(&paths.manager_dir);
+        let _ = fs::remove_dir_all(&paths.base_codex_home);
     }
 
     #[test]

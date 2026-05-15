@@ -182,6 +182,22 @@ pub(crate) fn now_unix_ms() -> u128 {
         .as_millis()
 }
 
+#[cfg(test)]
+pub(crate) fn test_resume_state(slot: &str, cwd: PathBuf) -> ResumeState {
+    ResumeState {
+        version: STATE_VERSION,
+        terminal_key: TerminalKey {
+            source: "test".to_string(),
+            value: "tty-1".to_string(),
+        },
+        slot: slot.to_string(),
+        cwd,
+        session_id: "session-1".to_string(),
+        rollout_path: None,
+        recorded_at_unix_ms: 1,
+    }
+}
+
 fn watch_for_session(request: &WatchRequest) -> Result<()> {
     if request.version != WATCH_REQUEST_VERSION {
         return Ok(());

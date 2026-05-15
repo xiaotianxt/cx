@@ -33,11 +33,11 @@ const USAGE_CACHE_SCHEMA_VERSION: u64 = 1;
 const USAGE_CACHE_TTL_SECONDS: i64 = 30;
 const USAGE_STALE_TTL_SECONDS: i64 = 10 * 60;
 const RATE_STATE_SCHEMA_VERSION: u64 = 1;
-const DEFAULT_START_INTERVAL_MS: u64 = 125;
-const MIN_START_INTERVAL_MS: u64 = 75;
-const MAX_START_INTERVAL_MS: u64 = 1_000;
-const SUCCESS_RECOVERY_WINDOW: u64 = 8;
-const SUCCESS_INTERVAL_STEP_MS: u64 = 10;
+const DEFAULT_START_INTERVAL_MS: u64 = 35;
+const MIN_START_INTERVAL_MS: u64 = 15;
+const MAX_START_INTERVAL_MS: u64 = 750;
+const SUCCESS_RECOVERY_WINDOW: u64 = 4;
+const SUCCESS_INTERVAL_STEP_MS: u64 = 20;
 const DEFAULT_THROTTLE_COOLDOWN_SECONDS: i64 = 1;
 const MAX_THROTTLE_COOLDOWN_SECONDS: i64 = 30;
 const RATE_STATE_IDLE_RESET_SECONDS: i64 = 15 * 60;
@@ -505,6 +505,9 @@ impl UsageRateState {
         if self.throttled_until.is_some_and(|until| until <= now) {
             self.throttled_until = None;
         }
+        if self.throttled_until.is_none() && self.throttle_count == 0 {
+            self.start_interval_ms = self.start_interval_ms.min(DEFAULT_START_INTERVAL_MS);
+        }
         if self.throttled_until.is_none()
             && now.saturating_sub(self.updated_at) > RATE_STATE_IDLE_RESET_SECONDS
         {
@@ -787,5 +790,35 @@ mod tests {
         assert_eq!(state.start_interval_ms, DEFAULT_START_INTERVAL_MS);
         assert_eq!(state.throttle_count, 0);
         assert_eq!(state.successful_refreshes, 0);
+    }
+
+    #[test]
+    fn rate_state_without_throttle_debt_uses_aggressive_default() {
+        let mut state = UsageRateState {
+            start_interval_ms: DEFAULT_START_INTERVAL_MS * 3,
+            updated_at: unix_now(),
+            throttle_count: 0,
+            throttled_until: None,
+            ..UsageRateState::default()
+        };
+
+        state.normalize(unix_now());
+
+        assert_eq!(state.start_interval_ms, DEFAULT_START_INTERVAL_MS);
+    }
+
+    #[test]
+    fn rate_state_preserves_recent_throttle_slowdown() {
+        let mut state = UsageRateState {
+            start_interval_ms: DEFAULT_START_INTERVAL_MS * 3,
+            updated_at: unix_now(),
+            throttle_count: 1,
+            throttled_until: None,
+            ..UsageRateState::default()
+        };
+
+        state.normalize(unix_now());
+
+        assert_eq!(state.start_interval_ms, DEFAULT_START_INTERVAL_MS * 3);
     }
 }

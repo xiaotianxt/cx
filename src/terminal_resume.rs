@@ -110,6 +110,13 @@ pub(crate) fn current_terminal_key() -> Option<TerminalKey> {
         .or_else(gpg_tty_terminal_key)
 }
 
+pub(crate) fn desktop_process_key(pid: u32) -> TerminalKey {
+    TerminalKey {
+        source: "desktop-pid".to_string(),
+        value: pid.to_string(),
+    }
+}
+
 pub(crate) fn load_resume_state(
     paths: &ManagerPaths,
     key: &TerminalKey,
@@ -221,9 +228,11 @@ pub(crate) fn spawn_session_watcher(
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     detach_command(&mut command);
-    command
-        .spawn()
-        .with_context(|| format!("spawn terminal resume watcher {}", request_path.display()))?;
+    if let Err(err) = command.spawn() {
+        let _ignored = fs::remove_file(&request_path);
+        return Err(err)
+            .with_context(|| format!("spawn terminal resume watcher {}", request_path.display()));
+    }
     Ok(())
 }
 
@@ -265,6 +274,26 @@ pub(crate) fn test_write_watch_request(
         manager_dir: paths.manager_dir.clone(),
         codex_home: paths.base_codex_home.clone(),
         sqlite_home: None,
+        slot: "dia1".to_string(),
+        cwd: cwd.to_path_buf(),
+        launch_started_unix_ms: now_unix_ms(),
+        launch_pid,
+    };
+    write_watch_request(paths, &request)
+}
+
+#[cfg(test)]
+pub(crate) fn test_write_desktop_watch_request(
+    paths: &ManagerPaths,
+    cwd: &Path,
+    launch_pid: u32,
+) -> Result<PathBuf> {
+    let request = WatchRequest {
+        version: WATCH_REQUEST_VERSION,
+        terminal_key: desktop_process_key(launch_pid),
+        manager_dir: paths.manager_dir.clone(),
+        codex_home: paths.slot_home("dia1"),
+        sqlite_home: Some(paths.slot_sqlite_home("dia1")),
         slot: "dia1".to_string(),
         cwd: cwd.to_path_buf(),
         launch_started_unix_ms: now_unix_ms(),

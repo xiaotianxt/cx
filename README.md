@@ -205,13 +205,15 @@ cx desktop --target research
 
 `cx desktop` starts the Desktop executable directly with `CODEX_HOME` set to the
 selected slot home, so the Desktop process reads that slot's `auth.json` and
-account state. `env.conf` values are passed to the Desktop process; slot
-`overrides.conf` values are not forwarded to Electron. By default, `cx desktop`
-refuses to launch while another Codex Desktop process is running, because a
-second launch may reuse the old Electron instance and ignore the new slot
-environment. Quit Codex Desktop before switching slots, or pass
-`--allow-parallel` when you intentionally want to test parallel instances. If
-Codex Desktop is installed somewhere else, use `--app-bin` or
+account state. The current working directory is opened with Desktop's
+`--open-project` argument by default, which keeps the slot's Desktop project
+list aligned with the shell project that launched it. `env.conf` values are
+passed to the Desktop process; slot `overrides.conf` values are not forwarded to
+Electron. By default, `cx desktop` refuses to launch while another Codex Desktop
+process is running, because a second launch may reuse the old Electron instance
+and ignore the new slot environment. Quit Codex Desktop before switching slots,
+or pass `--allow-parallel` when you intentionally want to test parallel
+instances. If Codex Desktop is installed somewhere else, use `--app-bin` or
 `CX_CODEX_DESKTOP_BIN`.
 
 Copy the current `~/.codex` auth state into a slot:

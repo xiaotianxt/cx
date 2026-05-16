@@ -23,6 +23,8 @@ struct DesktopLaunchSpec {
     program: PathBuf,
     codex_home: PathBuf,
     envs: BTreeMap<String, String>,
+    launch_cwd: PathBuf,
+    workspace_root: PathBuf,
     args: Vec<OsString>,
     slot: String,
     target_name: Option<String>,
@@ -37,11 +39,12 @@ impl DesktopLaunchSpec {
         self.target_name.as_deref()
     }
 
-    fn into_command(self) -> Command {
-        let mut command = Command::new(self.program);
-        command.env("CODEX_HOME", self.codex_home);
-        command.envs(self.envs);
-        command.args(self.args);
+    fn command(&self) -> Command {
+        let mut command = Command::new(&self.program);
+        command.env("CODEX_HOME", &self.codex_home);
+        command.envs(&self.envs);
+        command.current_dir(&self.launch_cwd);
+        command.args(&self.args);
         command
     }
 }
@@ -51,6 +54,7 @@ pub fn launch(args: DesktopArgs) -> Result<()> {
 
     let paths = ManagerPaths::new(args.manager_dir.clone())?;
     crate::upgrade::run_startup(&paths)?;
+    let launch_cwd = std::env::current_dir().context("resolve current directory")?;
     let command_progress = crate::output::CommandProgress::for_human_output(false);
     let mut progress = command_progress.slot_query("checking slots");
     let runtime = run::select_runtime_with_progress(
@@ -66,6 +70,7 @@ pub fn launch(args: DesktopArgs) -> Result<()> {
         app_bin,
         &runtime.slot,
         runtime.target.as_ref(),
+        &launch_cwd,
         args.args.into_iter().map(OsString::from).collect(),
     )?;
 
@@ -74,14 +79,18 @@ pub fn launch(args: DesktopArgs) -> Result<()> {
         eprintln!("cx desktop target: {target}");
     }
     eprintln!("cx desktop CODEX_HOME: {}", spec.codex_home.display());
+    eprintln!("cx desktop workspace: {}", spec.workspace_root.display());
 
-    let mut command = spec.into_command();
+    let mut command = spec.command();
+    let launch_started_unix_ms = crate::terminal_resume::now_unix_ms();
     if args.wait {
         command
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
-        let status = command.status().context("run Codex Desktop")?;
+        let mut child = command.spawn().context("run Codex Desktop")?;
+        spawn_desktop_session_watcher(&paths, &spec, launch_started_unix_ms, child.id());
+        let status = child.wait().context("wait for Codex Desktop")?;
         if !status.success() {
             anyhow::bail!("Codex Desktop exited with {status}");
         }
@@ -91,10 +100,30 @@ pub fn launch(args: DesktopArgs) -> Result<()> {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let child = command.spawn().context("launch Codex Desktop")?;
+        spawn_desktop_session_watcher(&paths, &spec, launch_started_unix_ms, child.id());
         eprintln!("cx desktop pid: {}", child.id());
     }
 
     Ok(())
+}
+
+fn spawn_desktop_session_watcher(
+    paths: &ManagerPaths,
+    spec: &DesktopLaunchSpec,
+    launch_started_unix_ms: u128,
+    launch_pid: u32,
+) {
+    let key = crate::terminal_resume::current_terminal_key()
+        .unwrap_or_else(|| crate::terminal_resume::desktop_process_key(launch_pid));
+    let _ignored = crate::terminal_resume::spawn_session_watcher(
+        paths,
+        &spec.codex_home,
+        spec.slot(),
+        &spec.workspace_root,
+        &key,
+        launch_started_unix_ms,
+        launch_pid,
+    );
 }
 
 fn ensure_desktop_not_running(allow_parallel: bool) -> Result<()> {
@@ -204,6 +233,7 @@ fn build_desktop_launch_spec(
     app_bin: PathBuf,
     selected_slot: &str,
     target: Option<&TargetSpec>,
+    launch_cwd: &Path,
     args: Vec<OsString>,
 ) -> Result<DesktopLaunchSpec> {
     let slot_home = paths.slot_home(selected_slot);
@@ -229,15 +259,56 @@ fn build_desktop_launch_spec(
         run::CODEX_SQLITE_HOME.to_string(),
         sqlite_home.display().to_string(),
     );
+    let workspace_root = desktop_workspace_root(&args, launch_cwd);
+    let args = ensure_open_project_arg(args, launch_cwd);
 
     Ok(DesktopLaunchSpec {
         program: app_bin,
         codex_home: slot_home,
         envs,
+        launch_cwd: launch_cwd.to_path_buf(),
+        workspace_root,
         args,
         slot: selected_slot.to_string(),
         target_name,
     })
+}
+
+fn ensure_open_project_arg(mut args: Vec<OsString>, workspace_root: &Path) -> Vec<OsString> {
+    if desktop_open_project_arg(&args).is_none() {
+        args.push(OsString::from("--open-project"));
+        args.push(workspace_root.as_os_str().to_os_string());
+    }
+    args
+}
+
+fn desktop_workspace_root(args: &[OsString], launch_cwd: &Path) -> PathBuf {
+    let Some(path) = desktop_open_project_arg(args) else {
+        return launch_cwd.to_path_buf();
+    };
+    if path.is_absolute() {
+        path
+    } else {
+        launch_cwd.join(path)
+    }
+}
+
+fn desktop_open_project_arg(args: &[OsString]) -> Option<PathBuf> {
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        let arg_text = arg.to_string_lossy();
+        if arg_text == "--open-project" {
+            return args.get(index + 1).map(PathBuf::from);
+        }
+        if let Some(path) = arg_text.strip_prefix("--open-project=") {
+            if !path.trim().is_empty() {
+                return Some(PathBuf::from(path));
+            }
+        }
+        index += 1;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -293,7 +364,9 @@ mod tests {
         let root = temp_root("desktop_spec_merges_slot_and_target_env");
         let base = root.join(".codex");
         let manager = base.join("profile-manager");
+        let cwd = root.join("work");
         let paths = ManagerPaths::from_roots(base, manager);
+        fs::create_dir_all(&cwd).unwrap();
         fs::create_dir_all(paths.slot_home("bus1")).unwrap();
         fs::write(
             paths.slot_dir("bus1").join("env.conf"),
@@ -321,6 +394,7 @@ mod tests {
             PathBuf::from("/tmp/Codex"),
             "bus1",
             Some(&target),
+            &cwd,
             Vec::new(),
         )
         .unwrap();
@@ -334,7 +408,7 @@ mod tests {
             Some(&paths.slot_sqlite_home("bus1").display().to_string())
         );
         assert!(paths.slot_sqlite_home("bus1").is_dir());
-        let command = spec.clone().into_command();
+        let command = spec.command();
         let command_sqlite_home = command
             .get_envs()
             .find_map(|(key, value)| {
@@ -347,6 +421,7 @@ mod tests {
             command_sqlite_home,
             paths.slot_sqlite_home("bus1").display().to_string()
         );
+        assert_eq!(command.get_current_dir(), Some(cwd.as_path()));
         assert_eq!(spec.target_name(), Some("work"));
     }
 
@@ -355,7 +430,9 @@ mod tests {
         let root = temp_root("desktop_spec_does_not_forward_codex_overrides_to_electron");
         let base = root.join(".codex");
         let manager = base.join("profile-manager");
+        let cwd = root.join("work");
         let paths = ManagerPaths::from_roots(base, manager);
+        fs::create_dir_all(&cwd).unwrap();
         fs::create_dir_all(paths.slot_home("bus1")).unwrap();
         fs::write(
             paths.slot_dir("bus1").join("overrides.conf"),
@@ -368,11 +445,113 @@ mod tests {
             PathBuf::from("/tmp/Codex"),
             "bus1",
             None,
+            &cwd,
             vec![OsString::from("--enable-logging")],
         )
         .unwrap();
 
-        assert_eq!(spec.args, vec![OsString::from("--enable-logging")]);
+        assert_eq!(
+            spec.args,
+            vec![
+                OsString::from("--enable-logging"),
+                OsString::from("--open-project"),
+                cwd.as_os_str().to_os_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn desktop_spec_adds_current_workspace_root() {
+        let root = temp_root("desktop_spec_adds_current_workspace_root");
+        let base = root.join(".codex");
+        let manager = base.join("profile-manager");
+        let cwd = root.join("project");
+        let paths = ManagerPaths::from_roots(base, manager);
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(paths.slot_home("bus1")).unwrap();
+
+        let spec = build_desktop_launch_spec(
+            &paths,
+            PathBuf::from("/tmp/Codex"),
+            "bus1",
+            None,
+            &cwd,
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert_eq!(spec.workspace_root, cwd);
+        assert_eq!(
+            spec.args,
+            vec![
+                OsString::from("--open-project"),
+                spec.workspace_root.as_os_str().to_os_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn desktop_spec_respects_explicit_open_project_arg() {
+        let root = temp_root("desktop_spec_respects_explicit_open_project_arg");
+        let base = root.join(".codex");
+        let manager = base.join("profile-manager");
+        let cwd = root.join("project");
+        let paths = ManagerPaths::from_roots(base, manager);
+        fs::create_dir_all(cwd.join("nested")).unwrap();
+        fs::create_dir_all(paths.slot_home("bus1")).unwrap();
+
+        let spec = build_desktop_launch_spec(
+            &paths,
+            PathBuf::from("/tmp/Codex"),
+            "bus1",
+            None,
+            &cwd,
+            vec![
+                OsString::from("--open-project"),
+                OsString::from("nested"),
+                OsString::from("--trace-warnings"),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(spec.workspace_root, cwd.join("nested"));
+        assert_eq!(
+            spec.args,
+            vec![
+                OsString::from("--open-project"),
+                OsString::from("nested"),
+                OsString::from("--trace-warnings"),
+            ]
+        );
+    }
+
+    #[test]
+    fn desktop_spec_respects_equals_open_project_arg() {
+        let root = temp_root("desktop_spec_respects_equals_open_project_arg");
+        let base = root.join(".codex");
+        let manager = base.join("profile-manager");
+        let cwd = root.join("project");
+        let workspace = root.join("other");
+        let paths = ManagerPaths::from_roots(base, manager);
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(paths.slot_home("bus1")).unwrap();
+
+        let spec = build_desktop_launch_spec(
+            &paths,
+            PathBuf::from("/tmp/Codex"),
+            "bus1",
+            None,
+            &cwd,
+            vec![OsString::from(format!(
+                "--open-project={}",
+                workspace.display()
+            ))],
+        )
+        .unwrap();
+
+        assert_eq!(spec.workspace_root, workspace);
+        assert_eq!(spec.args.len(), 1);
     }
 
     fn temp_root(name: &str) -> PathBuf {

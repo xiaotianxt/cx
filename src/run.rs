@@ -1014,6 +1014,27 @@ mod tests {
     }
 
     #[test]
+    fn active_desktop_session_blocks_auto_resume_candidate() {
+        let paths = test_paths("auto-resume-desktop-active-block");
+        let cwd = paths.base_codex_home.join("project");
+        let state = crate::terminal_resume::test_resume_state("dia7", cwd.clone());
+        let watch_request = crate::terminal_resume::test_write_desktop_watch_request(
+            &paths,
+            &cwd,
+            std::process::id(),
+        )
+        .unwrap();
+
+        assert!(auto_resume_candidate_for_launch(&paths, &cwd, Some(&state))
+            .unwrap()
+            .is_none());
+
+        let _ = fs::remove_file(watch_request);
+        let _ = fs::remove_dir_all(&paths.manager_dir);
+        let _ = fs::remove_dir_all(&paths.base_codex_home);
+    }
+
+    #[test]
     fn active_session_in_other_cwd_does_not_block_auto_resume_candidate() {
         let paths = test_paths("auto-resume-other-cwd");
         let cwd = paths.base_codex_home.join("project");

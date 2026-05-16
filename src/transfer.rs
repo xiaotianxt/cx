@@ -226,11 +226,26 @@ fn validate_slots(paths: &ManagerPaths, slots: Vec<String>) -> Result<Vec<String
         if !seen.insert(slot.clone()) {
             continue;
         }
+        let slot_dir = paths.slot_dir(&slot);
+        let slot_meta = fs::symlink_metadata(&slot_dir)
+            .with_context(|| format!("stat slot directory {}", slot_dir.display()))?;
+        if !slot_meta.file_type().is_dir() {
+            anyhow::bail!("slot must be a directory: {}", slot_dir.display());
+        }
+        let slot_home = paths.slot_home(&slot);
+        let slot_home_meta = fs::symlink_metadata(&slot_home)
+            .with_context(|| format!("stat slot home {}", slot_home.display()))?;
+        if !slot_home_meta.file_type().is_dir() {
+            anyhow::bail!("slot home must be a directory: {}", slot_home.display());
+        }
         let auth_path = paths.slot_home(&slot).join("auth.json");
-        let auth_meta = fs::symlink_metadata(&auth_path)
-            .with_context(|| format!("stat slot auth {}", auth_path.display()))?;
-        if !auth_meta.file_type().is_file() {
-            anyhow::bail!("slot auth must be a private file: {}", auth_path.display());
+        match fs::symlink_metadata(&auth_path) {
+            Ok(auth_meta) if !auth_meta.file_type().is_file() => {
+                anyhow::bail!("slot auth must be a private file: {}", auth_path.display());
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err).with_context(|| format!("stat {}", auth_path.display())),
         }
         unique.push(slot);
     }
@@ -404,12 +419,6 @@ fn validate_bundle_sources(bundle: &TransferBundle, manifest: &TransferManifest)
         check_named_sources(&source_slot, SLOT_ROOT_FILES)?;
         check_named_sources(&source_slot.join("home"), SLOT_HOME_FILES)?;
         check_named_sources(&source_slot.join("home"), SLOT_HOME_DIRS)?;
-        if !source_slot.join("home/auth.json").is_file() {
-            anyhow::bail!(
-                "bundle missing slot auth: {}",
-                source_slot.join("home/auth.json").display()
-            );
-        }
     }
     Ok(())
 }
@@ -621,4 +630,95 @@ fn normalize_path(path: &Path) -> PathBuf {
         }
     }
     normalized
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::SystemTime;
+    use std::time::UNIX_EPOCH;
+
+    use super::*;
+    use crate::cli::TransferExportArgs;
+    use crate::cli::TransferImportArgs;
+
+    #[test]
+    fn transfer_round_trip_allows_slot_without_auth() {
+        let root = temp_root("no-auth-slot");
+        let _ = fs::remove_dir_all(&root);
+
+        let source = ManagerPaths::from_roots(
+            root.join("source/.codex"),
+            root.join("source/.codex/profile-manager"),
+        );
+        let dest = ManagerPaths::from_roots(
+            root.join("dest/.codex"),
+            root.join("dest/.codex/profile-manager"),
+        );
+        let bundle = root.join("bundle");
+
+        fs::create_dir_all(source.slot_home("deepseek")).unwrap();
+        fs::write(
+            source.base_codex_home.join("config.toml"),
+            "model = \"test\"\n",
+        )
+        .unwrap();
+        fs::write(source.rotation_file.as_path(), "deepseek\n").unwrap();
+        fs::write(
+            source.slot_dir("deepseek").join("env.conf"),
+            "export DEEPSEEK_API_KEY=\"redacted\"\n",
+        )
+        .unwrap();
+        fs::write(
+            source.slot_dir("deepseek").join("overrides.conf"),
+            "model_provider=\"deepseek\"\n",
+        )
+        .unwrap();
+
+        export_with_paths(
+            &source,
+            TransferExportArgs {
+                manager_dir: None,
+                out: bundle.clone(),
+                replace: false,
+                slots: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        assert!(bundle
+            .join("profile-manager/slots/deepseek/env.conf")
+            .is_file());
+        assert!(!bundle
+            .join("profile-manager/slots/deepseek/home/auth.json")
+            .exists());
+
+        import_with_paths(
+            &dest,
+            TransferImportArgs {
+                manager_dir: None,
+                replace: false,
+                bundle,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(dest.slot_dir("deepseek").join("overrides.conf")).unwrap(),
+            "model_provider=\"deepseek\"\n"
+        );
+        assert!(!dest.slot_home("deepseek").join("auth.json").exists());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn temp_root(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "cx-transfer-test-{name}-{}-{nanos}",
+            std::process::id()
+        ))
+    }
 }

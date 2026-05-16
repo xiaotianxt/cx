@@ -8,6 +8,7 @@ mod envfile;
 mod install;
 mod output;
 mod paths;
+mod prime;
 mod resume_id;
 mod run;
 mod selector;
@@ -27,6 +28,7 @@ use clap::CommandFactory;
 use clap::Parser;
 use cli::Cli;
 use cli::Command;
+use cli::PrimeCommand;
 use cli::StatusSort;
 use cli::TargetCommand;
 use cli::TransferCommand;
@@ -97,6 +99,33 @@ fn entry() -> Result<()> {
                 output::print_stats(&report)?;
             }
         }
+        Command::Prime(args) => match args.command {
+            PrimeCommand::Plan(args) => {
+                let paths = paths::ManagerPaths::new(args.schedule.manager_dir.clone())?;
+                upgrade::run_startup(&paths)?;
+                prime::plan(&paths, args)?;
+            }
+            PrimeCommand::Install(args) => {
+                let paths = paths::ManagerPaths::new(args.schedule.manager_dir.clone())?;
+                upgrade::run_startup(&paths)?;
+                prime::install(&paths, args)?;
+            }
+            PrimeCommand::Run(args) => {
+                let paths = paths::ManagerPaths::new(args.manager_dir.clone())?;
+                upgrade::run_startup(&paths)?;
+                prime::run(&paths, args)?;
+            }
+            PrimeCommand::Status(args) => {
+                let paths = paths::ManagerPaths::new(args.manager_dir.clone())?;
+                upgrade::run_startup(&paths)?;
+                prime::status(&paths, args)?;
+            }
+            PrimeCommand::Uninstall(args) => {
+                let paths = paths::ManagerPaths::new(args.manager_dir.clone())?;
+                upgrade::run_startup(&paths)?;
+                prime::uninstall(&paths, args)?;
+            }
+        },
         Command::Select(args) => {
             let paths = paths::ManagerPaths::new(args.manager_dir.clone())?;
             upgrade::run_startup(&paths)?;

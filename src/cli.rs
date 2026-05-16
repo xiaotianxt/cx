@@ -31,6 +31,8 @@ pub enum Command {
     Status(StatusArgs),
     /// Show local Codex token usage totals from the Codex state database.
     Stats(StatsArgs),
+    /// Plan and run short quota-window priming requests.
+    Prime(PrimeArgs),
     /// Print the best slot name for scripting.
     Select(SelectArgs),
     /// Create or update a slot.
@@ -325,6 +327,174 @@ pub struct StatsArgs {
     pub slots: Vec<String>,
 }
 
+#[derive(Debug, Clone, Args)]
+pub struct PrimeArgs {
+    #[command(subcommand)]
+    pub command: PrimeCommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum PrimeCommand {
+    /// Show data-derived daily prime times.
+    Plan(PrimePlanArgs),
+    /// Install a macOS LaunchAgent that runs prime checks at planned times.
+    Install(PrimeInstallArgs),
+    /// Run one prime check now.
+    Run(PrimeRunArgs),
+    /// Show saved prime config and last run state.
+    Status(PrimeStatusArgs),
+    /// Uninstall the macOS LaunchAgent.
+    Uninstall(PrimeUninstallArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct PrimePlanArgs {
+    #[command(flatten)]
+    pub schedule: PrimeScheduleArgs,
+
+    /// Print JSON instead of a human report.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct PrimeInstallArgs {
+    #[command(flatten)]
+    pub schedule: PrimeScheduleArgs,
+
+    /// Target config whose slots and overrides are used by prime runs.
+    #[arg(long)]
+    pub target: Option<String>,
+
+    /// Restrict prime runs to these slots. Defaults to target slots or rotation.txt.
+    #[arg(long = "slot")]
+    pub slots: Vec<String>,
+
+    /// Maximum slots to prime in a single run.
+    #[arg(long, default_value_t = 3)]
+    pub max_slots: usize,
+
+    /// Real Codex binary used by launchd runs.
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
+    pub codex_bin: Option<PathBuf>,
+
+    /// Model to use for the tiny priming request. Defaults to Codex config.
+    #[arg(long)]
+    pub model: Option<String>,
+
+    /// Prompt used for the tiny priming request.
+    #[arg(long, default_value = crate::prime::DEFAULT_PRIME_PROMPT)]
+    pub prompt: String,
+
+    /// Per-slot usage request timeout in seconds.
+    #[arg(long, default_value_t = 2.0)]
+    pub timeout: f32,
+
+    /// Maximum number of slot usage requests to run at once.
+    #[arg(long, default_value_t = 4)]
+    pub jobs: usize,
+
+    /// Retry transient usage request failures this many times.
+    #[arg(long, default_value_t = 1)]
+    pub retries: usize,
+
+    /// Minimum weekly remaining percentage required before sending a prime.
+    #[arg(long, default_value_t = 5.0)]
+    pub min_weekly_remaining: f64,
+
+    /// Prime immediately after installing.
+    #[arg(long)]
+    pub run_now: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct PrimeRunArgs {
+    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
+    pub manager_dir: Option<PathBuf>,
+
+    /// Target config whose slots and overrides are used by this run.
+    #[arg(long)]
+    pub target: Option<String>,
+
+    /// Restrict this run to these slots.
+    #[arg(long = "slot")]
+    pub slots: Vec<String>,
+
+    /// Maximum slots to prime in this run.
+    #[arg(long)]
+    pub max_slots: Option<usize>,
+
+    /// Real Codex binary.
+    #[arg(long, value_hint = clap::ValueHint::FilePath)]
+    pub codex_bin: Option<PathBuf>,
+
+    /// Model to use for the tiny priming request.
+    #[arg(long)]
+    pub model: Option<String>,
+
+    /// Prompt used for the tiny priming request.
+    #[arg(long)]
+    pub prompt: Option<String>,
+
+    /// Send a request even when the 5h window already looks active.
+    #[arg(long)]
+    pub force: bool,
+
+    /// Print what would run without sending requests.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Print JSON instead of a human report.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct PrimeStatusArgs {
+    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
+    pub manager_dir: Option<PathBuf>,
+
+    /// Print JSON instead of a human report.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct PrimeUninstallArgs {
+    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
+    pub manager_dir: Option<PathBuf>,
+
+    /// Also remove saved prime config and state.
+    #[arg(long)]
+    pub delete_state: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct PrimeScheduleArgs {
+    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
+    pub manager_dir: Option<PathBuf>,
+
+    /// Days of local history used to infer heavy work hours.
+    #[arg(long, default_value_t = 30)]
+    pub days: u32,
+
+    /// Minutes before a heavy work hour to send the tiny request.
+    #[arg(long, default_value_t = 210)]
+    pub lead_minutes: u32,
+
+    /// Maximum daily launchd times to install.
+    #[arg(long, default_value_t = 6)]
+    pub max_times: usize,
+
+    /// Ignore hours below this token volume unless all hours are below it.
+    #[arg(long, default_value_t = 20_000_000)]
+    pub min_tokens: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser;
@@ -405,6 +575,40 @@ mod tests {
         let result = Cli::try_parse_from(["cx", "stats", "--range", "2026-02-31"]);
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn prime_install_accepts_schedule_and_run_options() {
+        let cli = Cli::parse_from([
+            "cx",
+            "prime",
+            "install",
+            "--lead-minutes",
+            "180",
+            "--max-times",
+            "4",
+            "--target",
+            "work",
+            "--slot",
+            "bus1",
+            "--max-slots",
+            "2",
+            "--model",
+            "gpt-5.4-mini",
+        ]);
+
+        let Command::Prime(args) = cli.command else {
+            panic!("expected prime command");
+        };
+        let PrimeCommand::Install(args) = args.command else {
+            panic!("expected prime install command");
+        };
+        assert_eq!(args.schedule.lead_minutes, 180);
+        assert_eq!(args.schedule.max_times, 4);
+        assert_eq!(args.target, Some(String::from("work")));
+        assert_eq!(args.slots, vec![String::from("bus1")]);
+        assert_eq!(args.max_slots, 2);
+        assert_eq!(args.model, Some(String::from("gpt-5.4-mini")));
     }
 
     #[test]

@@ -13,6 +13,7 @@ live usage.
 - `cat file | cx "summarize this"`: pass stdin into Codex as prompt context.
 - `cx status`: query all configured slots concurrently.
 - `cx stats`: summarize local Codex token usage from `state_5.sqlite`.
+- `cx prime`: plan and run tiny quota-window priming requests.
 - `cx add` / `cx login` / `cx remove`: manage isolated Codex slots.
 - `cx select`: print the best slot name for scripts.
 - `cx desktop`: launch Codex Desktop through a selected slot.
@@ -192,6 +193,35 @@ plus per-period, per-slot, and per-model cost fields. cx-owned
 `price-cache.json`, `stats-calibration.json`, and `stats-rollout-cache.sqlite`
 live under the profile-manager directory. cx never rewrites Codex's upstream
 `state_5.sqlite`.
+
+Prime 5h quota windows before predictable heavy work:
+
+```bash
+cx prime plan
+cx prime install
+cx prime run --dry-run
+cx prime status
+cx prime uninstall
+```
+
+`cx prime plan` reads local `state_5.sqlite` files and the rollout token cache to
+infer the heaviest local work hours, then shifts those hours earlier by the
+configured lead time, 210 minutes by default. `cx prime install` writes a macOS
+LaunchAgent with exact `StartCalendarInterval` entries for those local times.
+The cx process does not stay resident; launchd starts `cx prime run` at each
+planned time and coalesces missed calendar events when the Mac wakes from sleep.
+
+`cx prime run` checks live usage first and only sends the tiny `codex exec
+--ephemeral` request to eligible ChatGPT slots whose 5h window does not already
+look active and whose weekly quota still has the configured safety margin.
+Defaults are conservative: at most 3 slots per run, a minimum 5% weekly
+remaining, and the prompt `Reply exactly: hi`. Use `--slot`, `--target`,
+`--max-slots`, `--model`, or `--prompt` on `cx prime install` or `cx prime run`
+when you need a narrower policy.
+
+This is intentionally local and opportunistic. If the Mac is asleep, launchd
+runs the missed check after wake; if it is powered off or cannot wake before the
+work session, no local scheduler can start the remote quota window early.
 
 Create and authenticate a slot:
 

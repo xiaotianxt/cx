@@ -23,15 +23,62 @@ impl ProgressOptions {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandProgress {
+    options: ProgressOptions,
+}
+
+impl CommandProgress {
+    pub fn for_human_output(disabled: bool) -> Self {
+        Self {
+            options: ProgressOptions::for_human_output(disabled),
+        }
+    }
+
+    pub fn count(&self, len: usize, message: impl Into<String>) -> ProgressHandle {
+        ProgressHandle::count(self.options, len, message)
+    }
+
+    pub fn spinner(&self, message: impl Into<String>) -> ProgressHandle {
+        ProgressHandle::spinner(self.options, message)
+    }
+
+    pub fn slot_query(&self, message: impl Into<String>) -> SlotQueryProgressBar {
+        SlotQueryProgressBar::new(*self, message)
+    }
+}
+
 #[derive(Debug)]
 pub struct ProgressHandle {
     bar: Option<ProgressBar>,
 }
 
 impl ProgressHandle {
+    pub fn empty() -> Self {
+        Self { bar: None }
+    }
+
+    pub fn spinner(options: ProgressOptions, message: impl Into<String>) -> Self {
+        if !options.enabled {
+            return Self::empty();
+        }
+
+        let bar = ProgressBar::with_draw_target(
+            None,
+            ProgressDrawTarget::stderr_with_hz(PROGRESS_REFRESH_HZ),
+        );
+        if let Ok(style) = ProgressStyle::with_template("{spinner} {msg}") {
+            bar.set_style(style.tick_chars("-\\|/"));
+        }
+        bar.set_message(message.into());
+        bar.enable_steady_tick(Duration::from_millis(100));
+        bar.force_draw();
+        Self { bar: Some(bar) }
+    }
+
     pub fn count(options: ProgressOptions, len: usize, message: impl Into<String>) -> Self {
         if !options.enabled || len == 0 {
-            return Self { bar: None };
+            return Self::empty();
         }
 
         let bar = ProgressBar::with_draw_target(
@@ -76,16 +123,18 @@ impl Drop for ProgressHandle {
 }
 
 #[derive(Debug)]
-pub struct SlotStatusProgress {
-    options: ProgressOptions,
+pub struct SlotQueryProgressBar {
+    progress: CommandProgress,
+    message: String,
     handle: ProgressHandle,
 }
 
-impl SlotStatusProgress {
-    pub fn for_status_command(json: bool, disabled: bool) -> Self {
+impl SlotQueryProgressBar {
+    fn new(progress: CommandProgress, message: impl Into<String>) -> Self {
         Self {
-            options: ProgressOptions::for_human_output(json || disabled),
-            handle: ProgressHandle { bar: None },
+            progress,
+            message: message.into(),
+            handle: ProgressHandle::empty(),
         }
     }
 
@@ -94,9 +143,9 @@ impl SlotStatusProgress {
     }
 }
 
-impl SlotQueryProgressSink for SlotStatusProgress {
+impl SlotQueryProgressSink for SlotQueryProgressBar {
     fn started(&mut self, total: usize) {
-        self.handle = ProgressHandle::count(self.options, total, "checking slots");
+        self.handle = self.progress.count(total, self.message.clone());
     }
 
     fn slot_checked(&mut self, _result: &SlotResult) {
@@ -108,6 +157,10 @@ impl SlotQueryProgressSink for SlotStatusProgress {
             total,
             format!("retrying transient failures {attempt}/{total_attempts}"),
         );
+    }
+
+    fn finished(&mut self) {
+        self.finish_and_clear();
     }
 }
 

@@ -62,11 +62,11 @@ fn entry() -> Result<()> {
                 args.query.jobs,
                 args.query.retries,
             );
-            let mut progress =
-                output::SlotStatusProgress::for_status_command(args.query.json, args.no_progress);
+            let command_progress =
+                output::CommandProgress::for_human_output(args.query.json || args.no_progress);
+            let mut progress = command_progress.slot_query("checking slots");
             let mut results =
                 selector::query_slots_with_progress(&paths, &slots, options, &mut progress)?;
-            progress.finish_and_clear();
             match args.sort {
                 StatusSort::Score => usage::sort_by_score_desc(&mut results),
                 StatusSort::Rotation => {}
@@ -81,11 +81,19 @@ fn entry() -> Result<()> {
             if let Some(target_name) = args.target.as_deref().filter(|_| args.slots.is_empty()) {
                 args.slots = target::load_target(&paths, target_name)?.slots_or_rotation(&paths)?;
             }
+            let command_progress = output::CommandProgress::for_human_output(args.json);
+            let mut progress = command_progress.spinner(if args.calibrate {
+                "calibrating token mix"
+            } else {
+                "collecting stats"
+            });
             if args.calibrate {
                 let report = stats::calibrate_mix(&paths, args)?;
+                progress.finish_and_clear();
                 output::print_stats_calibration(&report)?;
             } else {
                 let report = stats::collect_report(&paths, args)?;
+                progress.finish_and_clear();
                 output::print_stats(&report)?;
             }
         }
@@ -94,7 +102,10 @@ fn entry() -> Result<()> {
             upgrade::run_startup(&paths)?;
             let slots = args.slots_or_rotation(&paths)?;
             let options = selector::SlotQueryOptions::new(args.timeout, args.jobs, args.retries);
-            let results = selector::query_slots(&paths, &slots, options)?;
+            let command_progress = output::CommandProgress::for_human_output(args.json);
+            let mut progress = command_progress.slot_query("checking slots");
+            let results =
+                selector::query_slots_with_progress(&paths, &slots, options, &mut progress)?;
             let selected = selector::choose_result(&results);
             if args.json {
                 output::print_report(&results, selected.map(|result| result.slot.as_str()), true)?;
@@ -128,12 +139,18 @@ fn entry() -> Result<()> {
             TransferCommand::Export(args) => {
                 let paths = paths::ManagerPaths::new(args.manager_dir.clone())?;
                 upgrade::run_startup(&paths)?;
-                transfer::export_with_paths(&paths, args)?
+                let command_progress = output::CommandProgress::for_human_output(false);
+                let mut progress = command_progress.spinner("exporting transfer bundle");
+                transfer::export_with_paths(&paths, args)?;
+                progress.finish_and_clear();
             }
             TransferCommand::Import(args) => {
                 let paths = paths::ManagerPaths::new(args.manager_dir.clone())?;
                 upgrade::run_startup(&paths)?;
-                transfer::import_with_paths(&paths, args)?
+                let command_progress = output::CommandProgress::for_human_output(false);
+                let mut progress = command_progress.spinner("importing transfer bundle");
+                transfer::import_with_paths(&paths, args)?;
+                progress.finish_and_clear();
             }
         },
         Command::Target(args) => match args.command {
@@ -182,7 +199,10 @@ fn entry() -> Result<()> {
             if args.online {
                 let options =
                     selector::SlotQueryOptions::new(args.timeout, args.jobs, args.retries);
-                let results = selector::query_slots(&paths, &slots, options)?;
+                let command_progress = output::CommandProgress::for_human_output(false);
+                let mut progress = command_progress.slot_query("checking slots");
+                let results =
+                    selector::query_slots_with_progress(&paths, &slots, options, &mut progress)?;
                 let selected = selector::choose_result(&results).map(|result| result.slot.clone());
                 output::print_report(&results, selected.as_deref(), false)?;
             }

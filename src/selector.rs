@@ -48,12 +48,8 @@ pub trait SlotQueryProgress {
     fn started(&mut self, _total: usize) {}
     fn slot_checked(&mut self, _result: &SlotResult) {}
     fn retry_started(&mut self, _attempt: usize, _total_attempts: usize, _total: usize) {}
+    fn finished(&mut self) {}
 }
-
-#[derive(Debug, Default)]
-struct NoSlotQueryProgress;
-
-impl SlotQueryProgress for NoSlotQueryProgress {}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SlotQueryOptions {
@@ -70,15 +66,6 @@ impl SlotQueryOptions {
             retries,
         }
     }
-}
-
-pub fn query_slots(
-    paths: &ManagerPaths,
-    slots: &[String],
-    options: SlotQueryOptions,
-) -> Result<Vec<SlotResult>> {
-    let mut progress = NoSlotQueryProgress;
-    query_slots_with_progress(paths, slots, options, &mut progress)
 }
 
 pub fn query_slots_with_progress<P: SlotQueryProgress>(
@@ -149,6 +136,7 @@ pub fn query_slots_with_progress<P: SlotQueryProgress>(
 
     let _ignored = rate_state.save(paths);
     results.sort_by_key(|result| result.index);
+    progress.finished();
     Ok(results)
 }
 

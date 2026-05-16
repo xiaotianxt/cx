@@ -51,11 +51,14 @@ pub fn launch(args: DesktopArgs) -> Result<()> {
 
     let paths = ManagerPaths::new(args.manager_dir.clone())?;
     crate::upgrade::run_startup(&paths)?;
-    let runtime = run::select_runtime(
+    let command_progress = crate::output::CommandProgress::for_human_output(false);
+    let mut progress = command_progress.slot_query("checking slots");
+    let runtime = run::select_runtime_with_progress(
         &paths,
         args.slot.as_deref(),
         args.target.as_deref(),
         args.cx_debug,
+        &mut progress,
     )?;
     let app_bin = resolve_desktop_bin(args.app_bin.as_deref())?;
     let spec = build_desktop_launch_spec(

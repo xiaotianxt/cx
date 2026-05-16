@@ -56,7 +56,7 @@ const MODEL_COLORS: [(u8, u8, u8); 12] = [
 pub mod progress;
 mod status;
 
-pub use progress::SlotStatusProgress;
+pub use progress::CommandProgress;
 pub use status::print_no_available;
 pub use status::print_report;
 

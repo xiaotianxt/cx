@@ -252,7 +252,14 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
     let selected_slot = if let Some(slot) = options.slot.clone() {
         slot
     } else {
-        let results = selector::query_slots(&paths, &candidates, usage_query_options())?;
+        let command_progress = crate::output::CommandProgress::for_human_output(false);
+        let mut progress = command_progress.slot_query("checking slots");
+        let results = selector::query_slots_with_progress(
+            &paths,
+            &candidates,
+            usage_query_options(),
+            &mut progress,
+        )?;
         let selected = choose_launch_result(&results);
         if options.debug || std::env::var_os("CX_SLOT_DEBUG").is_some() {
             crate::output::print_report(
@@ -310,11 +317,12 @@ pub(crate) fn should_skip_stdin_wrapper(args: &[OsString]) -> bool {
         .is_some_and(|arg| BYPASS_SUBCOMMANDS.contains(&arg.as_str()))
 }
 
-pub(crate) fn select_runtime(
+pub(crate) fn select_runtime_with_progress<P: selector::SlotQueryProgress>(
     paths: &ManagerPaths,
     slot: Option<&str>,
     target_name: Option<&str>,
     debug: bool,
+    progress: &mut P,
 ) -> Result<RuntimeSelection> {
     let target = crate::target::load_optional_target(paths, target_name)?;
     if let Some(slot) = slot {
@@ -333,7 +341,8 @@ pub(crate) fn select_runtime(
         anyhow::bail!("no configured slots");
     }
 
-    let results = selector::query_slots(paths, &candidates, usage_query_options())?;
+    let results =
+        selector::query_slots_with_progress(paths, &candidates, usage_query_options(), progress)?;
     let selected = selector::choose_result(&results);
     if debug || std::env::var_os("CX_SLOT_DEBUG").is_some() {
         crate::output::print_report(&results, selected.map(|result| result.slot.as_str()), false)?;

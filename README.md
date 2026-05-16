@@ -60,17 +60,22 @@ Selection logic:
 2. Query every slot concurrently.
 3. Skip slots where `allowed=false` or `limit_reached=true`.
 4. Score each available slot as `min(5h remaining, weekly remaining)`.
-5. Pick the highest score, preserving `rotation.txt` order for ties.
-6. If every live check fails due to a transient network error, fall back to the
+5. For automatic selection, prefer slots with at least 20% bottleneck capacity
+   whose bottleneck window refreshes soonest, then prefer the higher score.
+6. If every available slot is below that expected-session floor, pick the
+   highest score instead of chasing an almost-empty refresh window.
+7. If every live check fails due to a transient network error, fall back to the
    first transient slot so a temporary network failure does not block local work.
 
 `credits.has_credits=false` is not treated as exhaustion. The real availability
 signals are `rate_limit.allowed` and `rate_limit.limit_reached`.
 
 `cx status` prints slots sorted by score descending by default, preserving
-`rotation.txt` order for ties. Use `cx status --sort rotation` to show
-`rotation.txt` or explicit argument order instead. The `5h` column comes from
-`rate_limit.primary_window` and the `weekly` column comes from
+`rotation.txt` order for ties. Automatic launch selection is refresh-aware, so
+the selected slot may be a lower-score slot whose bottleneck capacity refreshes
+sooner. Use `cx status --sort rotation` to show `rotation.txt` or explicit
+argument order instead. The `5h` column comes from `rate_limit.primary_window`
+and the `weekly` column comes from
 `rate_limit.secondary_window`. The summary includes the next refresh time when
 the usage endpoint reports a reset timestamp. The status line also includes a
 masked account label, using a masked email plus a short account-id suffix when

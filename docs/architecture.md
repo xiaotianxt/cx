@@ -60,6 +60,20 @@ rate_limit.limit_reached == true
 
 It intentionally ignores `credits.has_credits=false` as an exhaustion signal.
 
+Available ChatGPT slots keep a score equal to their bottleneck capacity:
+
+```text
+min(5h remaining, weekly remaining)
+```
+
+Automatic launch selection treats that score as current capacity, then applies
+a refresh-aware policy. Slots with at least 20% bottleneck capacity are eligible
+for the expected next session; among those, cx chooses the slot whose bottleneck
+window refreshes first, then breaks ties by higher bottleneck capacity and
+rotation order. If every available slot is below 20%, cx falls back to highest
+bottleneck capacity so it does not select a nearly empty account only because it
+refreshes soon.
+
 ## Usage Refresh Control
 
 Usage refresh is cached per slot, not per `status` command. Fresh cache entries

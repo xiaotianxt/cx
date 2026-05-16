@@ -50,13 +50,17 @@ ChatGPT-Account-ID: <account_id>
 1. 并发查询 `rotation.txt` 里的所有 slot。
 2. `allowed=false` 或 `limit_reached=true` 的 slot 视为耗尽并跳过。
 3. 使用 `min(5h 剩余额度, weekly 剩余额度)` 作为 score。
-4. 选择 score 最高的 slot；分数相同则保持 `rotation.txt` 顺序。
-5. 如果所有在线检查都是临时网络错误，则回退到第一个临时失败的 slot，避免网络抖动直接阻塞工作。
+4. 自动选择时，优先选瓶颈剩余额度至少 20%、且瓶颈窗口最早 refresh 的 slot；
+   refresh 时间相同再选 score 更高的。
+5. 如果所有可用 slot 都低于这个预期单次会话门槛，则回退到 score 最高的 slot，
+   避免为了快重置而选中几乎空掉的账号。
+6. 如果所有在线检查都是临时网络错误，则回退到第一个临时失败的 slot，避免网络抖动直接阻塞工作。
 
 `credits.has_credits=false` 不会被当成耗尽。这个字段只表示没有额外 credit，真正能不能用以
 `rate_limit.allowed` 和 `rate_limit.limit_reached` 为准。
 
-`cx status` 默认按 score 倒序显示，分数相同则保持 `rotation.txt` 顺序。使用
+`cx status` 默认按 score 倒序显示，分数相同则保持 `rotation.txt` 顺序。自动启动选择会考虑
+瓶颈窗口的 refresh 时间，因此被选中的 slot 可能不是当前 score 最高的 slot。使用
 `cx status --sort rotation` 可以改为按 `rotation.txt` 或显式参数顺序显示。`5h` 列来自
 `rate_limit.primary_window`，`weekly` 列来自 `rate_limit.secondary_window`。如果接口返回
 reset 时间，summary 会显示下一次 refresh 还要多久。状态行也会展示脱敏账号标识：优先使用

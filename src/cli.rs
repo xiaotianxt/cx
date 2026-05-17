@@ -402,6 +402,14 @@ pub struct PrimeInstallArgs {
     #[arg(long, default_value_t = 1)]
     pub retries: usize,
 
+    /// Seconds to poll live usage after each prime request.
+    #[arg(long, default_value_t = crate::prime::DEFAULT_PRIME_VERIFY_TIMEOUT_SECONDS)]
+    pub verify_timeout: u64,
+
+    /// Maximum Codex requests to send per slot while trying to verify active.
+    #[arg(long, default_value_t = crate::prime::DEFAULT_PRIME_MAX_REQUESTS)]
+    pub max_requests: usize,
+
     /// Minimum weekly remaining percentage required before sending a prime.
     #[arg(long, default_value_t = 5.0)]
     pub min_weekly_remaining: f64,
@@ -440,6 +448,14 @@ pub struct PrimeRunArgs {
     /// Prompt used for the tiny priming request.
     #[arg(long)]
     pub prompt: Option<String>,
+
+    /// Seconds to poll live usage after each prime request.
+    #[arg(long)]
+    pub verify_timeout: Option<u64>,
+
+    /// Maximum Codex requests to send per slot while trying to verify active.
+    #[arg(long)]
+    pub max_requests: Option<usize>,
 
     /// Send a request even when the 5h window already looks active.
     #[arg(long)]
@@ -609,6 +625,10 @@ mod tests {
             "2",
             "--model",
             "gpt-5.4-mini",
+            "--verify-timeout",
+            "20",
+            "--max-requests",
+            "2",
         ]);
 
         let Command::Prime(args) = cli.command else {
@@ -623,6 +643,33 @@ mod tests {
         assert_eq!(args.slots, vec![String::from("bus1")]);
         assert_eq!(args.max_slots, Some(2));
         assert_eq!(args.model, Some(String::from("gpt-5.4-mini")));
+        assert_eq!(args.verify_timeout, 20);
+        assert_eq!(args.max_requests, 2);
+    }
+
+    #[test]
+    fn prime_run_accepts_verification_policy() {
+        let cli = Cli::parse_from([
+            "cx",
+            "prime",
+            "run",
+            "--slot",
+            "bus1",
+            "--verify-timeout",
+            "30",
+            "--max-requests",
+            "3",
+        ]);
+
+        let Command::Prime(args) = cli.command else {
+            panic!("expected prime command");
+        };
+        let PrimeCommand::Run(args) = args.command else {
+            panic!("expected prime run command");
+        };
+        assert_eq!(args.slots, vec![String::from("bus1")]);
+        assert_eq!(args.verify_timeout, Some(30));
+        assert_eq!(args.max_requests, Some(3));
     }
 
     #[test]

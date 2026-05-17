@@ -42,8 +42,10 @@ use crate::usage::SlotStatus;
 use crate::usage::UsageChecker;
 
 pub const DEFAULT_PRIME_PROMPT: &str = "Reply exactly: hi";
+pub const DEFAULT_PRIME_VERIFY_TIMEOUT_SECONDS: u64 = 45;
+pub const DEFAULT_PRIME_MAX_REQUESTS: usize = 2;
 
-const PRIME_SCHEMA_VERSION: u64 = 2;
+const PRIME_SCHEMA_VERSION: u64 = 3;
 const PRIME_CONFIG: &str = "prime/config.json";
 const PRIME_STATE: &str = "prime/state.json";
 const PRIME_DIR: &str = "prime";
@@ -53,8 +55,8 @@ const ROLLOUT_CACHE: &str = "stats-rollout-cache.sqlite";
 const STATE_DB: &str = "state_5.sqlite";
 const MAX_PROMPT_BYTES: usize = 2_000;
 const PRIME_TIMEOUT_SECONDS: u64 = 90;
-const PRIME_VERIFY_DELAY: Duration = Duration::from_secs(2);
-const PRIME_REQUEST_ATTEMPTS: usize = 3;
+const PRIME_VERIFY_INTERVAL: Duration = Duration::from_secs(3);
+const RESET_AT_STABLE_TOLERANCE_SECONDS: i64 = 1;
 const FIVE_HOUR_WINDOW_SECONDS: i64 = 5 * 60 * 60;
 const ACTIVE_REFRESH_GRACE_SECONDS: i64 = 5 * 60;
 const MAX_IDLE_FIVE_HOUR_USED_PERCENT: f64 = 1.0;
@@ -119,6 +121,10 @@ struct PrimeConfig {
     timeout: f32,
     jobs: usize,
     retries: usize,
+    #[serde(default = "default_prime_verify_timeout_seconds")]
+    verify_timeout_seconds: u64,
+    #[serde(default = "default_prime_max_requests")]
+    max_requests: usize,
     min_weekly_remaining: f64,
 }
 
@@ -187,6 +193,8 @@ struct EffectiveRunConfig {
     timeout: f32,
     jobs: usize,
     retries: usize,
+    verify_timeout_seconds: u64,
+    max_requests: usize,
     min_weekly_remaining: f64,
 }
 
@@ -238,6 +246,8 @@ pub fn install(paths: &ManagerPaths, args: PrimeInstallArgs) -> Result<()> {
         timeout: args.timeout.max(0.1),
         jobs: args.jobs.max(1),
         retries: args.retries,
+        verify_timeout_seconds: args.verify_timeout,
+        max_requests: args.max_requests.max(1),
         min_weekly_remaining: args.min_weekly_remaining.clamp(0.0, 100.0),
     };
     save_config(paths, &config)?;
@@ -264,6 +274,8 @@ pub fn install(paths: &ManagerPaths, args: PrimeInstallArgs) -> Result<()> {
                 codex_bin: None,
                 model: None,
                 prompt: None,
+                verify_timeout: None,
+                max_requests: None,
                 force: false,
                 dry_run: false,
                 json: false,
@@ -387,6 +399,15 @@ impl EffectiveRunConfig {
             timeout: config.map(|config| config.timeout).unwrap_or(2.0).max(0.1),
             jobs: config.map(|config| config.jobs).unwrap_or(4).max(1),
             retries: config.map(|config| config.retries).unwrap_or(1),
+            verify_timeout_seconds: args
+                .verify_timeout
+                .or_else(|| config.map(|config| config.verify_timeout_seconds))
+                .unwrap_or(DEFAULT_PRIME_VERIFY_TIMEOUT_SECONDS),
+            max_requests: args
+                .max_requests
+                .map(|max_requests| max_requests.max(1))
+                .or_else(|| config.map(|config| config.max_requests.max(1)))
+                .unwrap_or(DEFAULT_PRIME_MAX_REQUESTS),
             min_weekly_remaining: config
                 .map(|config| config.min_weekly_remaining)
                 .unwrap_or(5.0)
@@ -851,7 +872,7 @@ fn run_prime_slot_inner(
     let mut saw_reported_tokens = false;
     let mut last_note = None;
 
-    for request_attempt in 1..=PRIME_REQUEST_ATTEMPTS {
+    for request_attempt in 1..=config.max_requests {
         let output = run_prime_exec_once(paths, real_codex, slot, target, config)?;
         let exit_code = output.status.code();
         if !output.status.success() {
@@ -873,7 +894,13 @@ fn run_prime_slot_inner(
             total_reported_tokens = total_reported_tokens.saturating_add(tokens);
         }
 
-        let verified = verify_prime_window(paths, slot, config.timeout)?;
+        let verification = verify_prime_window(
+            paths,
+            slot,
+            config.timeout,
+            Duration::from_secs(config.verify_timeout_seconds),
+        )?;
+        let verified = &verification.result;
         let verified_now = now_unix();
         let token_note = if saw_reported_tokens {
             format!("; codex reported {total_reported_tokens} tokens total")
@@ -882,8 +909,7 @@ fn run_prime_slot_inner(
         };
         match verified.status {
             SlotStatus::Available | SlotStatus::Exhausted => {
-                if let Some(active) = remote_active_five_hour_window_reason(&verified, verified_now)
-                {
+                if let Some(active) = verification.active_reason.as_deref() {
                     return Ok(CommandOutcome {
                         success: true,
                         exit_code,
@@ -893,9 +919,11 @@ fn run_prime_slot_inner(
                     });
                 }
                 last_note = Some(format!(
-                    "codex exec succeeded but 5h window is not active after {request_attempt} request(s){}; {}",
+                    "codex exec succeeded but 5h window was not verified after {request_attempt}/{} request(s) and {}s{}; {}",
+                    config.max_requests,
+                    config.verify_timeout_seconds,
                     token_note,
-                    live_window_summary(&verified, verified_now)
+                    live_window_summary(verified, verified_now)
                 ));
             }
             status => {
@@ -942,17 +970,96 @@ fn run_prime_exec_once(
     wait_with_timeout(command, Duration::from_secs(PRIME_TIMEOUT_SECONDS))
 }
 
-fn verify_prime_window(paths: &ManagerPaths, slot: &str, timeout: f32) -> Result<SlotResult> {
+fn verify_prime_window(
+    paths: &ManagerPaths,
+    slot: &str,
+    timeout: f32,
+    verify_timeout: Duration,
+) -> Result<PrimeVerification> {
     let checker = UsageChecker::new(timeout.max(1.0))?;
-    let first = checker.query_slot(paths, slot, 0);
-    if remote_active_five_hour_window_reason(&first, now_unix()).is_some()
-        || !matches!(first.status, SlotStatus::Available | SlotStatus::Exhausted)
-    {
-        return Ok(first);
+    let started = Instant::now();
+    let mut previous = None;
+
+    loop {
+        let result = checker.query_slot(paths, slot, 0);
+        let observed_at = now_unix();
+        if let Some(reason) = remote_active_five_hour_window_reason(&result, observed_at) {
+            return Ok(PrimeVerification::active(result, reason));
+        }
+        if let Some((previous_result, previous_at)) = previous.as_ref() {
+            if let Some(reason) =
+                stable_reset_at_reason(previous_result, *previous_at, &result, observed_at)
+            {
+                return Ok(PrimeVerification::active(result, reason));
+            }
+        }
+        if !matches!(result.status, SlotStatus::Available | SlotStatus::Exhausted)
+            || started.elapsed() >= verify_timeout
+        {
+            return Ok(PrimeVerification::inactive(result));
+        }
+
+        previous = Some((result, observed_at));
+        let remaining = verify_timeout.saturating_sub(started.elapsed());
+        thread::sleep(remaining.min(PRIME_VERIFY_INTERVAL));
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PrimeVerification {
+    result: SlotResult,
+    active_reason: Option<String>,
+}
+
+impl PrimeVerification {
+    fn active(result: SlotResult, reason: String) -> Self {
+        Self {
+            result,
+            active_reason: Some(reason),
+        }
     }
 
-    thread::sleep(PRIME_VERIFY_DELAY);
-    Ok(checker.query_slot(paths, slot, 0))
+    fn inactive(result: SlotResult) -> Self {
+        Self {
+            result,
+            active_reason: None,
+        }
+    }
+}
+
+fn stable_reset_at_reason(
+    previous: &SlotResult,
+    previous_at: i64,
+    current: &SlotResult,
+    current_at: i64,
+) -> Option<String> {
+    if !matches!(
+        current.status,
+        SlotStatus::Available | SlotStatus::Exhausted
+    ) {
+        return None;
+    }
+    let elapsed = current_at.saturating_sub(previous_at);
+    if elapsed < 2 {
+        return None;
+    }
+    let previous_refresh_at = previous.five_hour_refresh_at?;
+    let current_refresh_at = current.five_hour_refresh_at?;
+    if current_refresh_at.saturating_sub(current_at) <= ACTIVE_REFRESH_GRACE_SECONDS {
+        return None;
+    }
+
+    let shift = current_refresh_at - previous_refresh_at;
+    if shift.abs() > RESET_AT_STABLE_TOLERANCE_SECONDS {
+        return None;
+    }
+
+    let refresh = format_refresh_in(current_refresh_at)
+        .map(|refresh| format!(", refresh {refresh}"))
+        .unwrap_or_default();
+    Some(format!(
+        "5h window active (reset_at fixed over {elapsed}s{refresh})"
+    ))
 }
 
 fn parse_codex_tokens_used(stdout: &[u8]) -> Option<u64> {
@@ -1057,15 +1164,24 @@ fn save_config(paths: &ManagerPaths, config: &PrimeConfig) -> Result<()> {
         .map(|_| ())
 }
 
+fn default_prime_verify_timeout_seconds() -> u64 {
+    DEFAULT_PRIME_VERIFY_TIMEOUT_SECONDS
+}
+
+fn default_prime_max_requests() -> usize {
+    DEFAULT_PRIME_MAX_REQUESTS
+}
+
 fn load_config(paths: &ManagerPaths) -> Option<PrimeConfig> {
     CacheStore::new(paths)
         .read_json(PRIME_CONFIG, |config: &PrimeConfig| {
-            matches!(config.schema_version, 1 | PRIME_SCHEMA_VERSION)
+            matches!(config.schema_version, 1 | 2 | PRIME_SCHEMA_VERSION)
         })
         .map(|mut config| {
             if config.schema_version == 1 && config.max_slots == Some(3) {
                 config.max_slots = None;
             }
+            config.max_requests = config.max_requests.max(1);
             config
         })
 }
@@ -1078,7 +1194,7 @@ fn save_state(paths: &ManagerPaths, state: &PrimeState) -> Result<()> {
 
 fn load_state(paths: &ManagerPaths) -> Option<PrimeState> {
     CacheStore::new(paths).read_json(PRIME_STATE, |state: &PrimeState| {
-        state.schema_version == PRIME_SCHEMA_VERSION
+        matches!(state.schema_version, 2 | PRIME_SCHEMA_VERSION)
     })
 }
 
@@ -1401,12 +1517,14 @@ fn print_status_report(report: &PrimeStatusReport) {
     if let Some(config) = report.config.as_ref() {
         println!();
         println!(
-            "config: lead {}m, max slots {}, min weekly {:.1}%",
+            "config: lead {}m, max slots {}, verify {}s, max requests {}, min weekly {:.1}%",
             config.lead_minutes,
             config
                 .max_slots
                 .map(|max_slots| max_slots.to_string())
                 .unwrap_or_else(|| "all".to_string()),
+            config.verify_timeout_seconds,
+            config.max_requests,
             config.min_weekly_remaining
         );
         for schedule in &config.schedules {
@@ -1565,5 +1683,46 @@ mod tests {
             live_window_summary(&result, now),
             "live 5h used 1.0%, refresh in 5h"
         );
+    }
+
+    #[test]
+    fn fixed_reset_at_verifies_active_even_when_used_percent_is_one() {
+        let previous_at = 1_000;
+        let current_at = 1_005;
+        let mut previous = SlotResult::new("slot", 0, SlotStatus::Available, 99.0, "usage");
+        previous.five_hour_used_percent = Some(1.0);
+        previous.five_hour_refresh_at = Some(20_000);
+        let mut current = previous.clone();
+        current.five_hour_refresh_at = Some(20_000);
+
+        let reason = stable_reset_at_reason(&previous, previous_at, &current, current_at).unwrap();
+
+        assert!(reason.contains("reset_at fixed"));
+    }
+
+    #[test]
+    fn sliding_reset_at_does_not_verify_active() {
+        let previous_at = 1_000;
+        let current_at = 1_005;
+        let mut previous = SlotResult::new("slot", 0, SlotStatus::Available, 99.0, "usage");
+        previous.five_hour_used_percent = Some(1.0);
+        previous.five_hour_refresh_at = Some(20_000);
+        let mut current = previous.clone();
+        current.five_hour_refresh_at = Some(20_005);
+
+        assert!(stable_reset_at_reason(&previous, previous_at, &current, current_at).is_none());
+    }
+
+    #[test]
+    fn backward_reset_at_jump_does_not_verify_active() {
+        let previous_at = 1_000;
+        let current_at = 1_005;
+        let mut previous = SlotResult::new("slot", 0, SlotStatus::Available, 99.0, "usage");
+        previous.five_hour_used_percent = Some(1.0);
+        previous.five_hour_refresh_at = Some(20_000);
+        let mut current = previous.clone();
+        current.five_hour_refresh_at = Some(19_995);
+
+        assert!(stable_reset_at_reason(&previous, previous_at, &current, current_at).is_none());
     }
 }

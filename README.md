@@ -214,10 +214,10 @@ planned time and coalesces missed calendar events when the Mac wakes from sleep.
 `cx prime run` checks live usage first and only sends the tiny `codex exec
 --ephemeral` request to eligible ChatGPT slots whose 5h window does not already
 look active and whose weekly quota still has the configured safety margin.
-Defaults are conservative: at most 3 slots per run, a minimum 5% weekly
-remaining, and the prompt `Reply exactly: hi`. Use `--slot`, `--target`,
+By default, every eligible slot is primed in parallel, with a minimum 5% weekly
+remaining and the prompt `Reply exactly: hi`. Use `--slot`, `--target`,
 `--max-slots`, `--model`, or `--prompt` on `cx prime install` or `cx prime run`
-when you need a narrower policy.
+when you need a narrower policy or explicit concurrency cap.
 
 This is intentionally local and opportunistic. If the Mac is asleep, launchd
 runs the missed check after wake; if it is powered off or cannot wake before the

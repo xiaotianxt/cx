@@ -34,12 +34,13 @@ use crate::run;
 use crate::selector;
 use crate::slot;
 use crate::target;
+use crate::usage::format_refresh_in;
 use crate::usage::SlotResult;
 use crate::usage::SlotStatus;
 
 pub const DEFAULT_PRIME_PROMPT: &str = "Reply exactly: hi";
 
-const PRIME_SCHEMA_VERSION: u64 = 1;
+const PRIME_SCHEMA_VERSION: u64 = 2;
 const PRIME_CONFIG: &str = "prime/config.json";
 const PRIME_STATE: &str = "prime/state.json";
 const PRIME_DIR: &str = "prime";
@@ -49,7 +50,9 @@ const ROLLOUT_CACHE: &str = "stats-rollout-cache.sqlite";
 const STATE_DB: &str = "state_5.sqlite";
 const MAX_PROMPT_BYTES: usize = 2_000;
 const PRIME_TIMEOUT_SECONDS: u64 = 90;
+const FIVE_HOUR_WINDOW_SECONDS: i64 = 5 * 60 * 60;
 const ACTIVE_REFRESH_GRACE_SECONDS: i64 = 5 * 60;
+const LOCAL_PRIME_ACTIVE_SECONDS: i64 = FIVE_HOUR_WINDOW_SECONDS - ACTIVE_REFRESH_GRACE_SECONDS;
 const MAX_IDLE_FIVE_HOUR_USED_PERCENT: f64 = 1.0;
 const START_HOUR_WEIGHT: f64 = 1.0;
 const ROLLOUT_HOUR_WEIGHT: f64 = 0.35;
@@ -104,7 +107,8 @@ struct PrimeConfig {
     schedules: Vec<PrimeScheduleTime>,
     target: Option<String>,
     slots: Vec<String>,
-    max_slots: usize,
+    #[serde(default)]
+    max_slots: Option<usize>,
     codex_bin: Option<PathBuf>,
     model: Option<String>,
     prompt: String,
@@ -119,6 +123,8 @@ struct PrimeConfig {
 struct PrimeState {
     schema_version: u64,
     updated_at: i64,
+    #[serde(default, rename = "lastSuccessfulPrimes")]
+    last_successful_primes: BTreeMap<String, i64>,
     last_run: Option<PrimeRunReport>,
 }
 
@@ -130,7 +136,8 @@ struct PrimeRunReport {
     dry_run: bool,
     force: bool,
     checked_slots: usize,
-    max_slots: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_slots: Option<usize>,
     primed: Vec<PrimeAttempt>,
     skipped: Vec<PrimeSkip>,
 }
@@ -169,7 +176,7 @@ struct PrimeStatusReport {
 struct EffectiveRunConfig {
     target: Option<String>,
     slots: Vec<String>,
-    max_slots: usize,
+    max_slots: Option<usize>,
     codex_bin: Option<PathBuf>,
     model: Option<String>,
     prompt: String,
@@ -220,7 +227,7 @@ pub fn install(paths: &ManagerPaths, args: PrimeInstallArgs) -> Result<()> {
         schedules: report.schedules.clone(),
         target: args.target.clone(),
         slots: args.slots.clone(),
-        max_slots: args.max_slots.max(1),
+        max_slots: args.max_slots.map(|max_slots| max_slots.max(1)),
         codex_bin: Some(codex_bin),
         model: args.model.clone(),
         prompt: validate_prompt(&args.prompt)?,
@@ -265,13 +272,21 @@ pub fn install(paths: &ManagerPaths, args: PrimeInstallArgs) -> Result<()> {
 
 pub fn run(paths: &ManagerPaths, args: PrimeRunArgs) -> Result<()> {
     let config = load_config(paths);
+    let previous_state = load_state(paths);
     let effective = EffectiveRunConfig::from_config_and_args(config.as_ref(), &args)?;
-    let report = run_prime_check(paths, &effective, args.force, args.dry_run)?;
+    let report = run_prime_check(
+        paths,
+        &effective,
+        args.force,
+        args.dry_run,
+        previous_state.as_ref(),
+    )?;
     save_state(
         paths,
         &PrimeState {
             schema_version: PRIME_SCHEMA_VERSION,
             updated_at: now_unix(),
+            last_successful_primes: updated_prime_history(previous_state.as_ref(), &report),
             last_run: Some(report.clone()),
         },
     )?;
@@ -360,9 +375,8 @@ impl EffectiveRunConfig {
             slots,
             max_slots: args
                 .max_slots
-                .or_else(|| config.map(|config| config.max_slots))
-                .unwrap_or(1)
-                .max(1),
+                .map(|max_slots| max_slots.max(1))
+                .or_else(|| config.and_then(|config| config.max_slots)),
             codex_bin: args
                 .codex_bin
                 .clone()
@@ -563,6 +577,7 @@ fn run_prime_check(
     config: &EffectiveRunConfig,
     force: bool,
     dry_run: bool,
+    previous_state: Option<&PrimeState>,
 ) -> Result<PrimeRunReport> {
     let target = target::load_optional_target(paths, config.target.as_deref())?;
     let slots = if !config.slots.is_empty() {
@@ -586,9 +601,18 @@ fn run_prime_check(
     let now = now_unix();
     let mut skipped = Vec::new();
     let mut candidates = Vec::new();
+    let last_primes = previous_state
+        .map(|state| state.last_successful_primes.clone())
+        .unwrap_or_default();
 
     for result in &results {
-        match prime_candidate(result, now, config.min_weekly_remaining, force) {
+        match prime_candidate(
+            result,
+            now,
+            config.min_weekly_remaining,
+            force,
+            last_primes.get(&result.slot).copied(),
+        ) {
             Ok(candidate) => candidates.push(candidate),
             Err(reason) => skipped.push(PrimeSkip {
                 slot: result.slot.clone(),
@@ -603,9 +627,11 @@ fn run_prime_check(
     } else {
         Some(run::resolve_codex_bin(config.codex_bin.as_deref())?)
     };
+    let max_slots = config.max_slots.unwrap_or(usize::MAX);
+    let selected_candidates = candidates.into_iter().take(max_slots).collect::<Vec<_>>();
     let mut primed = Vec::new();
-    for candidate in candidates.into_iter().take(config.max_slots) {
-        if dry_run {
+    if dry_run {
+        for candidate in selected_candidates {
             primed.push(PrimeAttempt {
                 slot: candidate.result.slot.clone(),
                 account: candidate.result.account_label.clone(),
@@ -618,21 +644,40 @@ fn run_prime_check(
                     candidate.weekly_remaining
                 ),
             });
-            continue;
         }
+    } else if let Some(real_codex) = real_codex.as_ref() {
+        thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(selected_candidates.len());
+            for candidate in selected_candidates {
+                let real_codex = real_codex.as_path();
+                let target = target.as_ref();
+                handles.push(scope.spawn(move || {
+                    run_prime_slot(
+                        paths,
+                        real_codex,
+                        &candidate.result.slot,
+                        target,
+                        config,
+                        candidate.result.account_label.clone(),
+                    )
+                }));
+            }
 
-        let Some(real_codex) = real_codex.as_ref() else {
-            continue;
-        };
-        let attempt = run_prime_slot(
-            paths,
-            real_codex,
-            &candidate.result.slot,
-            target.as_ref(),
-            config,
-            candidate.result.account_label.clone(),
-        );
-        primed.push(attempt);
+            for handle in handles {
+                match handle.join() {
+                    Ok(attempt) => primed.push(attempt),
+                    Err(_panic) => primed.push(PrimeAttempt {
+                        slot: "<unknown>".to_string(),
+                        account: None,
+                        dry_run: false,
+                        success: false,
+                        exit_code: None,
+                        elapsed_ms: 0,
+                        note: "prime worker panicked".to_string(),
+                    }),
+                }
+            }
+        });
     }
 
     Ok(PrimeRunReport {
@@ -652,6 +697,7 @@ fn prime_candidate<'a>(
     now: i64,
     min_weekly_remaining: f64,
     force: bool,
+    last_successful_prime: Option<i64>,
 ) -> std::result::Result<PrimeCandidate<'a>, String> {
     if result.status != SlotStatus::Available {
         return Err(format!("status {}", result.status.as_str()));
@@ -668,8 +714,13 @@ fn prime_candidate<'a>(
         ));
     }
 
-    if !force && five_hour_window_looks_active(result, now) {
-        return Err("5h window already active".to_string());
+    if !force {
+        if let Some(reason) = local_prime_active_reason(last_successful_prime, now) {
+            return Err(reason);
+        }
+        if let Some(reason) = remote_active_five_hour_window_reason(result, now) {
+            return Err(reason);
+        }
     }
 
     Ok(PrimeCandidate {
@@ -678,12 +729,80 @@ fn prime_candidate<'a>(
     })
 }
 
-fn five_hour_window_looks_active(result: &SlotResult, now: i64) -> bool {
+fn local_prime_active_reason(last_successful_prime: Option<i64>, now: i64) -> Option<String> {
+    let primed_at = last_successful_prime?;
+    let age = now.saturating_sub(primed_at);
+    if !(0..LOCAL_PRIME_ACTIVE_SECONDS).contains(&age) {
+        return None;
+    }
+    Some(format!(
+        "locally primed {} ago",
+        format_seconds_compact(age)
+    ))
+}
+
+fn remote_active_five_hour_window_reason(result: &SlotResult, now: i64) -> Option<String> {
     let used = result.five_hour_used_percent.unwrap_or(0.0);
-    let refresh_in_future = result
+    let remaining = result
         .five_hour_refresh_at
-        .is_some_and(|refresh_at| refresh_at > now + ACTIVE_REFRESH_GRACE_SECONDS);
-    used > MAX_IDLE_FIVE_HOUR_USED_PERCENT || refresh_in_future
+        .map(|refresh_at| refresh_at.saturating_sub(now));
+    let full_like_window = remaining.is_some_and(|remaining| {
+        remaining >= FIVE_HOUR_WINDOW_SECONDS - ACTIVE_REFRESH_GRACE_SECONDS
+    });
+    let refresh_in_future =
+        remaining.is_some_and(|remaining| remaining > ACTIVE_REFRESH_GRACE_SECONDS);
+
+    if used <= MAX_IDLE_FIVE_HOUR_USED_PERCENT && full_like_window {
+        return None;
+    }
+    if used <= 0.0 || !refresh_in_future {
+        return None;
+    }
+
+    let refresh = result
+        .five_hour_refresh_at
+        .and_then(format_refresh_in)
+        .map(|refresh| format!(", refresh {refresh}"))
+        .unwrap_or_default();
+    Some(format!(
+        "5h window already active (used {used:.1}%{refresh})"
+    ))
+}
+
+fn updated_prime_history(
+    previous_state: Option<&PrimeState>,
+    report: &PrimeRunReport,
+) -> BTreeMap<String, i64> {
+    let mut history = previous_state
+        .map(|state| state.last_successful_primes.clone())
+        .unwrap_or_default();
+    let cutoff = report
+        .ran_at
+        .saturating_sub(FIVE_HOUR_WINDOW_SECONDS.saturating_mul(2));
+    history.retain(|_, primed_at| *primed_at >= cutoff);
+    if !report.dry_run {
+        for attempt in &report.primed {
+            if attempt.success {
+                history.insert(attempt.slot.clone(), report.ran_at);
+            }
+        }
+    }
+    history
+}
+
+fn format_seconds_compact(seconds: i64) -> String {
+    let seconds = seconds.max(0);
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return format!("{minutes}m");
+    }
+    let hours = minutes / 60;
+    let minutes = minutes % 60;
+    if minutes == 0 {
+        format!("{hours}h")
+    } else {
+        format!("{hours}h {minutes}m")
+    }
 }
 
 fn run_prime_slot(
@@ -810,9 +929,16 @@ fn save_config(paths: &ManagerPaths, config: &PrimeConfig) -> Result<()> {
 }
 
 fn load_config(paths: &ManagerPaths) -> Option<PrimeConfig> {
-    CacheStore::new(paths).read_json(PRIME_CONFIG, |config: &PrimeConfig| {
-        config.schema_version == PRIME_SCHEMA_VERSION
-    })
+    CacheStore::new(paths)
+        .read_json(PRIME_CONFIG, |config: &PrimeConfig| {
+            matches!(config.schema_version, 1 | PRIME_SCHEMA_VERSION)
+        })
+        .map(|mut config| {
+            if config.schema_version == 1 && config.max_slots == Some(3) {
+                config.max_slots = None;
+            }
+            config
+        })
 }
 
 fn save_state(paths: &ManagerPaths, state: &PrimeState) -> Result<()> {
@@ -1141,7 +1267,12 @@ fn print_status_report(report: &PrimeStatusReport) {
         println!();
         println!(
             "config: lead {}m, max slots {}, min weekly {:.1}%",
-            config.lead_minutes, config.max_slots, config.min_weekly_remaining
+            config.lead_minutes,
+            config
+                .max_slots
+                .map(|max_slots| max_slots.to_string())
+                .unwrap_or_else(|| "all".to_string()),
+            config.min_weekly_remaining
         );
         for schedule in &config.schedules {
             println!(
@@ -1214,13 +1345,37 @@ mod tests {
     fn active_window_is_not_a_candidate_without_force() {
         let now = 1_000;
         let mut result = SlotResult::new("slot", 0, SlotStatus::Available, 90.0, "usage");
-        result.five_hour_used_percent = Some(0.0);
+        result.five_hour_used_percent = Some(2.0);
         result.five_hour_refresh_at = Some(now + 3_600);
         result.weekly_used_percent = Some(10.0);
 
-        let reason = prime_candidate(&result, now, 5.0, false).unwrap_err();
+        let reason = prime_candidate(&result, now, 5.0, false, None).unwrap_err();
 
-        assert_eq!(reason, "5h window already active");
-        assert!(prime_candidate(&result, now, 5.0, true).is_ok());
+        assert_eq!(reason, "5h window already active (used 2.0%, refresh now)");
+        assert!(prime_candidate(&result, now, 5.0, true, None).is_ok());
+    }
+
+    #[test]
+    fn full_length_one_percent_window_is_still_primeable() {
+        let now = 1_000;
+        let mut result = SlotResult::new("slot", 0, SlotStatus::Available, 99.0, "usage");
+        result.five_hour_used_percent = Some(1.0);
+        result.five_hour_refresh_at = Some(now + FIVE_HOUR_WINDOW_SECONDS);
+        result.weekly_used_percent = Some(0.0);
+
+        assert!(prime_candidate(&result, now, 5.0, false, None).is_ok());
+    }
+
+    #[test]
+    fn recent_local_prime_is_not_a_candidate() {
+        let now = 10_000;
+        let mut result = SlotResult::new("slot", 0, SlotStatus::Available, 99.0, "usage");
+        result.five_hour_used_percent = Some(1.0);
+        result.five_hour_refresh_at = Some(now + FIVE_HOUR_WINDOW_SECONDS);
+        result.weekly_used_percent = Some(0.0);
+
+        let reason = prime_candidate(&result, now, 5.0, false, Some(now - 600)).unwrap_err();
+
+        assert_eq!(reason, "locally primed 10m ago");
     }
 }

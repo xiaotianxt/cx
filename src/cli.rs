@@ -370,9 +370,9 @@ pub struct PrimeInstallArgs {
     #[arg(long = "slot")]
     pub slots: Vec<String>,
 
-    /// Maximum slots to prime in a single run.
-    #[arg(long, default_value_t = 3)]
-    pub max_slots: usize,
+    /// Maximum slots to prime in a single run. Defaults to every eligible slot.
+    #[arg(long)]
+    pub max_slots: Option<usize>,
 
     /// Real Codex binary used by launchd runs.
     #[arg(long, value_hint = clap::ValueHint::FilePath)]
@@ -607,7 +607,7 @@ mod tests {
         assert_eq!(args.schedule.max_times, 4);
         assert_eq!(args.target, Some(String::from("work")));
         assert_eq!(args.slots, vec![String::from("bus1")]);
-        assert_eq!(args.max_slots, 2);
+        assert_eq!(args.max_slots, Some(2));
         assert_eq!(args.model, Some(String::from("gpt-5.4-mini")));
     }
 

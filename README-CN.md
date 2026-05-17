@@ -188,9 +188,9 @@ cx 进程不会常驻后台；到点时由 launchd 拉起 `cx prime run`，Mac �
 
 `cx prime run` 会先查实时用量，只对符合条件的 ChatGPT slot 发送极短的 `codex exec
 --ephemeral` 请求：5h 窗口看起来尚未启动，并且 weekly 额度仍高于安全线。默认策略较保守：
-每次最多 prime 3 个 slot、weekly 剩余至少 5%、prompt 为 `Reply exactly: hi`。需要收窄策略时，
-可在 `cx prime install` 或 `cx prime run` 上使用 `--slot`、`--target`、`--max-slots`、
-`--model` 或 `--prompt`。
+默认会并发 prime 所有符合条件的 slot，weekly 剩余至少 5%，prompt 为 `Reply exactly: hi`。
+需要收窄策略或显式限制并发时，可在 `cx prime install` 或 `cx prime run` 上使用 `--slot`、
+`--target`、`--max-slots`、`--model` 或 `--prompt`。
 
 这套机制是本地、机会式的。Mac 睡眠时，launchd 会在唤醒后执行错过的检查；如果机器关机，
 或在正式开工前根本无法唤醒，本地 scheduler 没有机会提前启动远端额度窗口。

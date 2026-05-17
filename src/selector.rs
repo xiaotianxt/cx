@@ -56,6 +56,7 @@ pub struct SlotQueryOptions {
     pub timeout: f32,
     pub jobs: usize,
     pub retries: usize,
+    pub no_cache: bool,
 }
 
 impl SlotQueryOptions {
@@ -64,7 +65,13 @@ impl SlotQueryOptions {
             timeout,
             jobs: jobs.max(1),
             retries,
+            no_cache: false,
         }
+    }
+
+    pub fn with_no_cache(mut self, no_cache: bool) -> Self {
+        self.no_cache = no_cache;
+        self
     }
 }
 
@@ -93,6 +100,7 @@ pub fn query_slots_with_progress<P: SlotQueryProgress>(
             checker: &checker,
             cache: &cache,
             rate_state: &rate_state,
+            no_cache: options.no_cache,
         };
         query_indexed_slots(&query_context, &indexed_slots, options.jobs, None, progress)
     };
@@ -116,6 +124,7 @@ pub fn query_slots_with_progress<P: SlotQueryProgress>(
                 checker: &checker,
                 cache: &cache,
                 rate_state: &rate_state,
+                no_cache: options.no_cache,
             };
             query_indexed_slots(
                 &query_context,
@@ -145,6 +154,7 @@ struct LiveQueryContext<'a> {
     checker: &'a UsageChecker,
     cache: &'a UsageSlotCache,
     rate_state: &'a UsageRateState,
+    no_cache: bool,
 }
 
 fn query_indexed_slots(
@@ -206,16 +216,20 @@ fn query_indexed_slot(
     slot: &str,
     retry_attempt: Option<usize>,
 ) -> SlotResult {
-    if retry_attempt.is_none() {
+    if retry_attempt.is_none() && !context.no_cache {
         if let Some(result) = context.cache.fresh(slot, index) {
             return result;
         }
     }
 
-    if throttled.load(Ordering::Relaxed) {
+    if throttled.load(Ordering::Relaxed) && !context.no_cache {
         return context.cache.stale_or_rate_limited(slot, index, None);
     }
-    if let Some(retry_after_seconds) = context.rate_state.cooldown_remaining() {
+    if let Some(retry_after_seconds) = context
+        .rate_state
+        .cooldown_remaining()
+        .filter(|_| !context.no_cache)
+    {
         return context
             .cache
             .stale_or_cooldown(slot, index, retry_after_seconds);
@@ -227,11 +241,17 @@ fn query_indexed_slot(
     pacer.wait();
     let result = context.checker.query_slot(context.paths, slot, index);
     if result.status == SlotStatus::RateLimited {
+        if context.no_cache {
+            return result;
+        }
         return context
             .cache
             .stale_or_rate_limited(slot, index, result.retry_after_seconds);
     }
     if result.is_retryable_transient() {
+        if context.no_cache {
+            return result;
+        }
         return context.cache.stale_or_refresh_error(slot, index, result);
     }
     if result.is_cacheable_usage() {

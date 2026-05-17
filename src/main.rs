@@ -63,7 +63,8 @@ fn entry() -> Result<()> {
                 args.query.timeout,
                 args.query.jobs,
                 args.query.retries,
-            );
+            )
+            .with_no_cache(args.query.no_cache);
             let command_progress =
                 output::CommandProgress::for_human_output(args.query.json || args.no_progress);
             let mut progress = command_progress.slot_query("checking slots");
@@ -130,7 +131,8 @@ fn entry() -> Result<()> {
             let paths = paths::ManagerPaths::new(args.manager_dir.clone())?;
             upgrade::run_startup(&paths)?;
             let slots = args.slots_or_rotation(&paths)?;
-            let options = selector::SlotQueryOptions::new(args.timeout, args.jobs, args.retries);
+            let options = selector::SlotQueryOptions::new(args.timeout, args.jobs, args.retries)
+                .with_no_cache(args.no_cache);
             let command_progress = output::CommandProgress::for_human_output(args.json);
             let mut progress = command_progress.slot_query("checking slots");
             let results =

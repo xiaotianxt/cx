@@ -238,6 +238,10 @@ pub struct SlotQueryArgs {
     #[arg(long, default_value_t = crate::selector::DEFAULT_SLOT_QUERY_RETRIES)]
     pub retries: usize,
 
+    /// Skip the fresh usage cache and query live usage now.
+    #[arg(long)]
+    pub no_cache: bool,
+
     /// Print JSON instead of a human table.
     #[arg(long)]
     pub json: bool,
@@ -557,6 +561,16 @@ mod tests {
             panic!("expected status command");
         };
         assert!(args.no_progress);
+    }
+
+    #[test]
+    fn status_accepts_no_cache() {
+        let cli = Cli::parse_from(["cx", "status", "--no-cache"]);
+
+        let Command::Status(args) = cli.command else {
+            panic!("expected status command");
+        };
+        assert!(args.query.no_cache);
     }
 
     #[test]

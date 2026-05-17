@@ -54,7 +54,6 @@ const MAX_PROMPT_BYTES: usize = 2_000;
 const PRIME_TIMEOUT_SECONDS: u64 = 90;
 const FIVE_HOUR_WINDOW_SECONDS: i64 = 5 * 60 * 60;
 const ACTIVE_REFRESH_GRACE_SECONDS: i64 = 5 * 60;
-const LOCAL_PRIME_ACTIVE_SECONDS: i64 = FIVE_HOUR_WINDOW_SECONDS - ACTIVE_REFRESH_GRACE_SECONDS;
 const MAX_IDLE_FIVE_HOUR_USED_PERCENT: f64 = 1.0;
 const START_HOUR_WEIGHT: f64 = 1.0;
 const ROLLOUT_HOUR_WEIGHT: f64 = 0.35;
@@ -276,13 +275,7 @@ pub fn run(paths: &ManagerPaths, args: PrimeRunArgs) -> Result<()> {
     let config = load_config(paths);
     let previous_state = load_state(paths);
     let effective = EffectiveRunConfig::from_config_and_args(config.as_ref(), &args)?;
-    let report = run_prime_check(
-        paths,
-        &effective,
-        args.force,
-        args.dry_run,
-        previous_state.as_ref(),
-    )?;
+    let report = run_prime_check(paths, &effective, args.force, args.dry_run)?;
     save_state(
         paths,
         &PrimeState {
@@ -623,7 +616,6 @@ fn run_prime_check(
     config: &EffectiveRunConfig,
     force: bool,
     dry_run: bool,
-    previous_state: Option<&PrimeState>,
 ) -> Result<PrimeRunReport> {
     let target = target::load_optional_target(paths, config.target.as_deref())?;
     let slots = if !config.slots.is_empty() {
@@ -647,18 +639,9 @@ fn run_prime_check(
     let now = now_unix();
     let mut skipped = Vec::new();
     let mut candidates = Vec::new();
-    let last_primes = previous_state
-        .map(|state| state.last_successful_primes.clone())
-        .unwrap_or_default();
 
     for result in &results {
-        match prime_candidate(
-            result,
-            now,
-            config.min_weekly_remaining,
-            force,
-            last_primes.get(&result.slot).copied(),
-        ) {
+        match prime_candidate(result, now, config.min_weekly_remaining, force) {
             Ok(candidate) => candidates.push(candidate),
             Err(reason) => skipped.push(PrimeSkip {
                 slot: result.slot.clone(),
@@ -743,7 +726,6 @@ fn prime_candidate<'a>(
     now: i64,
     min_weekly_remaining: f64,
     force: bool,
-    last_successful_prime: Option<i64>,
 ) -> std::result::Result<PrimeCandidate<'a>, String> {
     if result.status != SlotStatus::Available {
         return Err(format!("status {}", result.status.as_str()));
@@ -761,9 +743,6 @@ fn prime_candidate<'a>(
     }
 
     if !force {
-        if let Some(reason) = local_prime_active_reason(last_successful_prime, now) {
-            return Err(reason);
-        }
         if let Some(reason) = remote_active_five_hour_window_reason(result, now) {
             return Err(reason);
         }
@@ -773,18 +752,6 @@ fn prime_candidate<'a>(
         result,
         weekly_remaining,
     })
-}
-
-fn local_prime_active_reason(last_successful_prime: Option<i64>, now: i64) -> Option<String> {
-    let primed_at = last_successful_prime?;
-    let age = now.saturating_sub(primed_at);
-    if !(0..LOCAL_PRIME_ACTIVE_SECONDS).contains(&age) {
-        return None;
-    }
-    Some(format!(
-        "locally primed {} ago",
-        format_seconds_compact(age)
-    ))
 }
 
 fn remote_active_five_hour_window_reason(result: &SlotResult, now: i64) -> Option<String> {
@@ -834,21 +801,6 @@ fn updated_prime_history(
         }
     }
     history
-}
-
-fn format_seconds_compact(seconds: i64) -> String {
-    let seconds = seconds.max(0);
-    let minutes = seconds / 60;
-    if minutes < 60 {
-        return format!("{minutes}m");
-    }
-    let hours = minutes / 60;
-    let minutes = minutes % 60;
-    if minutes == 0 {
-        format!("{hours}h")
-    } else {
-        format!("{hours}h {minutes}m")
-    }
 }
 
 fn run_prime_slot(
@@ -1435,10 +1387,10 @@ mod tests {
         result.five_hour_refresh_at = Some(now + 3_600);
         result.weekly_used_percent = Some(10.0);
 
-        let reason = prime_candidate(&result, now, 5.0, false, None).unwrap_err();
+        let reason = prime_candidate(&result, now, 5.0, false).unwrap_err();
 
         assert_eq!(reason, "5h window already active (used 2.0%, refresh now)");
-        assert!(prime_candidate(&result, now, 5.0, true, None).is_ok());
+        assert!(prime_candidate(&result, now, 5.0, true).is_ok());
     }
 
     #[test]
@@ -1449,19 +1401,6 @@ mod tests {
         result.five_hour_refresh_at = Some(now + FIVE_HOUR_WINDOW_SECONDS);
         result.weekly_used_percent = Some(0.0);
 
-        assert!(prime_candidate(&result, now, 5.0, false, None).is_ok());
-    }
-
-    #[test]
-    fn recent_local_prime_is_not_a_candidate() {
-        let now = 10_000;
-        let mut result = SlotResult::new("slot", 0, SlotStatus::Available, 99.0, "usage");
-        result.five_hour_used_percent = Some(1.0);
-        result.five_hour_refresh_at = Some(now + FIVE_HOUR_WINDOW_SECONDS);
-        result.weekly_used_percent = Some(0.0);
-
-        let reason = prime_candidate(&result, now, 5.0, false, Some(now - 600)).unwrap_err();
-
-        assert_eq!(reason, "locally primed 10m ago");
+        assert!(prime_candidate(&result, now, 5.0, false).is_ok());
     }
 }

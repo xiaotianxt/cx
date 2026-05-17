@@ -445,6 +445,19 @@ mod tests {
     }
 
     #[test]
+    fn refresh_in_does_not_round_up_to_next_hour() {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        assert_eq!(
+            payload::format_refresh_in(now + 5 * 60 * 60 - 1),
+            Some("in 4h 59m".to_string())
+        );
+    }
+
+    #[test]
     fn sorts_by_score_descending_then_rotation_order() {
         let mut results = vec![
             SlotResult::new("busy", 0, SlotStatus::Available, 20.0, "busy"),

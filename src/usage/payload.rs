@@ -131,7 +131,10 @@ pub(crate) fn format_refresh_in(refresh_at: i64) -> Option<String> {
         return Some("now".to_string());
     }
 
-    let minutes = (seconds + 59) / 60;
+    let minutes = seconds / 60;
+    if minutes == 0 {
+        return Some("in <1m".to_string());
+    }
     if minutes < 60 {
         return Some(format!("in {minutes}m"));
     }

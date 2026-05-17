@@ -39,6 +39,7 @@ use crate::target;
 use crate::usage::format_refresh_in;
 use crate::usage::SlotResult;
 use crate::usage::SlotStatus;
+use crate::usage::UsageChecker;
 
 pub const DEFAULT_PRIME_PROMPT: &str = "Reply exactly: hi";
 
@@ -52,6 +53,8 @@ const ROLLOUT_CACHE: &str = "stats-rollout-cache.sqlite";
 const STATE_DB: &str = "state_5.sqlite";
 const MAX_PROMPT_BYTES: usize = 2_000;
 const PRIME_TIMEOUT_SECONDS: u64 = 90;
+const PRIME_VERIFY_DELAY: Duration = Duration::from_secs(2);
+const PRIME_REQUEST_ATTEMPTS: usize = 3;
 const FIVE_HOUR_WINDOW_SECONDS: i64 = 5 * 60 * 60;
 const ACTIVE_REFRESH_GRACE_SECONDS: i64 = 5 * 60;
 const MAX_IDLE_FIVE_HOUR_USED_PERCENT: f64 = 1.0;
@@ -633,7 +636,8 @@ fn run_prime_check(
     let results = selector::query_slots_with_progress(
         paths,
         &slots,
-        selector::SlotQueryOptions::new(config.timeout, config.jobs, config.retries),
+        selector::SlotQueryOptions::new(config.timeout, config.jobs, config.retries)
+            .with_no_cache(true),
         &mut progress,
     )?;
     let now = now_unix();
@@ -843,6 +847,87 @@ fn run_prime_slot_inner(
     target: Option<&target::TargetSpec>,
     config: &EffectiveRunConfig,
 ) -> Result<CommandOutcome> {
+    let mut total_reported_tokens = 0_u64;
+    let mut saw_reported_tokens = false;
+    let mut last_note = None;
+
+    for request_attempt in 1..=PRIME_REQUEST_ATTEMPTS {
+        let output = run_prime_exec_once(paths, real_codex, slot, target, config)?;
+        let exit_code = output.status.code();
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let summary = stderr
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("codex exec failed");
+            return Ok(CommandOutcome {
+                success: false,
+                exit_code,
+                note: format!("codex exec failed: {}", truncate(summary, 240)),
+            });
+        }
+
+        if let Some(tokens) = parse_codex_tokens_used(&output.stdout) {
+            saw_reported_tokens = true;
+            total_reported_tokens = total_reported_tokens.saturating_add(tokens);
+        }
+
+        let verified = verify_prime_window(paths, slot, config.timeout)?;
+        let verified_now = now_unix();
+        let token_note = if saw_reported_tokens {
+            format!("; codex reported {total_reported_tokens} tokens total")
+        } else {
+            String::new()
+        };
+        match verified.status {
+            SlotStatus::Available | SlotStatus::Exhausted => {
+                if let Some(active) = remote_active_five_hour_window_reason(&verified, verified_now)
+                {
+                    return Ok(CommandOutcome {
+                        success: true,
+                        exit_code,
+                        note: format!(
+                            "verified active after {request_attempt} request(s): {active}{token_note}"
+                        ),
+                    });
+                }
+                last_note = Some(format!(
+                    "codex exec succeeded but 5h window is not active after {request_attempt} request(s){}; {}",
+                    token_note,
+                    live_window_summary(&verified, verified_now)
+                ));
+            }
+            status => {
+                return Ok(CommandOutcome {
+                    success: false,
+                    exit_code,
+                    note: format!(
+                        "codex exec succeeded but live verification returned {}{}: {}",
+                        status.as_str(),
+                        token_note,
+                        truncate(&verified.summary, 240)
+                    ),
+                });
+            }
+        }
+    }
+
+    Ok(CommandOutcome {
+        success: false,
+        exit_code: Some(0),
+        note: last_note
+            .unwrap_or_else(|| "codex exec succeeded but prime was not verified".to_string()),
+    })
+}
+
+fn run_prime_exec_once(
+    paths: &ManagerPaths,
+    real_codex: &Path,
+    slot: &str,
+    target: Option<&target::TargetSpec>,
+    config: &EffectiveRunConfig,
+) -> Result<std::process::Output> {
     let spec = run::build_slot_command_spec(
         paths,
         real_codex.to_path_buf(),
@@ -854,25 +939,71 @@ fn run_prime_slot_inner(
     command.current_dir(paths::home_dir()?);
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
-    let output = wait_with_timeout(command, Duration::from_secs(PRIME_TIMEOUT_SECONDS))?;
-    let exit_code = output.status.code();
-    let success = output.status.success();
-    let note = if success {
-        "primed".to_string()
+    wait_with_timeout(command, Duration::from_secs(PRIME_TIMEOUT_SECONDS))
+}
+
+fn verify_prime_window(paths: &ManagerPaths, slot: &str, timeout: f32) -> Result<SlotResult> {
+    let checker = UsageChecker::new(timeout.max(1.0))?;
+    let first = checker.query_slot(paths, slot, 0);
+    if remote_active_five_hour_window_reason(&first, now_unix()).is_some()
+        || !matches!(first.status, SlotStatus::Available | SlotStatus::Exhausted)
+    {
+        return Ok(first);
+    }
+
+    thread::sleep(PRIME_VERIFY_DELAY);
+    Ok(checker.query_slot(paths, slot, 0))
+}
+
+fn parse_codex_tokens_used(stdout: &[u8]) -> Option<u64> {
+    let text = String::from_utf8_lossy(stdout);
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        if !line.trim().eq_ignore_ascii_case("tokens used") {
+            continue;
+        }
+        for value in lines.by_ref() {
+            let digits = value
+                .chars()
+                .filter(|ch| ch.is_ascii_digit())
+                .collect::<String>();
+            if digits.is_empty() {
+                continue;
+            }
+            return digits.parse::<u64>().ok();
+        }
+    }
+    None
+}
+
+fn live_window_summary(result: &SlotResult, now: i64) -> String {
+    let used = result.five_hour_used_percent.unwrap_or(0.0);
+    let refresh = result
+        .five_hour_refresh_at
+        .map(|refresh_at| refresh_at.saturating_sub(now))
+        .map(format_duration_compact)
+        .unwrap_or_else(|| "unknown refresh".to_string());
+    format!("live 5h used {used:.1}%, refresh {refresh}")
+}
+
+fn format_duration_compact(seconds: i64) -> String {
+    if seconds <= 0 {
+        return "now".to_string();
+    }
+    let minutes = seconds / 60;
+    if minutes == 0 {
+        return "in <1m".to_string();
+    }
+    if minutes < 60 {
+        return format!("in {minutes}m");
+    }
+    let hours = minutes / 60;
+    let remaining_minutes = minutes % 60;
+    if remaining_minutes == 0 {
+        format!("in {hours}h")
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let summary = stderr
-            .lines()
-            .rev()
-            .find(|line| !line.trim().is_empty())
-            .unwrap_or("codex exec failed");
-        format!("codex exec failed: {}", truncate(summary, 240))
-    };
-    Ok(CommandOutcome {
-        success,
-        exit_code,
-        note,
-    })
+        format!("in {hours}h {remaining_minutes}m")
+    }
 }
 
 fn prime_codex_args(config: &EffectiveRunConfig) -> Vec<OsString> {
@@ -1216,9 +1347,15 @@ fn print_plan(report: &PrimePlanReport) {
 }
 
 fn print_run_report(report: &PrimeRunReport) {
+    let successful = report
+        .primed
+        .iter()
+        .filter(|attempt| attempt.success)
+        .count();
     println!(
-        "prime run: checked {} slot(s), primed {} slot(s){}",
+        "prime run: checked {} slot(s), primed {}/{} slot(s){}",
         report.checked_slots,
+        successful,
         report.primed.len(),
         if report.dry_run { " (dry run)" } else { "" }
     );
@@ -1287,9 +1424,15 @@ fn print_status_report(report: &PrimeStatusReport) {
     {
         println!();
         let dry_run = if state.dry_run { " (dry run)" } else { "" };
+        let successful = state
+            .primed
+            .iter()
+            .filter(|attempt| attempt.success)
+            .count();
         println!(
-            "last run{dry_run}: checked {}, primed {}",
+            "last run{dry_run}: checked {}, primed {}/{}",
             state.checked_slots,
+            successful,
             state.primed.len()
         );
     }
@@ -1402,5 +1545,25 @@ mod tests {
         result.weekly_used_percent = Some(0.0);
 
         assert!(prime_candidate(&result, now, 5.0, false).is_ok());
+    }
+
+    #[test]
+    fn codex_human_output_token_count_is_parsed() {
+        let output = b"codex\nhi\nhi\ntokens used\n16,104\n";
+
+        assert_eq!(parse_codex_tokens_used(output), Some(16_104));
+    }
+
+    #[test]
+    fn live_window_summary_reports_idle_full_window() {
+        let now = 1_000;
+        let mut result = SlotResult::new("slot", 0, SlotStatus::Available, 99.0, "usage");
+        result.five_hour_used_percent = Some(1.0);
+        result.five_hour_refresh_at = Some(now + FIVE_HOUR_WINDOW_SECONDS);
+
+        assert_eq!(
+            live_window_summary(&result, now),
+            "live 5h used 1.0%, refresh in 5h"
+        );
     }
 }

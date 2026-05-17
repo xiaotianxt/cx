@@ -17,6 +17,8 @@ use anyhow::Context;
 use anyhow::Result;
 use rusqlite::params;
 use rusqlite::Connection;
+use rusqlite::Error;
+use rusqlite::ErrorCode;
 use rusqlite::OpenFlags;
 use serde::Deserialize;
 use serde::Serialize;
@@ -449,15 +451,16 @@ fn add_state_db_hour_scores(
     seen_threads: &mut HashSet<String>,
     scores: &mut BTreeMap<u8, PrimeHourScore>,
 ) -> Result<()> {
-    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .with_context(|| format!("open {}", db_path.display()))?;
-    let mut statement = conn.prepare(
-        "SELECT id,
-                CAST(strftime('%H', created_at, 'unixepoch', 'localtime') AS INTEGER),
-                COALESCE(tokens_used, 0)
-         FROM threads
-         WHERE created_at >= ?1 AND tokens_used > 0",
-    )?;
+    let conn = open_query_only_connection(db_path)?;
+    let mut statement = conn
+        .prepare(
+            "SELECT id,
+                    CAST(strftime('%H', created_at, 'unixepoch', 'localtime') AS INTEGER),
+                    COALESCE(tokens_used, 0)
+             FROM threads
+             WHERE created_at >= ?1 AND tokens_used > 0",
+        )
+        .with_context(|| format!("prepare prime state query for {}", db_path.display()))?;
     let rows = statement.query_map(params![cutoff], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -491,16 +494,17 @@ fn add_rollout_hour_scores(
     cutoff: i64,
     scores: &mut BTreeMap<u8, PrimeHourScore>,
 ) -> Result<()> {
-    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .with_context(|| format!("open {}", db_path.display()))?;
-    let mut statement = conn.prepare(
-        "SELECT CAST(strftime('%H', timestamp_unix, 'unixepoch', 'localtime') AS INTEGER),
-                COALESCE(SUM(total_tokens), 0),
-                COALESCE(SUM(samples), 0)
-         FROM rollout_events
-         WHERE timestamp_unix >= ?1
-         GROUP BY 1",
-    )?;
+    let conn = open_query_only_connection(db_path)?;
+    let mut statement = conn
+        .prepare(
+            "SELECT CAST(strftime('%H', timestamp_unix, 'unixepoch', 'localtime') AS INTEGER),
+                    COALESCE(SUM(total_tokens), 0),
+                    COALESCE(SUM(samples), 0)
+             FROM rollout_events
+             WHERE timestamp_unix >= ?1
+             GROUP BY 1",
+        )
+        .with_context(|| format!("prepare prime rollout query for {}", db_path.display()))?;
     let rows = statement.query_map(params![cutoff], |row| {
         Ok((
             row.get::<_, i64>(0)?,
@@ -525,6 +529,48 @@ fn add_rollout_hour_scores(
         entry.score += tokens as f64 * ROLLOUT_HOUR_WEIGHT;
     }
     Ok(())
+}
+
+fn open_query_only_connection(db_path: &Path) -> Result<Connection> {
+    match open_validated_connection(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY) {
+        Ok(conn) => Ok(conn),
+        Err(err) if is_cannot_open(&err) => {
+            let conn = Connection::open_with_flags(
+                db_path,
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+            )
+            .and_then(|conn| {
+                conn.pragma_update(None, "query_only", true)?;
+                validate_connection(&conn)?;
+                Ok(conn)
+            })
+            .with_context(|| {
+                format!(
+                    "open {} read-write query-only after read-only open failed",
+                    db_path.display()
+                )
+            })?;
+            Ok(conn)
+        }
+        Err(err) => Err(err).with_context(|| format!("open {}", db_path.display())),
+    }
+}
+
+fn open_validated_connection(
+    db_path: &Path,
+    flags: OpenFlags,
+) -> std::result::Result<Connection, Error> {
+    let conn = Connection::open_with_flags(db_path, flags)?;
+    validate_connection(&conn)?;
+    Ok(conn)
+}
+
+fn validate_connection(conn: &Connection) -> std::result::Result<(), Error> {
+    conn.query_row("SELECT count(*) FROM sqlite_schema", [], |_| Ok(()))
+}
+
+fn is_cannot_open(err: &Error) -> bool {
+    matches!(err, Error::SqliteFailure(error, _) if error.code == ErrorCode::CannotOpen)
 }
 
 fn schedule_times_from_scores(
@@ -1340,6 +1386,45 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(6, 30, 10), (16, 30, 20)]
         );
+    }
+
+    #[test]
+    fn state_hour_scores_read_wal_database_when_sidecars_are_missing() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("cx-prime-wal-test-{}-{unique}", std::process::id()));
+        let db_path = root.join(STATE_DB);
+        fs::create_dir_all(&root).expect("create temp dir");
+        {
+            let conn = Connection::open(&db_path).expect("open writable db");
+            conn.execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 CREATE TABLE threads (
+                   id TEXT PRIMARY KEY,
+                   created_at INTEGER NOT NULL,
+                   tokens_used INTEGER NOT NULL
+                 );
+                 INSERT INTO threads (id, created_at, tokens_used)
+                 VALUES ('thread-1', 3600, 1234);
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .expect("seed db");
+        }
+        let _ = fs::remove_file(format!("{}-wal", db_path.display()));
+        let _ = fs::remove_file(format!("{}-shm", db_path.display()));
+
+        let mut seen_threads = HashSet::new();
+        let mut scores = BTreeMap::new();
+        add_state_db_hour_scores(&db_path, 0, &mut seen_threads, &mut scores)
+            .expect("read state db");
+
+        let total_tokens = scores.values().map(|score| score.start_tokens).sum::<u64>();
+        assert_eq!(total_tokens, 1234);
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

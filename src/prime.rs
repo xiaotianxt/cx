@@ -1288,8 +1288,9 @@ fn print_status_report(report: &PrimeStatusReport) {
         .and_then(|state| state.last_run.as_ref())
     {
         println!();
+        let dry_run = if state.dry_run { " (dry run)" } else { "" };
         println!(
-            "last run: checked {}, primed {}",
+            "last run{dry_run}: checked {}, primed {}",
             state.checked_slots,
             state.primed.len()
         );

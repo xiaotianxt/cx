@@ -56,41 +56,6 @@ package_version() {
   sed -nE 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' Cargo.toml | head -1
 }
 
-bump_version() {
-  local version="$1"
-  local kind="$2"
-  local major minor patch
-
-  [[ "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || die "can only auto-bump x.y.z versions, got: ${version}"
-  major="${BASH_REMATCH[1]}"
-  minor="${BASH_REMATCH[2]}"
-  patch="${BASH_REMATCH[3]}"
-
-  case "$kind" in
-    major) major=$((major + 1)); minor=0; patch=0 ;;
-    minor) minor=$((minor + 1)); patch=0 ;;
-    patch) patch=$((patch + 1)) ;;
-    *) die "unknown bump level: ${kind}" ;;
-  esac
-
-  printf '%s.%s.%s\n' "$major" "$minor" "$patch"
-}
-
-set_package_version() {
-  local version="$1"
-  ruby - "$version" <<'RB'
-version = ARGV.fetch(0)
-
-cargo = File.read("Cargo.toml")
-cargo.sub!(/^version\s*=\s*"[^"]+"/, %(version = "#{version}")) or abort("Cargo.toml version not found")
-File.write("Cargo.toml", cargo)
-
-lock = File.read("Cargo.lock")
-lock.sub!(/(\[\[package\]\]\nname = "cx"\nversion = )"[^"]+"/, %(\\1"#{version}")) or abort("Cargo.lock cx package not found")
-File.write("Cargo.lock", lock)
-RB
-}
-
 local_tag_commit() {
   git rev-parse -q --verify "refs/tags/${1}^{}" 2>/dev/null || true
 }
@@ -117,6 +82,17 @@ tag_commit() {
   fi
 
   printf '%s' "$sha"
+}
+
+cargo_release_version() {
+  local level_or_version="$1"
+
+  cargo release "$level_or_version" \
+    --execute \
+    --no-confirm \
+    --no-publish \
+    --no-tag \
+    --no-push
 }
 
 while [[ $# -gt 0 ]]; do
@@ -161,9 +137,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 need_cmd cargo
+need_cmd cargo-release
 need_cmd git
 need_cmd gh
-need_cmd ruby
 if [[ "$UPDATE_TAP" -eq 1 || "$BREW_VERIFY" -eq 1 ]]; then
   need_cmd brew
 fi
@@ -202,24 +178,26 @@ CURRENT_VERSION="$(package_version)"
 [[ -n "$CURRENT_VERSION" ]] || die "Cargo.toml version not found"
 CURRENT_TAG="v${CURRENT_VERSION}"
 CURRENT_TAG_SHA="$(tag_commit "$CURRENT_TAG")"
-VERSION="$CURRENT_VERSION"
 
-if [[ -n "$VERSION_OVERRIDE" ]]; then
-  VERSION="$VERSION_OVERRIDE"
+if [[ -n "$VERSION_OVERRIDE" && "$VERSION_OVERRIDE" != "$CURRENT_VERSION" ]]; then
+  TAG_SHA="$(tag_commit "v${VERSION_OVERRIDE}")"
+  [[ -z "$TAG_SHA" ]] || die "tag v${VERSION_OVERRIDE} already exists at ${TAG_SHA}; choose a different version"
+  log "bumping Cargo version ${CURRENT_VERSION} -> ${VERSION_OVERRIDE} with cargo-release"
+  cargo_release_version "$VERSION_OVERRIDE"
 elif [[ -n "$CURRENT_TAG_SHA" && "$CURRENT_TAG_SHA" != "$HEAD_SHA" ]]; then
-  VERSION="$(bump_version "$CURRENT_VERSION" "$BUMP_KIND")"
+  log "current version ${CURRENT_VERSION} is already tagged; bumping ${BUMP_KIND} with cargo-release"
+  cargo_release_version "$BUMP_KIND"
+else
+  log "using Cargo version ${CURRENT_VERSION}"
 fi
 
+[[ -z "$(git status --porcelain -- Cargo.toml Cargo.lock)" ]] || die "cargo-release left uncommitted Cargo version changes"
+
+VERSION="$(package_version)"
+[[ -n "$VERSION" ]] || die "Cargo.toml version not found"
 TAG="v${VERSION}"
-if [[ "$VERSION" != "$CURRENT_VERSION" ]]; then
-  TAG_SHA="$(tag_commit "$TAG")"
-  [[ -z "$TAG_SHA" ]] || die "tag ${TAG} already exists at ${TAG_SHA}; choose a different version"
-
-  log "bumping Cargo version ${CURRENT_VERSION} -> ${VERSION}"
-  set_package_version "$VERSION"
-fi
-
 TAG_SHA="$(tag_commit "$TAG")"
+HEAD_SHA="$(git rev-parse HEAD)"
 if [[ -n "$TAG_SHA" && "$TAG_SHA" != "$HEAD_SHA" ]]; then
   die "tag ${TAG} points to ${TAG_SHA}, not HEAD ${HEAD_SHA}; choose a different version"
 fi
@@ -227,14 +205,6 @@ fi
 if [[ "$RUN_TESTS" -eq 1 ]]; then
   log "running cargo test"
   cargo test
-fi
-
-if ! git diff --quiet -- Cargo.toml Cargo.lock; then
-  log "committing version bump"
-  git diff --check -- Cargo.toml Cargo.lock
-  git add Cargo.toml Cargo.lock
-  git commit -m "chore: bump cx version to ${VERSION}"
-  HEAD_SHA="$(git rev-parse HEAD)"
 fi
 
 if [[ "$HEAD_SHA" != "$(git rev-parse origin/main)" ]]; then

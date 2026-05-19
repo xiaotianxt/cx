@@ -47,6 +47,8 @@ pub enum Command {
     Transfer(TransferArgs),
     /// Manage target-specific slot groups and overrides.
     Target(TargetArgs),
+    /// Sync selected Codex OAuth credentials into Mousedo.
+    App(AppArgs),
     /// Validate the local profile-manager layout.
     Doctor(DoctorArgs),
     /// Install cx into ~/.local/bin.
@@ -699,6 +701,18 @@ mod tests {
         assert!(args.allow_parallel);
         assert_eq!(args.args, vec![String::from("--enable-logging")]);
     }
+
+    #[test]
+    fn app_accepts_sync_options() {
+        let cli = Cli::parse_from(["cx", "app", "sync", "--slot", "dia1", "--no-cache"]);
+
+        let Command::App(args) = cli.command else {
+            panic!("expected app command");
+        };
+        let AppCommand::Sync(args) = args.command;
+        assert_eq!(args.slot, Some(String::from("dia1")));
+        assert!(args.no_cache);
+    }
 }
 
 #[derive(Debug, Clone, Args)]
@@ -913,6 +927,49 @@ pub struct TargetRemoveArgs {
 
     /// Target name.
     pub target: String,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct AppArgs {
+    #[command(subcommand)]
+    pub command: AppCommand,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum AppCommand {
+    /// Sync selected Codex OAuth credentials into Mousedo.
+    Sync(AppSyncArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct AppSyncArgs {
+    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
+    pub manager_dir: Option<PathBuf>,
+
+    /// Force a specific slot instead of config/target/rotation selection.
+    #[arg(long)]
+    pub slot: Option<String>,
+
+    /// Target config whose slots should be considered for auto selection.
+    #[arg(long)]
+    pub target: Option<String>,
+
+    /// Per-slot usage request timeout in seconds.
+    #[arg(long, default_value_t = 2.0)]
+    pub timeout: f32,
+
+    /// Maximum number of slot usage requests to run at once.
+    #[arg(long, default_value_t = crate::selector::DEFAULT_SLOT_QUERY_JOBS)]
+    pub jobs: usize,
+
+    /// Retry transient usage request failures this many times.
+    #[arg(long, default_value_t = crate::selector::DEFAULT_SLOT_QUERY_RETRIES)]
+    pub retries: usize,
+
+    /// Skip the fresh usage cache and query live usage now.
+    #[arg(long)]
+    pub no_cache: bool,
 }
 
 #[derive(Debug, Clone, Args)]

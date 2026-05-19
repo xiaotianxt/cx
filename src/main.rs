@@ -1,3 +1,4 @@
+mod appsync;
 mod auth;
 mod cache;
 mod cli;
@@ -26,6 +27,7 @@ use anyhow::Context;
 use anyhow::Result;
 use clap::CommandFactory;
 use clap::Parser;
+use cli::AppCommand;
 use cli::Cli;
 use cli::Command;
 use cli::PrimeCommand;
@@ -220,6 +222,18 @@ fn entry() -> Result<()> {
                 } else {
                     println!("target not found: {}", args.target);
                 }
+            }
+        },
+        Command::App(args) => match args.command {
+            AppCommand::Sync(args) => {
+                let paths = paths::ManagerPaths::new(args.manager_dir.clone())?;
+                upgrade::run_startup(&paths)?;
+                let result = appsync::sync_app(&paths, args)?;
+                println!(
+                    "synced app: {} using slot: {} ({})",
+                    result.app, result.slot, result.account
+                );
+                println!("wrote: {}", result.path.display());
             }
         },
         Command::Doctor(args) => {

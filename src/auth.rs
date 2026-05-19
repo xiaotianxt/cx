@@ -13,6 +13,7 @@ use crate::slot;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SlotAuth {
     pub access_token: Option<String>,
+    pub refresh_token: Option<String>,
     pub account_id: Option<String>,
     pub email: Option<String>,
     pub fedramp: bool,
@@ -73,6 +74,11 @@ pub fn read_slot_auth(slot_dir: &Path) -> Result<SlotAuth> {
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+    let refresh_token = tokens
+        .and_then(|tokens| tokens.get("refresh_token"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     let account_id = tokens
         .and_then(|tokens| tokens.get("account_id"))
         .and_then(Value::as_str)
@@ -102,6 +108,7 @@ pub fn read_slot_auth(slot_dir: &Path) -> Result<SlotAuth> {
 
     Ok(SlotAuth {
         access_token,
+        refresh_token,
         account_id,
         email,
         fedramp,
@@ -262,6 +269,30 @@ mod tests {
 
         assert_eq!(auth.email, Some("jwt@example.com".to_string()));
         assert_eq!(auth.account_id, Some("acc_jwt123".to_string()));
+        let _ = fs::remove_dir_all(slot_dir);
+    }
+
+    #[test]
+    fn read_slot_auth_extracts_refresh_token() {
+        let slot_dir = temp_slot_dir("refresh-token");
+        fs::write(
+            slot_dir.join("home/auth.json"),
+            json!({
+                "tokens": {
+                    "access_token": "access",
+                    "refresh_token": "refresh",
+                    "account_id": "acc_refresh"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let auth = read_slot_auth(&slot_dir).unwrap();
+
+        assert_eq!(auth.access_token, Some("access".to_string()));
+        assert_eq!(auth.refresh_token, Some("refresh".to_string()));
+        assert_eq!(auth.account_id, Some("acc_refresh".to_string()));
         let _ = fs::remove_dir_all(slot_dir);
     }
 

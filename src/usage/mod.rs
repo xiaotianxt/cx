@@ -112,8 +112,8 @@ impl UsageChecker {
             ));
         }
 
-        let auth = auth::read_slot_auth(&slot_dir)?;
-        let account_label = auth.account_label();
+        let mut auth = auth::read_slot_auth(&slot_dir)?;
+        let mut account_label = auth.account_label();
         if auth.access_token.is_none() {
             if auth.api_key.is_some() {
                 return Ok(SlotResult::new(
@@ -149,22 +149,55 @@ impl UsageChecker {
             .with_account_label(account_label));
         }
 
-        let base_url = read_slot_base_url(&slot_dir, &slot_home)?;
-        let url = payload::usage_url(&base_url);
-        let mut headers = HeaderMap::new();
-        headers.insert("User-Agent", HeaderValue::from_static("codex-cli"));
-        if let Some(token) = auth.access_token.as_deref() {
-            let value = HeaderValue::from_str(&format!("Bearer {token}"))?;
-            headers.insert(AUTHORIZATION, value);
-        }
-        if let Some(account_id) = auth.account_id.as_deref() {
-            headers.insert("ChatGPT-Account-ID", HeaderValue::from_str(account_id)?);
-        }
-        if auth.fedramp {
-            headers.insert("X-OpenAI-Fedramp", HeaderValue::from_static("true"));
+        if auth
+            .access_token
+            .as_deref()
+            .is_some_and(auth::access_token_is_expired)
+        {
+            match auth::refresh_slot_auth(&slot_dir, &self.client) {
+                Ok(Some(refreshed_auth)) => {
+                    auth = refreshed_auth;
+                    account_label = auth.account_label();
+                }
+                Ok(None) => {
+                    return Ok(SlotResult::new(
+                        slot,
+                        index,
+                        SlotStatus::NeedsLogin,
+                        -1.0,
+                        "ChatGPT access token expired and no refresh token is available",
+                    )
+                    .with_account_label(account_label));
+                }
+                Err(auth::RefreshSlotAuthError::Permanent(message)) => {
+                    return Ok(SlotResult::new(
+                        slot,
+                        index,
+                        SlotStatus::NeedsLogin,
+                        -1.0,
+                        format!(
+                            "ChatGPT access token expired; token refresh failed permanently: {message}"
+                        ),
+                    )
+                    .with_account_label(account_label));
+                }
+                Err(auth::RefreshSlotAuthError::Transient(message)) => {
+                    return Ok(SlotResult::new(
+                        slot,
+                        index,
+                        SlotStatus::Error,
+                        -1.0,
+                        format!("ChatGPT access token expired; token refresh failed: {message}"),
+                    )
+                    .with_account_label(account_label));
+                }
+            }
         }
 
-        let response = match self.client.get(&url).headers(headers).send() {
+        let base_url = read_slot_base_url(&slot_dir, &slot_home)?;
+        let url = payload::usage_url(&base_url);
+
+        let mut response = match self.send_usage_request(&url, &auth) {
             Ok(response) => response,
             Err(err) => {
                 return Ok(
@@ -173,6 +206,59 @@ impl UsageChecker {
                 );
             }
         };
+        if response.status() == 401 {
+            match auth::refresh_slot_auth(&slot_dir, &self.client) {
+                Ok(Some(refreshed_auth)) => {
+                    auth = refreshed_auth;
+                    account_label = auth.account_label();
+                    response = match self.send_usage_request(&url, &auth) {
+                        Ok(response) => response,
+                        Err(err) => {
+                            return Ok(SlotResult::new(
+                                slot,
+                                index,
+                                SlotStatus::Error,
+                                -1.0,
+                                err.to_string(),
+                            )
+                            .with_account_label(account_label));
+                        }
+                    };
+                }
+                Ok(None) => {
+                    return Ok(SlotResult::new(
+                        slot,
+                        index,
+                        SlotStatus::NeedsLogin,
+                        -1.0,
+                        "usage check returned 401 and no refresh token is available",
+                    )
+                    .with_account_label(account_label));
+                }
+                Err(auth::RefreshSlotAuthError::Permanent(message)) => {
+                    return Ok(SlotResult::new(
+                        slot,
+                        index,
+                        SlotStatus::NeedsLogin,
+                        -1.0,
+                        format!(
+                            "usage check returned 401; token refresh failed permanently: {message}"
+                        ),
+                    )
+                    .with_account_label(account_label));
+                }
+                Err(auth::RefreshSlotAuthError::Transient(message)) => {
+                    return Ok(SlotResult::new(
+                        slot,
+                        index,
+                        SlotStatus::Error,
+                        -1.0,
+                        format!("usage check returned 401; token refresh failed: {message}"),
+                    )
+                    .with_account_label(account_label));
+                }
+            }
+        }
         let status = response.status();
         if status == 401 || status == 403 {
             return Ok(SlotResult::new(
@@ -219,6 +305,27 @@ impl UsageChecker {
             .with_account_label(account_label));
         };
         Ok(payload::result_from_payload(slot, index, &payload).with_account_label(account_label))
+    }
+
+    fn send_usage_request(
+        &self,
+        url: &str,
+        auth: &auth::SlotAuth,
+    ) -> Result<reqwest::blocking::Response> {
+        let mut headers = HeaderMap::new();
+        headers.insert("User-Agent", HeaderValue::from_static("codex-cli"));
+        if let Some(token) = auth.access_token.as_deref() {
+            let value = HeaderValue::from_str(&format!("Bearer {token}"))?;
+            headers.insert(AUTHORIZATION, value);
+        }
+        if let Some(account_id) = auth.account_id.as_deref() {
+            headers.insert("ChatGPT-Account-ID", HeaderValue::from_str(account_id)?);
+        }
+        if auth.fedramp {
+            headers.insert("X-OpenAI-Fedramp", HeaderValue::from_static("true"));
+        }
+
+        Ok(self.client.get(url).headers(headers).send()?)
     }
 }
 

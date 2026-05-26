@@ -102,6 +102,20 @@ or `CX_NO_PROGRESS`.
 
 ## Install
 
+### Agent Skill
+
+Install the optional Codex/agent skill for `cx` workflows:
+
+```bash
+npx -y github:xiaotianxt/skills cx
+```
+
+After the npm package is published:
+
+```bash
+npx -y @xiaotianxt/skills cx
+```
+
 ### Homebrew
 
 ```bash

@@ -518,7 +518,7 @@ fn try_daemon_rate_limits(
         .and_then(Value::as_bool)
         .unwrap_or(true);
     let reached_type = rl.get("rateLimitReachedType");
-    let allowed = has_credits && reached_type.map_or(true, |v| v.is_null());
+    let allowed = has_credits && reached_type.is_none_or(|v| v.is_null());
 
     let remaining = 100.0 - weekly_used.or(five_hour_used).unwrap_or(0.0);
     let score = [five_hour_used, weekly_used]

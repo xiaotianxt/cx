@@ -185,7 +185,7 @@ mod imp {
             .as_nanos();
         let pid = std::process::id();
         let bytes: [u8; 16] = [
-            (nanos >> 0) as u8,
+            nanos as u8,
             (nanos >> 8) as u8,
             (nanos >> 16) as u8,
             (nanos >> 24) as u8,
@@ -193,7 +193,7 @@ mod imp {
             (nanos >> 40) as u8,
             (nanos >> 48) as u8,
             (nanos >> 56) as u8,
-            (pid >> 0) as u8,
+            pid as u8,
             (pid >> 8) as u8,
             (pid >> 16) as u8,
             (pid >> 24) as u8,
@@ -202,7 +202,7 @@ mod imp {
             0xba,
             0xbe,
         ];
-        base64::engine::general_purpose::STANDARD.encode(&bytes)
+        base64::engine::general_purpose::STANDARD.encode(bytes)
     }
 
     fn ws_send_text(stream: &mut UnixStream, text: &str) -> Result<()> {

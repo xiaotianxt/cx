@@ -17,7 +17,11 @@ pub fn load_rotation(paths: &ManagerPaths) -> Result<Vec<String>> {
     if paths.rotation_file.exists() {
         let content = fs::read_to_string(&paths.rotation_file)
             .with_context(|| format!("read {}", paths.rotation_file.display()))?;
-        for name in content.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#')) {
+        for name in content
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        {
             if name != DEFAULT_SLOT {
                 slots.push(name.to_string());
             }

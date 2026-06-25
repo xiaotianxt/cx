@@ -660,7 +660,8 @@ mod tests {
             .build()
             .unwrap();
 
-        let err = refresh_slot_auth_with_endpoint(&slot_dir, &client, &server.url, None).unwrap_err();
+        let err =
+            refresh_slot_auth_with_endpoint(&slot_dir, &client, &server.url, None).unwrap_err();
         let _ = server.request.join().unwrap();
 
         assert_eq!(

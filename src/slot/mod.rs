@@ -260,9 +260,7 @@ pub fn add_slot(paths: &ManagerPaths, args: AddArgs) -> Result<()> {
 pub fn remove_slot(paths: &ManagerPaths, args: RemoveArgs) -> Result<()> {
     validate_slot_name(&args.slot)?;
     if args.slot == "default" {
-        anyhow::bail!(
-            "\"default\" is the machine-default Codex slot; it cannot be removed"
-        );
+        anyhow::bail!("\"default\" is the machine-default Codex slot; it cannot be removed");
     }
 
     let removed_from_rotation = rotation::remove_from_rotation(paths, &args.slot)?;
@@ -309,7 +307,9 @@ pub fn audit_slot_layout(paths: &ManagerPaths, slot: &str) -> Result<SlotLayoutA
             slot: "default".to_string(),
             home_exists: true,
             auth_exists,
-            issues: if auth_exists { Vec::new() } else {
+            issues: if auth_exists {
+                Vec::new()
+            } else {
                 vec![SlotLayoutIssue {
                     path: paths.base_codex_home.join("auth.json"),
                     message: "missing default auth.json".to_string(),

@@ -197,8 +197,7 @@ impl UsageChecker {
         let base_url = read_slot_base_url(&slot_dir, &slot_home)?;
         let url = payload::usage_url(&base_url);
 
-        if let Some(daemon_result) =
-            try_daemon_rate_limits(slot, index, &slot_home, &account_label)
+        if let Some(daemon_result) = try_daemon_rate_limits(slot, index, &slot_home, &account_label)
         {
             return Ok(daemon_result);
         }
@@ -521,22 +520,18 @@ fn try_daemon_rate_limits(
     let reached_type = rl.get("rateLimitReachedType");
     let allowed = has_credits && reached_type.map_or(true, |v| v.is_null());
 
-    let remaining = 100.0
-        - weekly_used
-            .or(five_hour_used)
-            .unwrap_or(0.0);
+    let remaining = 100.0 - weekly_used.or(five_hour_used).unwrap_or(0.0);
     let score = [five_hour_used, weekly_used]
         .into_iter()
         .flatten()
         .map(|used| 100.0 - used)
         .fold(100.0, f64::min);
 
-    let reached_label = reached_type
-        .and_then(Value::as_str)
-        .map(|s| s.to_string());
+    let reached_label = reached_type.and_then(Value::as_str).map(|s| s.to_string());
 
     let reset_at = five_hour_reset.or(weekly_reset);
-    let exhausted_label = reached_label.clone()
+    let exhausted_label = reached_label
+        .clone()
         .unwrap_or_else(|| "limit reached".to_string());
 
     let mut result = if allowed {

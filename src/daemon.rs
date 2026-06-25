@@ -9,9 +9,9 @@ mod imp {
     use std::time::SystemTime;
     use std::time::UNIX_EPOCH;
 
+    use anyhow::bail;
     use anyhow::Context;
     use anyhow::Result;
-    use anyhow::bail;
     use base64::Engine;
     use serde::Deserialize;
     use serde_json::Value;
@@ -68,7 +68,8 @@ mod imp {
 
     fn probe(codex_home: &Path) -> Result<()> {
         let mut client = DaemonClient::connect(codex_home)?;
-        let _account = client.request("account/read", serde_json::json!({"refreshToken": false}))?;
+        let _account =
+            client.request("account/read", serde_json::json!({"refreshToken": false}))?;
         Ok(())
     }
 
@@ -353,10 +354,7 @@ pub fn try_query_rate_limits(codex_home: &std::path::Path) -> Option<serde_json:
         }
         let mut client = DaemonClient::connect(codex_home).ok()?;
         client
-            .request(
-                "account/rateLimits/read",
-                serde_json::json!({}),
-            )
+            .request("account/rateLimits/read", serde_json::json!({}))
             .ok()
     }
     #[cfg(not(unix))]

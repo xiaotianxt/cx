@@ -19,6 +19,7 @@ use serde_json::Value;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+use crate::paths;
 use crate::slot;
 
 const REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
@@ -73,9 +74,25 @@ impl fmt::Display for RefreshSlotAuthError {
     }
 }
 
-pub fn read_slot_auth(slot_dir: &Path) -> Result<SlotAuth> {
+fn resolve_auth_path(slot_dir: &Path, base_codex_home: Option<&Path>) -> Result<PathBuf> {
+    let slot_auth = slot_dir.join("home").join("auth.json");
+    if slot_auth.exists() {
+        return Ok(slot_auth);
+    }
+    let home = match base_codex_home {
+        Some(home) => home.to_path_buf(),
+        None => paths::home_dir()?.join(".codex"),
+    };
+    let default_auth = home.join("auth.json");
+    if default_auth.exists() {
+        return Ok(default_auth);
+    }
+    Ok(slot_auth)
+}
+
+pub fn read_slot_auth(slot_dir: &Path, base_codex_home: Option<&Path>) -> Result<SlotAuth> {
     let provider = slot::read_override_string(slot_dir, "model_provider")?;
-    let auth_path = slot_dir.join("home/auth.json");
+    let auth_path = resolve_auth_path(slot_dir, base_codex_home)?;
     if !auth_path.exists() {
         return Ok(SlotAuth {
             provider,
@@ -149,16 +166,25 @@ pub fn read_slot_auth(slot_dir: &Path) -> Result<SlotAuth> {
 pub fn refresh_slot_auth(
     slot_dir: &Path,
     client: &Client,
+    base_codex_home: Option<&Path>,
 ) -> std::result::Result<Option<SlotAuth>, RefreshSlotAuthError> {
-    refresh_slot_auth_with_endpoint(slot_dir, client, &refresh_token_url())
+    refresh_slot_auth_with_endpoint(slot_dir, client, &refresh_token_url(), base_codex_home)
 }
 
 fn refresh_slot_auth_with_endpoint(
     slot_dir: &Path,
     client: &Client,
     endpoint: &str,
+    base_codex_home: Option<&Path>,
 ) -> std::result::Result<Option<SlotAuth>, RefreshSlotAuthError> {
-    let auth_path = slot_dir.join("home/auth.json");
+    let auth_path = match resolve_auth_path(slot_dir, base_codex_home) {
+        Ok(path) => path,
+        Err(err) => {
+            return Err(RefreshSlotAuthError::Transient(format!(
+                "resolve auth path: {err}"
+            )));
+        }
+    };
     if !auth_path.exists() {
         return Ok(None);
     }
@@ -209,7 +235,7 @@ fn refresh_slot_auth_with_endpoint(
     atomic_write_private_json(&auth_path, &document).map_err(|err| {
         RefreshSlotAuthError::Transient(format!("write {}: {err:#}", auth_path.display()))
     })?;
-    read_slot_auth(slot_dir)
+    read_slot_auth(slot_dir, base_codex_home)
         .map(Some)
         .map_err(|err| RefreshSlotAuthError::Transient(format!("read refreshed auth: {err:#}")))
 }
@@ -467,7 +493,7 @@ mod tests {
         )
         .unwrap();
 
-        let auth = read_slot_auth(&slot_dir).unwrap();
+        let auth = read_slot_auth(&slot_dir, None).unwrap();
 
         assert_eq!(auth.email, Some("person@example.com".to_string()));
         assert_eq!(auth.account_id, Some("acc_abcdef".to_string()));
@@ -499,7 +525,7 @@ mod tests {
         )
         .unwrap();
 
-        let auth = read_slot_auth(&slot_dir).unwrap();
+        let auth = read_slot_auth(&slot_dir, None).unwrap();
 
         assert_eq!(auth.email, Some("jwt@example.com".to_string()));
         assert_eq!(auth.account_id, Some("acc_jwt123".to_string()));
@@ -522,7 +548,7 @@ mod tests {
         )
         .unwrap();
 
-        let auth = read_slot_auth(&slot_dir).unwrap();
+        let auth = read_slot_auth(&slot_dir, None).unwrap();
 
         assert_eq!(auth.access_token, Some("access".to_string()));
         assert_eq!(auth.refresh_token, Some("refresh".to_string()));
@@ -565,7 +591,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let auth = refresh_slot_auth_with_endpoint(&slot_dir, &client, &server.url)
+        let auth = refresh_slot_auth_with_endpoint(&slot_dir, &client, &server.url, None)
             .unwrap()
             .unwrap();
         let request = server.request.join().unwrap();
@@ -634,7 +660,7 @@ mod tests {
             .build()
             .unwrap();
 
-        let err = refresh_slot_auth_with_endpoint(&slot_dir, &client, &server.url).unwrap_err();
+        let err = refresh_slot_auth_with_endpoint(&slot_dir, &client, &server.url, None).unwrap_err();
         let _ = server.request.join().unwrap();
 
         assert_eq!(

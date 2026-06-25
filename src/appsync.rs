@@ -38,7 +38,7 @@ pub fn sync_app(paths: &ManagerPaths, args: AppSyncArgs) -> Result<AppSyncResult
 
 fn sync_mousedo(paths: &ManagerPaths, args: &AppSyncArgs) -> Result<AppSyncResult> {
     let slot = select_oauth_slot(paths, args)?;
-    let slot_auth = auth::read_slot_auth(&paths.slot_dir(&slot))?;
+    let slot_auth = auth::read_slot_auth(&paths.slot_dir(&slot), Some(&paths.base_codex_home))?;
     require_oauth_fields(&slot_auth, &slot)?;
 
     let path = mousedo_secrets_path()?;
@@ -77,7 +77,7 @@ fn select_oauth_slot(paths: &ManagerPaths, args: &AppSyncArgs) -> Result<String>
     candidates.sort_by(|left, right| usage::compare_for_selection(left, right));
 
     for candidate in candidates {
-        let slot_auth = auth::read_slot_auth(&paths.slot_dir(&candidate.slot))?;
+        let slot_auth = auth::read_slot_auth(&paths.slot_dir(&candidate.slot), Some(&paths.base_codex_home))?;
         if has_required_oauth_fields(&slot_auth) {
             return Ok(candidate.slot.clone());
         }

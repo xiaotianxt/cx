@@ -212,6 +212,7 @@ fn export_slots(paths: &ManagerPaths, requested: &[String]) -> Result<Vec<String
     } else {
         requested.to_vec()
     };
+    let slots: Vec<String> = slots.into_iter().filter(|s| s != "default").collect();
     if slots.is_empty() {
         anyhow::bail!("no slots to export");
     }

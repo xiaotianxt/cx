@@ -43,10 +43,16 @@ impl ManagerPaths {
     }
 
     pub fn slot_dir(&self, slot: &str) -> PathBuf {
+        if slot == "default" {
+            return self.base_codex_home.clone();
+        }
         self.slots_dir.join(slot)
     }
 
     pub fn slot_home(&self, slot: &str) -> PathBuf {
+        if slot == "default" {
+            return self.base_codex_home.clone();
+        }
         self.slot_dir(slot).join("home")
     }
 

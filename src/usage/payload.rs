@@ -99,7 +99,7 @@ fn rate_limit_reached_type(payload: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-fn summarize_window(
+pub(super) fn summarize_window(
     five_hour: Option<f64>,
     weekly: Option<f64>,
     five_hour_reset_at: Option<i64>,

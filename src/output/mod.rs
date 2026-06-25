@@ -304,6 +304,12 @@ pub fn print_doctor(paths: &ManagerPaths, slots: &[String]) -> Result<()> {
             );
         }
     }
+    let ds = crate::daemon::status(&paths.base_codex_home);
+    let daemon_state = if ds.running { "running" } else { "not running" };
+    println!(
+        "app-server daemon: {daemon_state} ({})",
+        ds.socket_path.display()
+    );
     Ok(())
 }
 

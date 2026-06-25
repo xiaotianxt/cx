@@ -101,7 +101,7 @@ impl UsageChecker {
         index: usize,
     ) -> Result<SlotResult> {
         let slot_dir = paths.slot_dir(slot);
-        let slot_home = slot_dir.join("home");
+        let slot_home = paths.slot_home(slot);
         if !slot_home.is_dir() {
             return Ok(SlotResult::new(
                 slot,
@@ -112,7 +112,7 @@ impl UsageChecker {
             ));
         }
 
-        let mut auth = auth::read_slot_auth(&slot_dir)?;
+        let mut auth = auth::read_slot_auth(&slot_dir, Some(&paths.base_codex_home))?;
         let mut account_label = auth.account_label();
         if auth.access_token.is_none() {
             if auth.api_key.is_some() {
@@ -154,7 +154,7 @@ impl UsageChecker {
             .as_deref()
             .is_some_and(auth::access_token_is_expired)
         {
-            match auth::refresh_slot_auth(&slot_dir, &self.client) {
+            match auth::refresh_slot_auth(&slot_dir, &self.client, Some(&paths.base_codex_home)) {
                 Ok(Some(refreshed_auth)) => {
                     auth = refreshed_auth;
                     account_label = auth.account_label();
@@ -197,6 +197,12 @@ impl UsageChecker {
         let base_url = read_slot_base_url(&slot_dir, &slot_home)?;
         let url = payload::usage_url(&base_url);
 
+        if let Some(daemon_result) =
+            try_daemon_rate_limits(slot, index, &slot_home, &account_label)
+        {
+            return Ok(daemon_result);
+        }
+
         let mut response = match self.send_usage_request(&url, &auth) {
             Ok(response) => response,
             Err(err) => {
@@ -207,7 +213,7 @@ impl UsageChecker {
             }
         };
         if response.status() == 401 {
-            match auth::refresh_slot_auth(&slot_dir, &self.client) {
+            match auth::refresh_slot_auth(&slot_dir, &self.client, Some(&paths.base_codex_home)) {
                 Ok(Some(refreshed_auth)) => {
                     auth = refreshed_auth;
                     account_label = auth.account_label();
@@ -483,6 +489,86 @@ fn read_slot_base_url(slot_dir: &std::path::Path, slot_home: &std::path::Path) -
         )?)
         .unwrap_or_else(|| DEFAULT_CHATGPT_BASE_URL.to_string());
     Ok(payload::normalize_chatgpt_base_url(&raw))
+}
+
+fn try_daemon_rate_limits(
+    slot: &str,
+    index: usize,
+    slot_home: &std::path::Path,
+    account_label: &Option<String>,
+) -> Option<SlotResult> {
+    use serde_json::Value;
+    let daemon = crate::daemon::try_query_rate_limits(slot_home)?;
+    let rl = daemon.get("rateLimits")?;
+    let primary = rl.get("primary")?;
+    let secondary = rl.get("secondary")?;
+    let credits = rl.get("credits");
+
+    let five_hour_used = primary
+        .get("usedPercent")
+        .and_then(Value::as_i64)
+        .map(|v| v as f64);
+    let weekly_used = secondary
+        .get("usedPercent")
+        .and_then(Value::as_i64)
+        .map(|v| v as f64);
+    let five_hour_reset = primary.get("resetsAt").and_then(Value::as_i64);
+    let weekly_reset = secondary.get("resetsAt").and_then(Value::as_i64);
+    let has_credits = credits
+        .and_then(|c| c.get("hasCredits"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let reached_type = rl.get("rateLimitReachedType");
+    let allowed = has_credits && reached_type.map_or(true, |v| v.is_null());
+
+    let remaining = 100.0
+        - weekly_used
+            .or(five_hour_used)
+            .unwrap_or(0.0);
+    let score = [five_hour_used, weekly_used]
+        .into_iter()
+        .flatten()
+        .map(|used| 100.0 - used)
+        .fold(100.0, f64::min);
+
+    let reached_label = reached_type
+        .and_then(Value::as_str)
+        .map(|s| s.to_string());
+
+    let reset_at = five_hour_reset.or(weekly_reset);
+    let exhausted_label = reached_label.clone()
+        .unwrap_or_else(|| "limit reached".to_string());
+
+    let mut result = if allowed {
+        SlotResult::new(
+            slot,
+            index,
+            SlotStatus::Available,
+            score,
+            payload::summarize_window(
+                five_hour_used,
+                weekly_used,
+                five_hour_reset,
+                weekly_reset,
+                score,
+            ),
+        )
+    } else {
+        SlotResult::new(
+            slot,
+            index,
+            SlotStatus::Exhausted,
+            remaining,
+            exhausted_label,
+        )
+    };
+    result.five_hour_used_percent = five_hour_used;
+    result.weekly_used_percent = weekly_used;
+    result.reset_at = reset_at;
+    result.five_hour_refresh_at = five_hour_reset;
+    result.weekly_refresh_at = weekly_reset;
+    result.rate_limit_reached_type = reached_label;
+    Some(result.with_account_label(account_label.clone()))
 }
 
 #[cfg(test)]

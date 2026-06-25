@@ -4,6 +4,7 @@ mod cache;
 mod cli;
 mod completion;
 mod cx;
+mod daemon;
 mod desktop;
 mod envfile;
 mod install;

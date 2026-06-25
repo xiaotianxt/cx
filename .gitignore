@@ -8,3 +8,5 @@ auth.json
 accounts/
 env.conf
 scripts/sync-*
+node_modules/
+package-lock.json

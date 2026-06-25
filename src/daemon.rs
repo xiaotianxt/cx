@@ -19,7 +19,6 @@ mod imp {
     const SOCKET_DIR: &str = "app-server-control";
     const SOCKET_FILE: &str = "app-server-control.sock";
     const READ_TIMEOUT: Duration = Duration::from_secs(5);
-    const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
     #[derive(Debug, Deserialize)]
     struct JsonRpcResponse {
@@ -79,11 +78,15 @@ mod imp {
 
     impl DaemonClient {
         pub fn connect(codex_home: &Path) -> Result<Self> {
+            Self::connect_with_timeout(codex_home, READ_TIMEOUT)
+        }
+
+        pub fn connect_with_timeout(codex_home: &Path, timeout: Duration) -> Result<Self> {
             let path = socket_path(codex_home);
             let mut stream = UnixStream::connect(&path)
                 .with_context(|| format!("connect to daemon at {}", path.display()))?;
-            stream.set_read_timeout(Some(READ_TIMEOUT))?;
-            stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
+            stream.set_read_timeout(Some(timeout))?;
+            stream.set_write_timeout(Some(timeout))?;
 
             ws_handshake(&mut stream)?;
 
@@ -346,13 +349,13 @@ pub use imp::*;
 #[cfg(unix)]
 use imp::DaemonClient;
 
-pub fn try_query_rate_limits(codex_home: &std::path::Path) -> Option<serde_json::Value> {
+pub fn try_query_rate_limits(
+    codex_home: &std::path::Path,
+    timeout: std::time::Duration,
+) -> Option<serde_json::Value> {
     #[cfg(unix)]
     {
-        if !imp::is_running(codex_home) {
-            return None;
-        }
-        let mut client = DaemonClient::connect(codex_home).ok()?;
+        let mut client = DaemonClient::connect_with_timeout(codex_home, timeout).ok()?;
         client
             .request("account/rateLimits/read", serde_json::json!({}))
             .ok()
@@ -360,6 +363,7 @@ pub fn try_query_rate_limits(codex_home: &std::path::Path) -> Option<serde_json:
     #[cfg(not(unix))]
     {
         let _ = codex_home;
+        let _ = timeout;
         None
     }
 }

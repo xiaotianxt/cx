@@ -523,6 +523,35 @@ mod tests {
         }
     }
 
+    fn add_args(slot: &str, rotate: bool) -> AddArgs {
+        AddArgs {
+            manager_dir: None,
+            slot: slot.to_string(),
+            rotate,
+            from_current: false,
+            sets: Vec::new(),
+            envs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn add_slot_does_not_persist_default_pseudo_slot_to_rotation() {
+        let paths = temp_paths("add-no-default-persist");
+        fs::create_dir_all(&paths.base_codex_home).unwrap();
+        fs::write(paths.base_codex_home.join("auth.json"), "{}\n").unwrap();
+
+        add_slot(&paths, add_args("dia1", true)).unwrap();
+
+        assert_eq!(fs::read_to_string(&paths.rotation_file).unwrap(), "dia1\n");
+        assert_eq!(
+            load_rotation(&paths).unwrap(),
+            vec!["default".to_string(), "dia1".to_string()]
+        );
+
+        let _ = fs::remove_dir_all(&paths.manager_dir);
+        let _ = fs::remove_dir_all(&paths.base_codex_home);
+    }
+
     #[test]
     fn remove_slot_keeps_files_by_default() {
         let paths = temp_paths("keep");
@@ -536,6 +565,24 @@ mod tests {
         assert!(paths.slot_dir("dia1").exists());
 
         let _ = fs::remove_dir_all(&paths.manager_dir);
+    }
+
+    #[test]
+    fn remove_slot_does_not_persist_default_pseudo_slot_to_rotation() {
+        let paths = temp_paths("remove-no-default-persist");
+        fs::create_dir_all(paths.slot_home("dia1")).unwrap();
+        fs::create_dir_all(&paths.base_codex_home).unwrap();
+        fs::create_dir_all(&paths.manager_dir).unwrap();
+        fs::write(paths.base_codex_home.join("auth.json"), "{}\n").unwrap();
+        fs::write(&paths.rotation_file, "dia1\n").unwrap();
+
+        remove_slot(&paths, remove_args("dia1", false)).unwrap();
+
+        assert_eq!(fs::read_to_string(&paths.rotation_file).unwrap(), "");
+        assert_eq!(load_rotation(&paths).unwrap(), vec!["default".to_string()]);
+
+        let _ = fs::remove_dir_all(&paths.manager_dir);
+        let _ = fs::remove_dir_all(&paths.base_codex_home);
     }
 
     #[test]

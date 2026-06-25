@@ -19,7 +19,6 @@ use serde_json::Value;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
-use crate::paths;
 use crate::slot;
 
 const REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
@@ -79,13 +78,10 @@ fn resolve_auth_path(slot_dir: &Path, base_codex_home: Option<&Path>) -> Result<
     if slot_auth.exists() {
         return Ok(slot_auth);
     }
-    let home = match base_codex_home {
-        Some(home) => home.to_path_buf(),
-        None => paths::home_dir()?.join(".codex"),
-    };
-    let default_auth = home.join("auth.json");
-    if default_auth.exists() {
-        return Ok(default_auth);
+    if let Some(home) = base_codex_home {
+        if slot_dir == home {
+            return Ok(home.join("auth.json"));
+        }
     }
     Ok(slot_auth)
 }
@@ -554,6 +550,56 @@ mod tests {
         assert_eq!(auth.refresh_token, Some("refresh".to_string()));
         assert_eq!(auth.account_id, Some("acc_refresh".to_string()));
         let _ = fs::remove_dir_all(slot_dir);
+    }
+
+    #[test]
+    fn read_slot_auth_does_not_fallback_to_default_for_named_slot() {
+        let root = temp_slot_dir("named-slot-no-default-fallback");
+        let base_home = root.join("base");
+        let slot_dir = root.join("slots/dia1");
+        fs::create_dir_all(slot_dir.join("home")).unwrap();
+        fs::create_dir_all(&base_home).unwrap();
+        fs::write(
+            base_home.join("auth.json"),
+            json!({
+                "tokens": {
+                    "access_token": "default-access",
+                    "refresh_token": "default-refresh"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let auth = read_slot_auth(&slot_dir, Some(&base_home)).unwrap();
+
+        assert_eq!(auth.access_token, None);
+        assert_eq!(auth.refresh_token, None);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn read_slot_auth_uses_default_auth_for_default_slot_home() {
+        let root = temp_slot_dir("default-slot-auth");
+        let base_home = root.join("base");
+        fs::create_dir_all(&base_home).unwrap();
+        fs::write(
+            base_home.join("auth.json"),
+            json!({
+                "tokens": {
+                    "access_token": "default-access",
+                    "refresh_token": "default-refresh"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let auth = read_slot_auth(&base_home, Some(&base_home)).unwrap();
+
+        assert_eq!(auth.access_token, Some("default-access".to_string()));
+        assert_eq!(auth.refresh_token, Some("default-refresh".to_string()));
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

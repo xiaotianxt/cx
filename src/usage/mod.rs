@@ -29,6 +29,7 @@ const DEFAULT_CHATGPT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 #[derive(Debug, Clone)]
 pub struct UsageChecker {
     client: Client,
+    timeout: Duration,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -84,7 +85,7 @@ impl UsageChecker {
     pub fn new(timeout_seconds: f32) -> Result<Self> {
         let timeout = Duration::from_secs_f32(timeout_seconds.max(0.1));
         let client = Client::builder().timeout(timeout).build()?;
-        Ok(Self { client })
+        Ok(Self { client, timeout })
     }
 
     pub fn query_slot(&self, paths: &ManagerPaths, slot: &str, index: usize) -> SlotResult {
@@ -197,7 +198,8 @@ impl UsageChecker {
         let base_url = read_slot_base_url(&slot_dir, &slot_home)?;
         let url = payload::usage_url(&base_url);
 
-        if let Some(daemon_result) = try_daemon_rate_limits(slot, index, &slot_home, &account_label)
+        if let Some(daemon_result) =
+            try_daemon_rate_limits(slot, index, &slot_home, &account_label, self.timeout)
         {
             return Ok(daemon_result);
         }
@@ -495,9 +497,10 @@ fn try_daemon_rate_limits(
     index: usize,
     slot_home: &std::path::Path,
     account_label: &Option<String>,
+    timeout: Duration,
 ) -> Option<SlotResult> {
     use serde_json::Value;
-    let daemon = crate::daemon::try_query_rate_limits(slot_home)?;
+    let daemon = crate::daemon::try_query_rate_limits(slot_home, timeout)?;
     let rl = daemon.get("rateLimits")?;
     let primary = rl.get("primary")?;
     let secondary = rl.get("secondary")?;

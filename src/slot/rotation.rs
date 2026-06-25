@@ -14,27 +14,33 @@ pub fn load_rotation(paths: &ManagerPaths) -> Result<Vec<String>> {
         slots.push(DEFAULT_SLOT.to_string());
     }
 
-    if paths.rotation_file.exists() {
-        let content = fs::read_to_string(&paths.rotation_file)
-            .with_context(|| format!("read {}", paths.rotation_file.display()))?;
-        for name in content
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        {
-            if name != DEFAULT_SLOT {
-                slots.push(name.to_string());
-            }
+    for name in load_rotation_file(paths)? {
+        if name != DEFAULT_SLOT {
+            slots.push(name);
         }
     }
 
     Ok(slots)
 }
 
+fn load_rotation_file(paths: &ManagerPaths) -> Result<Vec<String>> {
+    if !paths.rotation_file.exists() {
+        return Ok(Vec::new());
+    }
+    let content = fs::read_to_string(&paths.rotation_file)
+        .with_context(|| format!("read {}", paths.rotation_file.display()))?;
+    Ok(content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_string)
+        .collect())
+}
+
 pub(super) fn append_rotation(paths: &ManagerPaths, slot: &str) -> Result<()> {
     fs::create_dir_all(&paths.manager_dir)
         .with_context(|| format!("create {}", paths.manager_dir.display()))?;
-    let mut slots = load_rotation(paths)?;
+    let mut slots = load_rotation_file(paths)?;
     if !slots.iter().any(|existing| existing == slot) {
         slots.push(slot.to_string());
         fs::write(&paths.rotation_file, slots.join("\n") + "\n")
@@ -48,7 +54,7 @@ pub(super) fn remove_from_rotation(paths: &ManagerPaths, slot: &str) -> Result<b
         return Ok(false);
     }
 
-    let slots = load_rotation(paths)?;
+    let slots = load_rotation_file(paths)?;
     let filtered = slots
         .iter()
         .filter(|existing| existing.as_str() != slot)

@@ -10,7 +10,10 @@ const DEFAULT_SLOT: &str = "default";
 pub fn load_rotation(paths: &ManagerPaths) -> Result<Vec<String>> {
     let mut slots = Vec::new();
 
-    if paths.base_codex_home.join("auth.json").exists() {
+    let base_has_auth = paths.base_codex_home.join("auth.json").exists()
+        || paths.base_codex_home.join("keychain.conf").exists()
+        || paths.base_codex_home.join("env.conf").is_file();
+    if base_has_auth {
         slots.push(DEFAULT_SLOT.to_string());
     }
 

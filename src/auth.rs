@@ -19,6 +19,8 @@ use serde_json::Value;
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+use crate::envfile;
+use crate::keychain;
 use crate::slot;
 
 const REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
@@ -88,9 +90,69 @@ fn resolve_auth_path(slot_dir: &Path, base_codex_home: Option<&Path>) -> Result<
 
 pub fn read_slot_auth(slot_dir: &Path, base_codex_home: Option<&Path>) -> Result<SlotAuth> {
     let provider = slot::read_override_string(slot_dir, "model_provider")?;
+
+    // Read OPENAI_API_KEY from env.conf (takes precedence) and auth.json (fallback).
+    let envs = envfile::read_env_file(&slot_dir.join("env.conf")).unwrap_or_default();
+    let env_api_key = envs.get("OPENAI_API_KEY").cloned();
+
+    // keychain.conf is authoritative for PAT-backed slots. Do not fall back to
+    // auth.json here, or usage selection can disagree with launch behavior.
+    if let Some(conf) = keychain::read_keychain_conf(slot_dir)? {
+        let Some(pat) = keychain::fetch_pat_from_keychain(&conf.service, &conf.account)? else {
+            eprintln!(
+                "cx: Keychain entry {}/{} not found for PAT slot",
+                conf.service, conf.account
+            );
+            return Ok(SlotAuth {
+                provider,
+                ..SlotAuth::default()
+            });
+        };
+        if !keychain::is_pat(&pat) {
+            eprintln!(
+                "cx: Keychain entry {}/{} does not contain a PAT",
+                conf.service, conf.account
+            );
+            return Ok(SlotAuth {
+                provider,
+                ..SlotAuth::default()
+            });
+        }
+        let client = reqwest::blocking::Client::builder()
+            .timeout(keychain::whoami_timeout())
+            .build();
+        let hydrate_result = match &client {
+            Ok(client) => keychain::read_or_hydrate_metadata(slot_dir, &pat, &envs, client),
+            Err(err) => Err(anyhow::anyhow!("build whoami client: {err}")),
+        };
+        match hydrate_result {
+            Ok(Some(metadata)) => {
+                return Ok(SlotAuth {
+                    access_token: Some(pat),
+                    refresh_token: None,
+                    account_id: Some(metadata.account_id),
+                    email: metadata.email,
+                    fedramp: metadata.fedramp,
+                    api_key: None,
+                    provider,
+                });
+            }
+            Ok(None) => {}
+            Err(err) => {
+                eprintln!("cx: slot PAT unavailable ({err:#})");
+            }
+        }
+        return Ok(SlotAuth {
+            provider,
+            ..SlotAuth::default()
+        });
+    }
+
+    // OAuth fallback: read auth.json (existing logic).
     let auth_path = resolve_auth_path(slot_dir, base_codex_home)?;
     if !auth_path.exists() {
         return Ok(SlotAuth {
+            api_key: env_api_key,
             provider,
             ..SlotAuth::default()
         });
@@ -142,7 +204,7 @@ pub fn read_slot_auth(slot_dir: &Path, base_codex_home: Option<&Path>) -> Result
         .and_then(|id_token| id_token.get("chatgpt_account_is_fedramp"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let api_key = auth
+    let json_api_key = auth
         .get("OPENAI_API_KEY")
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
@@ -154,9 +216,15 @@ pub fn read_slot_auth(slot_dir: &Path, base_codex_home: Option<&Path>) -> Result
         account_id,
         email,
         fedramp,
-        api_key,
+        api_key: env_api_key.or(json_api_key),
         provider,
     })
+}
+
+/// Read provider from overrides.conf only, without touching keychain or auth.json.
+/// Used by session_scrub which only needs the provider field.
+pub fn read_slot_provider(slot_dir: &Path) -> Result<Option<String>> {
+    slot::read_override_string(slot_dir, "model_provider")
 }
 
 pub fn refresh_slot_auth(
@@ -549,6 +617,37 @@ mod tests {
         assert_eq!(auth.access_token, Some("access".to_string()));
         assert_eq!(auth.refresh_token, Some("refresh".to_string()));
         assert_eq!(auth.account_id, Some("acc_refresh".to_string()));
+        let _ = fs::remove_dir_all(slot_dir);
+    }
+
+    #[test]
+    fn read_slot_auth_does_not_fallback_to_oauth_when_keychain_entry_is_missing() {
+        let slot_dir = temp_slot_dir("missing-keychain-pat");
+        fs::write(
+            slot_dir.join("keychain.conf"),
+            "service=cx-test-missing\naccount=missing@example.com\n",
+        )
+        .unwrap();
+        fs::write(slot_dir.join("env.conf"), "OPENAI_API_KEY=sk-test\n").unwrap();
+        fs::write(
+            slot_dir.join("home/auth.json"),
+            json!({
+                "tokens": {
+                    "access_token": "old-access",
+                    "refresh_token": "old-refresh",
+                    "account_id": "acc_old"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let auth = read_slot_auth(&slot_dir, None).unwrap();
+
+        assert_eq!(auth.access_token, None);
+        assert_eq!(auth.refresh_token, None);
+        assert_eq!(auth.account_id, None);
+        assert_eq!(auth.api_key, None);
         let _ = fs::remove_dir_all(slot_dir);
     }
 

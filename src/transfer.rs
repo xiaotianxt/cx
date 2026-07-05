@@ -28,6 +28,7 @@ const BASE_ITEMS: &[&str] = &[
     "config.toml",
     "AGENTS.md",
     "installation_id",
+    "keychain.conf",
     "models_cache.json",
     "session_index.jsonl",
     "version.json",
@@ -42,7 +43,7 @@ const MANAGER_ITEMS: &[&str] = &[
     "price-cache.json",
 ];
 
-const SLOT_ROOT_FILES: &[&str] = &["env.conf", "overrides.conf"];
+const SLOT_ROOT_FILES: &[&str] = &["env.conf", "overrides.conf", "keychain.conf"];
 
 const SLOT_HOME_FILES: &[&str] = &[
     "auth.json",
@@ -94,6 +95,9 @@ pub fn export_with_paths(paths: &ManagerPaths, args: TransferExportArgs) -> Resu
     println!("exported transfer bundle: {}", bundle.root.display());
     println!("slots: {}", slots.join(", "));
     println!("warning: bundle contains live Codex credentials; keep it private");
+    println!(
+        "warning: keychain.conf entries are local Keychain references; recreate matching Keychain items on the destination before launching PAT-backed slots"
+    );
     Ok(())
 }
 
@@ -130,6 +134,9 @@ pub fn import_with_paths(paths: &ManagerPaths, args: TransferImportArgs) -> Resu
     println!("imported transfer bundle: {}", bundle.root.display());
     println!("slots: {}", manifest.slots.join(", "));
     println!("run `cx doctor` to verify the destination layout");
+    println!(
+        "if imported slots use keychain.conf, create the referenced Keychain items on this machine before launching them"
+    );
     Ok(())
 }
 

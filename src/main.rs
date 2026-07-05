@@ -1,4 +1,3 @@
-mod appsync;
 mod auth;
 mod cache;
 mod cli;
@@ -8,6 +7,7 @@ mod daemon;
 mod desktop;
 mod envfile;
 mod install;
+mod keychain;
 mod output;
 mod paths;
 mod prime;
@@ -29,9 +29,9 @@ use anyhow::Context;
 use anyhow::Result;
 use clap::CommandFactory;
 use clap::Parser;
-use cli::AppCommand;
 use cli::Cli;
 use cli::Command;
+use cli::PatCommand;
 use cli::PrimeCommand;
 use cli::StatusSort;
 use cli::TargetCommand;
@@ -167,6 +167,17 @@ fn entry() -> Result<()> {
             slot::ensure_slot_layout(&paths, &args.slot)?;
             run::exec_slot_login(&paths, args)?;
         }
+        Command::Pat(args) => {
+            let paths =
+                paths::ManagerPaths::new(args.command.manager_dir().map(std::path::PathBuf::from))?;
+            upgrade::run_startup(&paths)?;
+            match args.command {
+                PatCommand::Add(args) => keychain::pat_add(&paths, &args)?,
+                PatCommand::Check(args) => keychain::pat_check(&paths, &args)?,
+                PatCommand::Remove(args) => keychain::pat_remove(&paths, &args)?,
+                PatCommand::Refresh(args) => keychain::pat_refresh(&paths, &args)?,
+            }
+        }
         Command::Desktop(args) => {
             desktop::launch(args)?;
         }
@@ -224,18 +235,6 @@ fn entry() -> Result<()> {
                 } else {
                     println!("target not found: {}", args.target);
                 }
-            }
-        },
-        Command::App(args) => match args.command {
-            AppCommand::Sync(args) => {
-                let paths = paths::ManagerPaths::new(args.manager_dir.clone())?;
-                upgrade::run_startup(&paths)?;
-                let result = appsync::sync_app(&paths, args)?;
-                println!(
-                    "synced app: {} using slot: {} ({})",
-                    result.app, result.slot, result.account
-                );
-                println!("wrote: {}", result.path.display());
             }
         },
         Command::Doctor(args) => {

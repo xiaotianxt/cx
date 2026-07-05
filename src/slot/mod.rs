@@ -86,6 +86,7 @@ impl<'a> SlotMaterializer<'a> {
 
     fn audit(&self) -> Result<SlotLayoutAudit> {
         let auth_path = self.slot_home.join("auth.json");
+        let keychain_conf_path = self.paths.slot_dir(self.slot).join("keychain.conf");
         let mut issues = Vec::new();
 
         let home_exists = self.slot_home.is_dir();
@@ -102,13 +103,13 @@ impl<'a> SlotMaterializer<'a> {
             });
         }
 
-        let auth_exists = auth_path.exists();
+        let auth_exists = auth_path.exists() || keychain_conf_path.exists();
         if !auth_exists {
             issues.push(SlotLayoutIssue {
                 path: auth_path.clone(),
-                message: "missing slot auth.json".to_string(),
+                message: "missing keychain.conf or auth.json".to_string(),
             });
-        } else if is_symlink(&auth_path) {
+        } else if auth_path.exists() && is_symlink(&auth_path) {
             issues.push(SlotLayoutIssue {
                 path: auth_path.clone(),
                 message: "auth.json should be slot-private, not a symlink".to_string(),
@@ -302,7 +303,8 @@ pub fn repair_slot_layout(paths: &ManagerPaths, slot: &str) -> Result<()> {
 
 pub fn audit_slot_layout(paths: &ManagerPaths, slot: &str) -> Result<SlotLayoutAudit> {
     if slot == "default" {
-        let auth_exists = paths.base_codex_home.join("auth.json").exists();
+        let auth_exists = paths.base_codex_home.join("auth.json").exists()
+            || paths.base_codex_home.join("keychain.conf").exists();
         return Ok(SlotLayoutAudit {
             slot: "default".to_string(),
             home_exists: true,
@@ -312,7 +314,7 @@ pub fn audit_slot_layout(paths: &ManagerPaths, slot: &str) -> Result<SlotLayoutA
             } else {
                 vec![SlotLayoutIssue {
                     path: paths.base_codex_home.join("auth.json"),
-                    message: "missing default auth.json".to_string(),
+                    message: "missing default keychain.conf or auth.json".to_string(),
                 }]
             },
         });

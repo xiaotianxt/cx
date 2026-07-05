@@ -160,8 +160,9 @@ fn state_db_slot_names(paths: &ManagerPaths) -> Result<Vec<String>> {
 }
 
 fn target_model_provider(paths: &ManagerPaths, target_slot: &str) -> Result<String> {
-    let auth = auth::read_slot_auth(&paths.slot_dir(target_slot), Some(&paths.base_codex_home))?;
-    Ok(auth.provider.unwrap_or_else(|| "openai".to_string()))
+    let provider = auth::read_slot_provider(&paths.slot_dir(target_slot))?
+        .unwrap_or_else(|| "openai".to_string());
+    Ok(provider)
 }
 
 fn thread_exists(db_path: &Path, session_id: &str) -> Result<bool> {

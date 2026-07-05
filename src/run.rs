@@ -18,6 +18,7 @@ use clap::ValueHint;
 
 use crate::cli::LoginArgs;
 use crate::envfile;
+use crate::keychain;
 use crate::paths;
 use crate::paths::ManagerPaths;
 use crate::resume_id::ExplicitResumeId;
@@ -389,6 +390,35 @@ pub(crate) fn build_slot_command_spec(
         envs.extend(target.env().clone());
     }
     insert_sqlite_home_env(&mut envs, paths.slot_sqlite_home(selected_slot))?;
+
+    // Inject CODEX_ACCESS_TOKEN from Keychain if keychain.conf is present.
+    if let Some(conf) = keychain::read_keychain_conf(&slot_dir)? {
+        if envs.contains_key("CODEX_ACCESS_TOKEN")
+            || envs.contains_key("CODEX_API_KEY")
+            || envs.contains_key("OPENAI_API_KEY")
+        {
+            anyhow::bail!(
+                "slot {}: CODEX_ACCESS_TOKEN, CODEX_API_KEY, or OPENAI_API_KEY already set in env.conf/target; remove one auth source (keychain.conf is also present)",
+                selected_slot
+            );
+        }
+        let pat = keychain::fetch_pat_from_keychain(&conf.service, &conf.account)?.with_context(
+            || {
+                format!(
+                    "Keychain entry {}/{} not found; run `keychain-secret set {} {}`",
+                    conf.service, conf.account, conf.service, conf.account
+                )
+            },
+        )?;
+        if !keychain::is_pat(&pat) {
+            anyhow::bail!(
+                "Keychain entry {}/{} does not contain a PAT (expected `at-` prefix)",
+                conf.service,
+                conf.account
+            );
+        }
+        envs.insert("CODEX_ACCESS_TOKEN".to_string(), pat);
+    }
 
     let mut args = Vec::new();
     for override_line in overrides {
@@ -1214,6 +1244,38 @@ mod tests {
         assert_eq!(PathBuf::from(sqlite_home), paths.slot_sqlite_home("dia4"));
         assert_ne!(PathBuf::from(sqlite_home), paths.base_codex_home);
         assert!(paths.slot_sqlite_home("dia4").is_dir());
+
+        let _ = fs::remove_dir_all(&paths.manager_dir);
+        let _ = fs::remove_dir_all(&paths.base_codex_home);
+    }
+
+    #[test]
+    fn slot_command_spec_rejects_api_key_env_when_keychain_conf_is_present() {
+        let paths = test_paths("keychain-api-key-conflict");
+        fs::create_dir_all(&paths.base_codex_home).unwrap();
+        fs::create_dir_all(paths.slot_home("dia4")).unwrap();
+        fs::create_dir_all(paths.slot_dir("dia4")).unwrap();
+        fs::write(
+            paths.slot_dir("dia4").join("keychain.conf"),
+            "service=codex-pat\naccount=test@example.com\n",
+        )
+        .unwrap();
+        fs::write(
+            paths.slot_dir("dia4").join("env.conf"),
+            "OPENAI_API_KEY=sk-test\n",
+        )
+        .unwrap();
+
+        let err = build_slot_command_spec(
+            &paths,
+            PathBuf::from("/bin/codex"),
+            "dia4",
+            None,
+            Vec::new(),
+        )
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("OPENAI_API_KEY"));
 
         let _ = fs::remove_dir_all(&paths.manager_dir);
         let _ = fs::remove_dir_all(&paths.base_codex_home);

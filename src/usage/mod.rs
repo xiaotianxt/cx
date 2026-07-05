@@ -150,10 +150,11 @@ impl UsageChecker {
             .with_account_label(account_label));
         }
 
-        if auth
-            .access_token
-            .as_deref()
-            .is_some_and(auth::access_token_is_expired)
+        if auth.refresh_token.is_some()
+            && auth
+                .access_token
+                .as_deref()
+                .is_some_and(auth::access_token_is_expired)
         {
             match auth::refresh_slot_auth(&slot_dir, &self.client, Some(&paths.base_codex_home)) {
                 Ok(Some(refreshed_auth)) => {
@@ -213,7 +214,7 @@ impl UsageChecker {
                 );
             }
         };
-        if response.status() == 401 {
+        if response.status() == 401 && auth.refresh_token.is_some() {
             match auth::refresh_slot_auth(&slot_dir, &self.client, Some(&paths.base_codex_home)) {
                 Ok(Some(refreshed_auth)) => {
                     auth = refreshed_auth;

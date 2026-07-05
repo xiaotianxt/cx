@@ -104,6 +104,66 @@ pub fn is_pat(token: &str) -> bool {
     token.starts_with("at-")
 }
 
+pub fn inject_pat_env_from_keychain(
+    slot_dir: &Path,
+    slot: &str,
+    envs: &mut BTreeMap<String, String>,
+) -> Result<()> {
+    let Some(conf) = read_keychain_conf(slot_dir)? else {
+        return Ok(());
+    };
+    inject_pat_env_from_conf_with_parent_env(
+        slot,
+        envs,
+        &conf,
+        parent_auth_env_var_present,
+        fetch_pat_from_keychain,
+    )
+}
+
+fn inject_pat_env_from_conf_with_parent_env<F, G>(
+    slot: &str,
+    envs: &mut BTreeMap<String, String>,
+    conf: &KeychainConf,
+    parent_env_var_present: G,
+    fetch: F,
+) -> Result<()>
+where
+    F: FnOnce(&str, &str) -> Result<Option<String>>,
+    G: Fn(&str) -> bool,
+{
+    if envs.contains_key("CODEX_ACCESS_TOKEN")
+        || envs.contains_key("CODEX_API_KEY")
+        || envs.contains_key("OPENAI_API_KEY")
+        || parent_env_var_present("CODEX_API_KEY")
+        || parent_env_var_present("OPENAI_API_KEY")
+    {
+        anyhow::bail!(
+            "slot {}: CODEX_ACCESS_TOKEN, CODEX_API_KEY, or OPENAI_API_KEY already set in env.conf/target, or CODEX_API_KEY/OPENAI_API_KEY already set in parent environment; remove one auth source (keychain.conf is also present)",
+            slot
+        );
+    }
+    let pat = fetch(&conf.service, &conf.account)?.with_context(|| {
+        format!(
+            "Keychain entry {}/{} not found; run `keychain-secret set {} {}`",
+            conf.service, conf.account, conf.service, conf.account
+        )
+    })?;
+    if !is_pat(&pat) {
+        anyhow::bail!(
+            "Keychain entry {}/{} does not contain a PAT (expected `at-` prefix)",
+            conf.service,
+            conf.account
+        );
+    }
+    envs.insert("CODEX_ACCESS_TOKEN".to_string(), pat);
+    Ok(())
+}
+
+fn parent_auth_env_var_present(key: &str) -> bool {
+    std::env::var_os(key).is_some_and(|value| !value.is_empty())
+}
+
 pub fn pat_fingerprint(pat: &str) -> String {
     let hash = Sha256::digest(pat.as_bytes());
     let hex = hash.iter().map(|b| format!("{b:02x}")).collect::<String>();
@@ -419,4 +479,186 @@ pub fn pat_refresh(
     println!("  email: {}", metadata.email.as_deref().unwrap_or("(none)"));
     println!("  account_id: {}", metadata.account_id);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inject_pat_env_from_conf_inserts_codex_access_token() {
+        let conf = KeychainConf {
+            service: "codex-pat".to_string(),
+            account: "test@example.com".to_string(),
+        };
+        let mut envs = BTreeMap::new();
+
+        inject_pat_env_from_conf_with_parent_env(
+            "dia4",
+            &mut envs,
+            &conf,
+            |_| false,
+            |service, account| {
+                assert_eq!(service, "codex-pat");
+                assert_eq!(account, "test@example.com");
+                Ok(Some("at-test".to_string()))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(envs.get("CODEX_ACCESS_TOKEN"), Some(&"at-test".to_string()));
+    }
+
+    #[test]
+    fn inject_pat_env_from_conf_rejects_existing_auth_env() {
+        let conf = KeychainConf {
+            service: "codex-pat".to_string(),
+            account: "test@example.com".to_string(),
+        };
+        let mut envs = BTreeMap::new();
+        envs.insert("OPENAI_API_KEY".to_string(), "sk-test".to_string());
+
+        let err = inject_pat_env_from_conf_with_parent_env(
+            "dia4",
+            &mut envs,
+            &conf,
+            |_| false,
+            |_, _| panic!("conflicting env should be rejected before keychain fetch"),
+        )
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("OPENAI_API_KEY"));
+        assert!(!envs.contains_key("CODEX_ACCESS_TOKEN"));
+    }
+
+    #[test]
+    fn inject_pat_env_from_conf_rejects_existing_codex_access_token_env() {
+        let conf = KeychainConf {
+            service: "codex-pat".to_string(),
+            account: "test@example.com".to_string(),
+        };
+        let mut envs = BTreeMap::new();
+        envs.insert("CODEX_ACCESS_TOKEN".to_string(), "at-existing".to_string());
+
+        let err = inject_pat_env_from_conf_with_parent_env(
+            "dia4",
+            &mut envs,
+            &conf,
+            |_| false,
+            |_, _| panic!("conflicting env should be rejected before keychain fetch"),
+        )
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("CODEX_ACCESS_TOKEN"));
+        assert_eq!(
+            envs.get("CODEX_ACCESS_TOKEN"),
+            Some(&"at-existing".to_string())
+        );
+    }
+
+    #[test]
+    fn inject_pat_env_from_conf_rejects_parent_auth_env() {
+        let conf = KeychainConf {
+            service: "codex-pat".to_string(),
+            account: "test@example.com".to_string(),
+        };
+        let mut envs = BTreeMap::new();
+
+        let err = inject_pat_env_from_conf_with_parent_env(
+            "dia4",
+            &mut envs,
+            &conf,
+            |key| key == "OPENAI_API_KEY",
+            |_, _| panic!("conflicting parent env should be rejected before keychain fetch"),
+        )
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("parent environment"));
+        assert!(!envs.contains_key("CODEX_ACCESS_TOKEN"));
+    }
+
+    #[test]
+    fn inject_pat_env_from_conf_allows_parent_codex_access_token() {
+        let conf = KeychainConf {
+            service: "codex-pat".to_string(),
+            account: "test@example.com".to_string(),
+        };
+        let mut envs = BTreeMap::new();
+
+        inject_pat_env_from_conf_with_parent_env(
+            "dia4",
+            &mut envs,
+            &conf,
+            |key| key == "CODEX_ACCESS_TOKEN",
+            |_, _| Ok(Some("at-slot".to_string())),
+        )
+        .unwrap();
+
+        assert_eq!(envs.get("CODEX_ACCESS_TOKEN"), Some(&"at-slot".to_string()));
+    }
+
+    #[test]
+    fn inject_pat_env_from_conf_rejects_non_pat_token() {
+        let conf = KeychainConf {
+            service: "codex-pat".to_string(),
+            account: "test@example.com".to_string(),
+        };
+        let mut envs = BTreeMap::new();
+
+        let err = inject_pat_env_from_conf_with_parent_env(
+            "dia4",
+            &mut envs,
+            &conf,
+            |_| false,
+            |_, _| Ok(Some("sk-test".to_string())),
+        )
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("does not contain a PAT"));
+        assert!(!envs.contains_key("CODEX_ACCESS_TOKEN"));
+    }
+
+    #[test]
+    fn inject_pat_env_from_conf_errors_when_keychain_entry_is_missing() {
+        let conf = KeychainConf {
+            service: "codex-pat".to_string(),
+            account: "test@example.com".to_string(),
+        };
+        let mut envs = BTreeMap::new();
+
+        let err = inject_pat_env_from_conf_with_parent_env(
+            "dia4",
+            &mut envs,
+            &conf,
+            |_| false,
+            |_, _| Ok(None),
+        )
+        .unwrap_err();
+
+        let message = format!("{err:#}");
+        assert!(message.contains("Keychain entry codex-pat/test@example.com not found"));
+        assert!(message.contains("keychain-secret set codex-pat test@example.com"));
+        assert!(!envs.contains_key("CODEX_ACCESS_TOKEN"));
+    }
+
+    #[test]
+    fn inject_pat_env_from_conf_propagates_keychain_fetch_errors() {
+        let conf = KeychainConf {
+            service: "codex-pat".to_string(),
+            account: "test@example.com".to_string(),
+        };
+        let mut envs = BTreeMap::new();
+
+        let err = inject_pat_env_from_conf_with_parent_env(
+            "dia4",
+            &mut envs,
+            &conf,
+            |_| false,
+            |_, _| Err(anyhow::anyhow!("security wait failed")),
+        )
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("security wait failed"));
+        assert!(!envs.contains_key("CODEX_ACCESS_TOKEN"));
+    }
 }

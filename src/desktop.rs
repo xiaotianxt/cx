@@ -127,7 +127,17 @@ fn spawn_desktop_session_watcher(
 }
 
 fn ensure_desktop_not_running(allow_parallel: bool) -> Result<()> {
-    ensure_no_running_desktop(allow_parallel, running_desktop_process()?)
+    ensure_desktop_not_running_with(allow_parallel, running_desktop_process)
+}
+
+fn ensure_desktop_not_running_with<F>(allow_parallel: bool, running: F) -> Result<()>
+where
+    F: FnOnce() -> Result<Option<RunningDesktop>>,
+{
+    if allow_parallel {
+        return Ok(());
+    }
+    ensure_no_running_desktop(false, running()?)
 }
 
 fn ensure_no_running_desktop(allow_parallel: bool, running: Option<RunningDesktop>) -> Result<()> {
@@ -259,8 +269,10 @@ fn build_desktop_launch_spec(
         run::CODEX_SQLITE_HOME.to_string(),
         sqlite_home.display().to_string(),
     );
+    run::inject_keychain_access_token(&slot_dir, selected_slot, &mut envs)?;
     let workspace_root = desktop_workspace_root(&args, launch_cwd);
     let args = ensure_open_project_arg(args, launch_cwd);
+    let args = prepend_desktop_app_arg(&app_bin, args);
 
     Ok(DesktopLaunchSpec {
         program: app_bin,
@@ -280,6 +292,22 @@ fn ensure_open_project_arg(mut args: Vec<OsString>, workspace_root: &Path) -> Ve
         args.push(workspace_root.as_os_str().to_os_string());
     }
     args
+}
+
+fn prepend_desktop_app_arg(app_bin: &Path, args: Vec<OsString>) -> Vec<OsString> {
+    let Some(app_payload) = desktop_app_payload(app_bin) else {
+        return args;
+    };
+    let mut with_payload = Vec::with_capacity(args.len() + 1);
+    with_payload.push(app_payload.into_os_string());
+    with_payload.extend(args);
+    with_payload
+}
+
+fn desktop_app_payload(app_bin: &Path) -> Option<PathBuf> {
+    let contents_dir = app_bin.parent()?.parent()?;
+    let payload = contents_dir.join("Resources/app.asar");
+    payload.exists().then_some(payload)
 }
 
 fn desktop_workspace_root(args: &[OsString], launch_cwd: &Path) -> PathBuf {
@@ -355,6 +383,14 @@ mod tests {
     }
 
     #[test]
+    fn running_desktop_guard_skips_probe_when_parallel_is_allowed() {
+        ensure_desktop_not_running_with(true, || {
+            panic!("allow-parallel should skip the desktop process probe");
+        })
+        .unwrap();
+    }
+
+    #[test]
     fn pgrep_pid_parser_ignores_non_pid_lines() {
         assert_eq!(parse_pgrep_pids(b"123\nnot-a-pid\n456\n"), vec![123, 456]);
     }
@@ -426,6 +462,39 @@ mod tests {
     }
 
     #[test]
+    fn desktop_spec_rejects_api_key_env_when_keychain_conf_is_present() {
+        let root = temp_root("desktop_keychain_api_key_conflict");
+        let base = root.join(".codex");
+        let manager = base.join("profile-manager");
+        let cwd = root.join("work");
+        let paths = ManagerPaths::from_roots(base, manager);
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(paths.slot_home("bus1")).unwrap();
+        fs::write(
+            paths.slot_dir("bus1").join("keychain.conf"),
+            "service=codex-pat\naccount=test@example.com\n",
+        )
+        .unwrap();
+        fs::write(
+            paths.slot_dir("bus1").join("env.conf"),
+            "OPENAI_API_KEY=sk-test\n",
+        )
+        .unwrap();
+
+        let err = build_desktop_launch_spec(
+            &paths,
+            PathBuf::from("/tmp/Codex"),
+            "bus1",
+            None,
+            &cwd,
+            Vec::new(),
+        )
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("OPENAI_API_KEY"));
+    }
+
+    #[test]
     fn desktop_spec_does_not_forward_codex_overrides_to_electron() {
         let root = temp_root("desktop_spec_does_not_forward_codex_overrides_to_electron");
         let base = root.join(".codex");
@@ -454,6 +523,35 @@ mod tests {
             spec.args,
             vec![
                 OsString::from("--enable-logging"),
+                OsString::from("--open-project"),
+                cwd.as_os_str().to_os_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn desktop_spec_prepends_app_payload_for_direct_electron_launch() {
+        let root = temp_root("desktop_spec_prepends_app_payload_for_direct_electron_launch");
+        let base = root.join(".codex");
+        let manager = base.join("profile-manager");
+        let cwd = root.join("work");
+        let app_bin = root.join("Codex.app/Contents/MacOS/Codex");
+        let app_payload = root.join("Codex.app/Contents/Resources/app.asar");
+        let paths = ManagerPaths::from_roots(base, manager);
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(paths.slot_home("bus1")).unwrap();
+        fs::create_dir_all(app_bin.parent().unwrap()).unwrap();
+        fs::create_dir_all(app_payload.parent().unwrap()).unwrap();
+        fs::write(&app_bin, "").unwrap();
+        fs::write(&app_payload, "").unwrap();
+
+        let spec =
+            build_desktop_launch_spec(&paths, app_bin, "bus1", None, &cwd, Vec::new()).unwrap();
+
+        assert_eq!(
+            spec.args,
+            vec![
+                app_payload.into_os_string(),
                 OsString::from("--open-project"),
                 cwd.as_os_str().to_os_string(),
             ]

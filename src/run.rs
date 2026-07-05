@@ -391,34 +391,7 @@ pub(crate) fn build_slot_command_spec(
     }
     insert_sqlite_home_env(&mut envs, paths.slot_sqlite_home(selected_slot))?;
 
-    // Inject CODEX_ACCESS_TOKEN from Keychain if keychain.conf is present.
-    if let Some(conf) = keychain::read_keychain_conf(&slot_dir)? {
-        if envs.contains_key("CODEX_ACCESS_TOKEN")
-            || envs.contains_key("CODEX_API_KEY")
-            || envs.contains_key("OPENAI_API_KEY")
-        {
-            anyhow::bail!(
-                "slot {}: CODEX_ACCESS_TOKEN, CODEX_API_KEY, or OPENAI_API_KEY already set in env.conf/target; remove one auth source (keychain.conf is also present)",
-                selected_slot
-            );
-        }
-        let pat = keychain::fetch_pat_from_keychain(&conf.service, &conf.account)?.with_context(
-            || {
-                format!(
-                    "Keychain entry {}/{} not found; run `keychain-secret set {} {}`",
-                    conf.service, conf.account, conf.service, conf.account
-                )
-            },
-        )?;
-        if !keychain::is_pat(&pat) {
-            anyhow::bail!(
-                "Keychain entry {}/{} does not contain a PAT (expected `at-` prefix)",
-                conf.service,
-                conf.account
-            );
-        }
-        envs.insert("CODEX_ACCESS_TOKEN".to_string(), pat);
-    }
+    inject_keychain_access_token(&slot_dir, selected_slot, &mut envs)?;
 
     let mut args = Vec::new();
     for override_line in overrides {
@@ -436,6 +409,14 @@ pub(crate) fn build_slot_command_spec(
         target_name,
         launch_context: CodexLaunchContext::Slot,
     })
+}
+
+pub(crate) fn inject_keychain_access_token(
+    slot_dir: &Path,
+    selected_slot: &str,
+    envs: &mut BTreeMap<String, String>,
+) -> Result<()> {
+    keychain::inject_pat_env_from_keychain(slot_dir, selected_slot, envs)
 }
 
 fn exec_slot_codex(

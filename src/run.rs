@@ -253,9 +253,7 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
         let mut codex_args = options.codex_args;
         append_auto_resume_args_if_missing(
             &mut codex_args,
-            auto_resume_candidate
-                .as_ref()
-                .map(|candidate| candidate.session_id.as_str()),
+            auto_resume_session_for_selected_slot(auto_resume_candidate.as_ref(), "default"),
         );
         return exec_real_codex(&real_codex, codex_args);
     }
@@ -271,7 +269,8 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
             usage_query_options(),
             &mut progress,
         )?;
-        let selected = choose_launch_result(&results);
+        let selected = auto_resume_result_from_results(auto_resume_candidate.as_ref(), &results)
+            .or_else(|| choose_launch_result(&results));
         if options.debug || std::env::var_os("CX_SLOT_DEBUG").is_some() {
             crate::output::print_report(
                 &results,
@@ -425,24 +424,9 @@ fn exec_slot_codex(
         options.codex_args,
     )?;
     let explicit_resume = explicit_resume_id(&spec.args);
-    let resumed_id = append_auto_resume_args_if_missing(
-        &mut spec.args,
-        resume_launch
-            .auto_candidate
-            .as_ref()
-            .map(|candidate| candidate.session_id.as_str()),
-    );
-
-    if let (Some(key), Some(resume_id)) = (resume_launch.key.as_ref(), explicit_resume.as_ref()) {
-        let _ = terminal_resume::record_resume_state(
-            paths,
-            key,
-            selected_slot,
-            &resume_launch.cwd,
-            resume_id.as_str(),
-            None,
-        );
-    }
+    let auto_resume_session_id =
+        auto_resume_session_for_selected_slot(resume_launch.auto_candidate.as_ref(), selected_slot);
+    let resumed_id = append_auto_resume_args_if_missing(&mut spec.args, auto_resume_session_id);
 
     if resume_launch.direct_launch || explicit_resume.is_some() {
         if let Some(key) = resume_launch.key.as_ref() {
@@ -482,6 +466,25 @@ fn append_auto_resume_args_if_missing(
     let session_id = auto_session_id?;
     append_resume_args(args, session_id);
     Some(ExplicitResumeId::parse(session_id))
+}
+
+fn auto_resume_session_for_selected_slot<'a>(
+    candidate: Option<&'a ResumeCandidate>,
+    selected_slot: &str,
+) -> Option<&'a str> {
+    candidate
+        .filter(|candidate| candidate.slot == selected_slot)
+        .map(|candidate| candidate.session_id.as_str())
+}
+
+fn auto_resume_result_from_results<'a>(
+    candidate: Option<&'a ResumeCandidate>,
+    results: &'a [crate::usage::SlotResult],
+) -> Option<&'a crate::usage::SlotResult> {
+    let candidate = candidate?;
+    results
+        .iter()
+        .find(|result| result.slot == candidate.slot && result.is_available())
 }
 
 fn auto_resume_candidate_for_launch(
@@ -933,7 +936,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_resume_does_not_bias_slot_selection() {
+    fn plain_slot_selection_still_uses_usage_score() {
         let state = crate::terminal_resume::test_resume_state(
             "dia7",
             PathBuf::from("/tmp/cx-run-test-project"),
@@ -963,46 +966,95 @@ mod tests {
     }
 
     #[test]
-    fn auto_resume_args_survive_rotated_selected_slot() {
-        let state = crate::terminal_resume::test_resume_state(
-            "dia7",
-            PathBuf::from("/tmp/cx-run-test-project"),
-        );
+    fn auto_resume_prefers_recorded_slot_when_available() {
+        let candidate = ResumeCandidate {
+            slot: "ollama".to_string(),
+            cwd: PathBuf::from("/tmp/cx-run-test-project"),
+            session_id: "session-1".to_string(),
+            rollout_path: None,
+        };
         let results = vec![
             crate::usage::SlotResult::new(
-                "dia7",
+                "dia4",
                 0,
                 crate::usage::SlotStatus::Available,
-                10.0,
-                "resume",
+                95.0,
+                "fresh",
             ),
             crate::usage::SlotResult::new(
-                "bus1",
+                "ollama",
                 1,
-                crate::usage::SlotStatus::Available,
-                80.0,
-                "fresh",
+                crate::usage::SlotStatus::ExternalProvider,
+                100.0,
+                "external provider slot",
             ),
         ];
 
         assert_eq!(
-            choose_launch_result(&results).map(|result| result.slot.as_str()),
-            Some("bus1")
+            auto_resume_result_from_results(Some(&candidate), &results)
+                .map(|result| result.slot.as_str()),
+            Some("ollama"),
         );
+    }
+
+    #[test]
+    fn auto_resume_does_not_prefer_missing_recorded_slot() {
+        let candidate = ResumeCandidate {
+            slot: "ollama".to_string(),
+            cwd: PathBuf::from("/tmp/cx-run-test-project"),
+            session_id: "session-1".to_string(),
+            rollout_path: None,
+        };
+        let results = vec![crate::usage::SlotResult::new(
+            "ollama",
+            0,
+            crate::usage::SlotStatus::Missing,
+            -1.0,
+            "missing slot home",
+        )];
+
+        assert!(auto_resume_result_from_results(Some(&candidate), &results).is_none());
+    }
+
+    #[test]
+    fn auto_resume_does_not_cross_slots() {
+        let candidate = ResumeCandidate {
+            slot: "ollama".to_string(),
+            cwd: PathBuf::from("/tmp/cx-run-test-project"),
+            session_id: "session-1".to_string(),
+            rollout_path: None,
+        };
         let mut args = Vec::new();
+        let auto_session_id = auto_resume_session_for_selected_slot(Some(&candidate), "dia4");
 
-        let resumed =
-            append_auto_resume_args_if_missing(&mut args, Some(state.session_id.as_str()));
+        let resumed = append_auto_resume_args_if_missing(&mut args, auto_session_id);
+
+        assert_eq!(resumed, None);
+        assert!(args.is_empty());
+    }
+
+    #[test]
+    fn no_rotation_fallback_only_auto_resumes_default_slot() {
+        let slot_candidate = ResumeCandidate {
+            slot: "ollama".to_string(),
+            cwd: PathBuf::from("/tmp/cx-run-test-project"),
+            session_id: "slot-session".to_string(),
+            rollout_path: None,
+        };
+        let default_candidate = ResumeCandidate {
+            slot: "default".to_string(),
+            cwd: PathBuf::from("/tmp/cx-run-test-project"),
+            session_id: "default-session".to_string(),
+            rollout_path: None,
+        };
 
         assert_eq!(
-            resumed,
-            Some(ExplicitResumeId::AppThreadOrCodexSession(String::from(
-                "session-1"
-            )))
+            auto_resume_session_for_selected_slot(Some(&slot_candidate), "default"),
+            None,
         );
         assert_eq!(
-            args,
-            vec![OsString::from("resume"), OsString::from("session-1")]
+            auto_resume_session_for_selected_slot(Some(&default_candidate), "default"),
+            Some("default-session"),
         );
     }
 

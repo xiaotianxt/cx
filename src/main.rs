@@ -14,6 +14,7 @@ mod prime;
 mod resume_id;
 mod run;
 mod selector;
+mod session_scrub;
 mod slot;
 mod stats;
 mod target;

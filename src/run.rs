@@ -424,6 +424,29 @@ fn exec_slot_codex(
         options.codex_args,
     )?;
     let explicit_resume = explicit_resume_id(&spec.args);
+    let explicit_resume = if let Some(resume_id) = explicit_resume {
+        let prepared = crate::session_scrub::prepare_cross_slot_resume(
+            paths,
+            selected_slot,
+            resume_id.as_str(),
+        )?;
+        if prepared.scrubbed {
+            replace_explicit_resume_id(&mut spec.args, resume_id.as_str(), &prepared.session_id);
+            if !options.quiet {
+                eprintln!(
+                    "cx resume scrubbed: {} -> {} for slot {}",
+                    resume_id.as_str(),
+                    prepared.session_id,
+                    selected_slot
+                );
+            }
+            Some(ExplicitResumeId::parse(prepared.session_id))
+        } else {
+            Some(resume_id)
+        }
+    } else {
+        None
+    };
     let auto_resume_session_id =
         auto_resume_session_for_selected_slot(resume_launch.auto_candidate.as_ref(), selected_slot);
     let resumed_id = append_auto_resume_args_if_missing(&mut spec.args, auto_resume_session_id);
@@ -454,6 +477,28 @@ fn exec_slot_codex(
 fn append_resume_args(args: &mut Vec<OsString>, session_id: &str) {
     args.push(OsString::from("resume"));
     args.push(OsString::from(session_id));
+}
+
+fn replace_explicit_resume_id(args: &mut [OsString], old_session_id: &str, new_session_id: &str) {
+    let mut index = 0;
+    while index < args.len() {
+        let arg_text = args[index].to_string_lossy();
+        if arg_text.starts_with('-') {
+            index += match codex_option_kind(arg_text.as_ref()) {
+                CodexOptionKind::Flag | CodexOptionKind::Unknown => 1,
+                CodexOptionKind::Value => 2,
+            };
+            continue;
+        }
+        if arg_text == "resume" {
+            if let Some(value) = args.get_mut(index + 1) {
+                if value == old_session_id {
+                    *value = OsString::from(new_session_id);
+                }
+            }
+        }
+        return;
+    }
 }
 
 fn append_auto_resume_args_if_missing(
@@ -932,6 +977,28 @@ mod tests {
         assert_eq!(
             args,
             vec![OsString::from("resume"), OsString::from("thread-explicit"),]
+        );
+    }
+
+    #[test]
+    fn explicit_resume_id_can_be_replaced_after_scrub() {
+        let mut args = vec![
+            OsString::from("-m"),
+            OsString::from("gpt-5.5"),
+            OsString::from("resume"),
+            OsString::from("old-session"),
+        ];
+
+        replace_explicit_resume_id(&mut args, "old-session", "new-session");
+
+        assert_eq!(
+            args,
+            vec![
+                OsString::from("-m"),
+                OsString::from("gpt-5.5"),
+                OsString::from("resume"),
+                OsString::from("new-session"),
+            ]
         );
     }
 

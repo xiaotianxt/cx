@@ -1,6 +1,6 @@
 [package]
 name = "cx"
-version = "0.4.30"
+version = "0.4.31"
 edition = "2021"
 description = "Fast local Codex launcher, stdin wrapper, and slot manager"
 authors = ["yupeit"]
@@ -25,6 +25,10 @@ rusqlite = "0.40"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+aes = "0.8"
+cbc = "0.1"
+pbkdf2 = "0.12"
+sha1 = "0.10"
 wait-timeout = "0.2"
 time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
 toml = "1.1"

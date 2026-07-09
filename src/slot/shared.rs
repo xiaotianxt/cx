@@ -73,7 +73,9 @@ impl SharedProfile {
     }
 
     pub(crate) fn is_blacklisted(name: &str) -> bool {
-        CODEX_SLOT_PRIVATE_RESOURCES.iter().any(|blocked| *blocked == name)
+        CODEX_SLOT_PRIVATE_RESOURCES
+            .iter()
+            .any(|blocked| *blocked == name)
     }
 
     pub(crate) fn is_known_shared(name: &str) -> bool {

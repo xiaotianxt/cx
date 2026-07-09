@@ -102,9 +102,7 @@ impl<'a> SlotMaterializer<'a> {
                 None => continue,
             };
 
-            if SharedProfile::is_known_shared(name_str)
-                || SharedProfile::is_blacklisted(name_str)
-            {
+            if SharedProfile::is_known_shared(name_str) || SharedProfile::is_blacklisted(name_str) {
                 continue;
             }
 

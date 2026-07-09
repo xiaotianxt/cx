@@ -17,6 +17,7 @@ use crate::auth;
 use crate::paths::ManagerPaths;
 use crate::slot;
 
+mod ollama;
 mod payload;
 mod score;
 
@@ -117,6 +118,24 @@ impl UsageChecker {
         let mut account_label = auth.account_label();
         if auth.access_token.is_none() {
             if auth.api_key.is_some() {
+                // Ollama Cloud slots: scrape ollama.com/settings via Helium
+                // browser cookies for real usage data. Falls back to a plain
+                // 100-score slot if cookies are unavailable.
+                if auth.provider.as_deref() == Some("ollama") {
+                    match ollama::query(slot, index, account_label.clone(), &self.client) {
+                        Ok(result) => return Ok(result),
+                        Err(err) => {
+                            return Ok(SlotResult::new(
+                                slot,
+                                index,
+                                SlotStatus::ExternalProvider,
+                                100.0,
+                                format!("ollama usage unavailable: {err:#}"),
+                            )
+                            .with_account_label(account_label));
+                        }
+                    }
+                }
                 return Ok(SlotResult::new(
                     slot,
                     index,

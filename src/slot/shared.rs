@@ -40,6 +40,10 @@ impl SharedResource {
         }
     }
 
+    pub(crate) fn name(self) -> &'static str {
+        self.name
+    }
+
     pub(crate) fn kind(self) -> SharedResourceKind {
         self.kind
     }
@@ -66,6 +70,17 @@ impl SharedProfile {
 
     pub(crate) fn resources(self) -> &'static [SharedResource] {
         self.resources
+    }
+
+    pub(crate) fn is_blacklisted(name: &str) -> bool {
+        CODEX_SLOT_PRIVATE_RESOURCES.iter().any(|blocked| *blocked == name)
+    }
+
+    pub(crate) fn is_known_shared(name: &str) -> bool {
+        Self::codex_slot_default()
+            .resources()
+            .iter()
+            .any(|resource| resource.name() == name)
     }
 }
 
@@ -160,4 +175,44 @@ const CODEX_SLOT_SHARED_RESOURCES: &[SharedResource] = &[
         SharedResourceKind::RegularFile,
         SlotCreationPolicy::LinkWhenCanonicalExists,
     ),
+    SharedResource::new(
+        "hooks.json",
+        SharedResourceKind::RegularFile,
+        SlotCreationPolicy::LinkWhenCanonicalExists,
+    ),
+    SharedResource::new(
+        "herdr-agent-state.sh",
+        SharedResourceKind::RegularFile,
+        SlotCreationPolicy::LinkWhenCanonicalExists,
+    ),
+];
+
+/// Files and directories that must stay slot-private and must never be
+/// symlinked from the base CODEX_HOME.
+const CODEX_SLOT_PRIVATE_RESOURCES: &[&str] = &[
+    "auth.json",
+    "auth.json.oauth.bak",
+    "keychain.conf",
+    "keychain-meta.json",
+    "overrides.conf",
+    "env.conf",
+    "sqlite",
+    ".tmp",
+    "tmp",
+    "log",
+    "cache",
+    "computer-use",
+    ".codex-global-state.json",
+    ".codex-global-state.json.bak",
+    ".personality_migration",
+    "state_5.sqlite",
+    "state_5.sqlite-shm",
+    "state_5.sqlite-wal",
+    "profile-manager",
+    "cxrun",
+    "cx-scrubbed-sessions",
+    "archived_sessions",
+    "attachments",
+    "bin",
+    "process_manager",
 ];

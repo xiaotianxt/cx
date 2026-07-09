@@ -73,6 +73,7 @@ impl<'a> SlotMaterializer<'a> {
                 }
             }
         }
+        self.link_unknown_base_resources()?;
         Ok(())
     }
 
@@ -80,6 +81,50 @@ impl<'a> SlotMaterializer<'a> {
         self.create_home()?;
         for resource in self.profile.resources() {
             self.repair_resource(*resource)?;
+        }
+        self.link_unknown_base_resources()?;
+        Ok(())
+    }
+
+    /// Scan the base CODEX_HOME for files/dirs not in the known shared whitelist
+    /// and not in the private blacklist. Link any that are missing from the slot
+    /// so new Codex-added resources are picked up automatically. Emit a warning
+    /// for each newly discovered resource so the user can review whether it
+    /// should be added to the explicit whitelist or the private blacklist.
+    fn link_unknown_base_resources(&self) -> Result<()> {
+        let Ok(entries) = fs::read_dir(&self.paths.base_codex_home) else {
+            return Ok(());
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = match name.to_str() {
+                Some(s) => s,
+                None => continue,
+            };
+
+            if SharedProfile::is_known_shared(name_str)
+                || SharedProfile::is_blacklisted(name_str)
+            {
+                continue;
+            }
+
+            let canonical_path = entry.path();
+            let slot_path = self.slot_home.join(&name);
+
+            if is_symlink_to(&slot_path, &canonical_path)? {
+                continue;
+            }
+
+            if slot_path.exists() || is_symlink(&slot_path) {
+                continue;
+            }
+
+            eprintln!(
+                "cx: warning: linking unknown base resource '{}' into slot '{}' (not in shared whitelist; add to shared.rs if intentional, or to the private blacklist if it should stay slot-private)",
+                name_str,
+                self.slot
+            );
+            link_if_safe(&canonical_path, &slot_path)?;
         }
         Ok(())
     }

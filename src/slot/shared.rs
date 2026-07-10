@@ -73,7 +73,7 @@ impl SharedProfile {
     }
 
     pub(crate) fn is_blacklisted(name: &str) -> bool {
-        CODEX_SLOT_PRIVATE_RESOURCES.contains(&name)
+        CODEX_SLOT_PRIVATE_RESOURCES.contains(&name) || name.starts_with("config.toml.bak-")
     }
 
     pub(crate) fn is_known_shared(name: &str) -> bool {
@@ -117,6 +117,11 @@ const CODEX_SLOT_SHARED_RESOURCES: &[SharedResource] = &[
     ),
     SharedResource::new(
         "models_cache.json",
+        SharedResourceKind::RegularFile,
+        SlotCreationPolicy::LinkWhenCanonicalExists,
+    ),
+    SharedResource::new(
+        "models_catalog_static.json",
         SharedResourceKind::RegularFile,
         SlotCreationPolicy::LinkWhenCanonicalExists,
     ),
@@ -208,6 +213,9 @@ const CODEX_SLOT_PRIVATE_RESOURCES: &[&str] = &[
     "state_5.sqlite",
     "state_5.sqlite-shm",
     "state_5.sqlite-wal",
+    "logs_2.sqlite",
+    "logs_2.sqlite-shm",
+    "logs_2.sqlite-wal",
     "profile-manager",
     "cxrun",
     "cx-scrubbed-sessions",

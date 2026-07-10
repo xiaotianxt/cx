@@ -652,6 +652,13 @@ mod tests {
         fs::write(paths.base_codex_home.join("config.toml"), "").unwrap();
         fs::write(paths.base_codex_home.join("history.jsonl"), "base\n").unwrap();
         fs::write(paths.base_codex_home.join("state_5.sqlite"), "").unwrap();
+        fs::write(paths.base_codex_home.join("logs_2.sqlite"), "").unwrap();
+        fs::write(
+            paths.base_codex_home.join("models_catalog_static.json"),
+            "{}\n",
+        )
+        .unwrap();
+        fs::write(paths.base_codex_home.join("config.toml.bak-20260709"), "").unwrap();
 
         ensure_slot_layout(&paths, "dia1").unwrap();
 
@@ -666,6 +673,16 @@ mod tests {
         )
         .unwrap());
         assert!(!paths.slot_home("dia1").join("state_5.sqlite").exists());
+        assert!(!paths.slot_home("dia1").join("logs_2.sqlite").exists());
+        assert!(is_symlink_to(
+            &paths.slot_home("dia1").join("models_catalog_static.json"),
+            &paths.base_codex_home.join("models_catalog_static.json")
+        )
+        .unwrap());
+        assert!(!paths
+            .slot_home("dia1")
+            .join("config.toml.bak-20260709")
+            .exists());
 
         let _ = fs::remove_dir_all(&paths.manager_dir);
         let _ = fs::remove_dir_all(&paths.base_codex_home);

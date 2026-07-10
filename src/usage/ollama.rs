@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -75,8 +77,9 @@ pub(super) fn query(
     index: usize,
     account_label: Option<String>,
     client: &Client,
+    envs: &BTreeMap<String, String>,
 ) -> Result<SlotResult> {
-    let sources = BrowserCookieSource::configured_sources()?;
+    let sources = BrowserCookieSource::configured_sources(envs)?;
     let mut failures = Vec::new();
     for source in sources {
         match query_from_source(&source, client) {
@@ -94,30 +97,30 @@ fn query_from_source(source: &BrowserCookieSource, client: &Client) -> Result<Ol
 }
 
 impl BrowserCookieSource {
-    fn configured_sources() -> Result<Vec<Self>> {
-        if let Some(source) = Self::from_env()? {
+    fn configured_sources(envs: &BTreeMap<String, String>) -> Result<Vec<Self>> {
+        if let Some(source) = Self::from_env(envs)? {
             return Ok(vec![source]);
         }
-        let requested = std::env::var("CX_OLLAMA_COOKIE_SOURCE")
+        let requested = env_value(envs, "CX_OLLAMA_COOKIE_SOURCE")
             .unwrap_or_else(|_| "auto".to_string())
             .to_ascii_lowercase();
         match requested.as_str() {
-            "auto" => Ok(vec![Self::helium()?, Self::chrome()?]),
+            "auto" => Ok(vec![Self::helium()?, Self::chrome_with_env(envs)?]),
             "helium" => Ok(vec![Self::helium()?]),
-            "chrome" => Ok(vec![Self::chrome()?]),
+            "chrome" => Ok(vec![Self::chrome_with_env(envs)?]),
             other => bail!(
                 "unsupported CX_OLLAMA_COOKIE_SOURCE={other}; expected auto, helium, or chrome"
             ),
         }
     }
 
-    fn from_env() -> Result<Option<Self>> {
-        let Some(cookie_db) = std::env::var_os("CX_OLLAMA_COOKIE_DB") else {
+    fn from_env(envs: &BTreeMap<String, String>) -> Result<Option<Self>> {
+        let Some(cookie_db) = env_os_value(envs, "CX_OLLAMA_COOKIE_DB") else {
             return Ok(None);
         };
-        let keychain_service = std::env::var("CX_OLLAMA_KEYCHAIN_SERVICE")
+        let keychain_service = env_value(envs, "CX_OLLAMA_KEYCHAIN_SERVICE")
             .unwrap_or_else(|_| CHROME_KEYCHAIN_SERVICE.to_string());
-        let keychain_account = std::env::var("CX_OLLAMA_KEYCHAIN_ACCOUNT")
+        let keychain_account = env_value(envs, "CX_OLLAMA_KEYCHAIN_ACCOUNT")
             .unwrap_or_else(|_| CHROME_KEYCHAIN_ACCOUNT.to_string());
         Ok(Some(Self {
             name: "custom".to_string(),
@@ -139,11 +142,11 @@ impl BrowserCookieSource {
         })
     }
 
-    fn chrome() -> Result<Self> {
+    fn chrome_with_env(envs: &BTreeMap<String, String>) -> Result<Self> {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .ok_or_else(|| anyhow!("HOME is not set"))?;
-        let profile = std::env::var("CX_OLLAMA_CHROME_PROFILE")
+        let profile = env_value(envs, "CX_OLLAMA_CHROME_PROFILE")
             .unwrap_or_else(|_| CHROME_DEFAULT_PROFILE.to_string());
         Ok(Self {
             name: format!("chrome/{profile}"),
@@ -152,6 +155,27 @@ impl BrowserCookieSource {
             keychain_account: CHROME_KEYCHAIN_ACCOUNT.to_string(),
         })
     }
+
+    #[cfg(test)]
+    fn chrome() -> Result<Self> {
+        Self::chrome_with_env(&BTreeMap::new())
+    }
+}
+
+fn env_value(
+    envs: &BTreeMap<String, String>,
+    key: &str,
+) -> std::result::Result<String, std::env::VarError> {
+    envs.get(key)
+        .cloned()
+        .ok_or(std::env::VarError::NotPresent)
+        .or_else(|_| std::env::var(key))
+}
+
+fn env_os_value(envs: &BTreeMap<String, String>, key: &str) -> Option<OsString> {
+    envs.get(key)
+        .map(OsString::from)
+        .or_else(|| std::env::var_os(key))
 }
 
 fn read_ollama_cookies(source: &BrowserCookieSource) -> Result<Vec<(String, String)>> {
@@ -460,7 +484,7 @@ mod tests {
         std::env::set_var("CX_OLLAMA_KEYCHAIN_ACCOUNT", "Custom Account");
         std::env::set_var("CX_OLLAMA_COOKIE_SOURCE", "helium");
 
-        let sources = BrowserCookieSource::configured_sources().expect("sources");
+        let sources = BrowserCookieSource::configured_sources(&BTreeMap::new()).expect("sources");
 
         assert_eq!(sources.len(), 1);
         assert_eq!(sources[0].name, "custom");
@@ -472,5 +496,28 @@ mod tests {
         std::env::remove_var("CX_OLLAMA_KEYCHAIN_SERVICE");
         std::env::remove_var("CX_OLLAMA_KEYCHAIN_ACCOUNT");
         std::env::remove_var("CX_OLLAMA_COOKIE_SOURCE");
+    }
+
+    #[test]
+    fn slot_env_selects_chrome_profile_for_configured_sources() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("CX_OLLAMA_COOKIE_DB");
+        std::env::remove_var("CX_OLLAMA_COOKIE_SOURCE");
+        std::env::remove_var("CX_OLLAMA_CHROME_PROFILE");
+        let envs = BTreeMap::from([
+            ("CX_OLLAMA_COOKIE_SOURCE".to_string(), "chrome".to_string()),
+            (
+                "CX_OLLAMA_CHROME_PROFILE".to_string(),
+                "Profile 5".to_string(),
+            ),
+        ]);
+
+        let sources = BrowserCookieSource::configured_sources(&envs).expect("sources");
+
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].name, "chrome/Profile 5");
+        assert!(sources[0]
+            .cookie_db
+            .ends_with("Google/Chrome/Profile 5/Cookies"));
     }
 }

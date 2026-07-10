@@ -368,14 +368,14 @@ pub fn pat_add(
     let pat = fetch_pat_from_keychain(&args.service, &args.account)?.with_context(|| {
         format!(
             "Keychain entry {} not found; run `keychain-secret set {} {}` first",
-            &args.service, &args.service, &args.account
+            args.service, args.service, args.account
         )
     })?;
     if !is_pat(&pat) {
         anyhow::bail!(
             "Keychain entry {}/{} does not contain a PAT (expected `at-` prefix)",
-            &args.service,
-            &args.account
+            args.service,
+            args.account
         );
     }
 
@@ -406,17 +406,13 @@ pub fn pat_check(
     let slot_dir = paths.slot_dir(&args.slot);
     let conf = read_keychain_conf(&slot_dir)?
         .with_context(|| format!("no keychain.conf for slot {}", args.slot))?;
-    let pat = fetch_pat_from_keychain(&conf.service, &conf.account)?.with_context(|| {
-        format!(
-            "Keychain entry {}/{} not found",
-            &conf.service, &conf.account
-        )
-    })?;
+    let pat = fetch_pat_from_keychain(&conf.service, &conf.account)?
+        .with_context(|| format!("Keychain entry {}/{} not found", conf.service, conf.account))?;
     if !is_pat(&pat) {
         anyhow::bail!(
             "Keychain entry {}/{} does not contain a PAT (expected `at-` prefix)",
-            &conf.service,
-            &conf.account
+            conf.service,
+            conf.account
         );
     }
     let envs = crate::envfile::read_env_file(&slot_dir.join("env.conf"))?;
@@ -461,12 +457,8 @@ pub fn pat_refresh(
     let slot_dir = paths.slot_dir(&args.slot);
     let conf = read_keychain_conf(&slot_dir)?
         .with_context(|| format!("no keychain.conf for slot {}", args.slot))?;
-    let pat = fetch_pat_from_keychain(&conf.service, &conf.account)?.with_context(|| {
-        format!(
-            "Keychain entry {}/{} not found",
-            &conf.service, &conf.account
-        )
-    })?;
+    let pat = fetch_pat_from_keychain(&conf.service, &conf.account)?
+        .with_context(|| format!("Keychain entry {}/{} not found", conf.service, conf.account))?;
     let envs = crate::envfile::read_env_file(&slot_dir.join("env.conf"))?;
     let client = reqwest::blocking::Client::builder()
         .timeout(whoami_timeout())

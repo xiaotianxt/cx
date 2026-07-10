@@ -32,6 +32,10 @@ const SETTINGS_URL: &str = "https://ollama.com/settings";
 const HELIUM_COOKIE_DB: &str = "Library/Application Support/net.imput.helium/Default/Cookies";
 const HELIUM_KEYCHAIN_SERVICE: &str = "Helium Storage Key";
 const HELIUM_KEYCHAIN_ACCOUNT: &str = "Helium";
+const CHROME_ROOT: &str = "Library/Application Support/Google/Chrome";
+const CHROME_DEFAULT_PROFILE: &str = "Default";
+const CHROME_KEYCHAIN_SERVICE: &str = "Chrome Safe Storage";
+const CHROME_KEYCHAIN_ACCOUNT: &str = "Chrome";
 const OLLAMA_HOST: &str = "ollama.com";
 const SESSION_COOKIE: &str = "__Secure-session";
 const AID_COOKIE: &str = "aid";
@@ -45,9 +49,10 @@ type Aes128CbcDec = cbc::Decryptor<Aes128>;
 
 #[derive(Debug, Clone)]
 struct BrowserCookieSource {
+    name: String,
     cookie_db: PathBuf,
-    keychain_service: &'static str,
-    keychain_account: &'static str,
+    keychain_service: String,
+    keychain_account: String,
 }
 
 #[derive(Debug, Clone)]
@@ -71,22 +76,80 @@ pub(super) fn query(
     account_label: Option<String>,
     client: &Client,
 ) -> Result<SlotResult> {
-    let source = BrowserCookieSource::helium()?;
-    let cookies = read_ollama_cookies(&source)?;
+    let sources = BrowserCookieSource::configured_sources()?;
+    let mut failures = Vec::new();
+    for source in sources {
+        match query_from_source(&source, client) {
+            Ok(usage) => return Ok(result_from_usage(slot, index, account_label, usage)),
+            Err(err) => failures.push(format!("{}: {err:#}", source.name)),
+        }
+    }
+    bail!("all Ollama cookie sources failed: {}", failures.join("; "))
+}
+
+fn query_from_source(source: &BrowserCookieSource, client: &Client) -> Result<OllamaUsage> {
+    let cookies = read_ollama_cookies(source)?;
     let html = fetch_settings(client, &cookies)?;
-    let usage = parse_settings_usage(&html).context("parse Ollama settings usage")?;
-    Ok(result_from_usage(slot, index, account_label, usage))
+    parse_settings_usage(&html).context("parse Ollama settings usage")
 }
 
 impl BrowserCookieSource {
+    fn configured_sources() -> Result<Vec<Self>> {
+        if let Some(source) = Self::from_env()? {
+            return Ok(vec![source]);
+        }
+        let requested = std::env::var("CX_OLLAMA_COOKIE_SOURCE")
+            .unwrap_or_else(|_| "auto".to_string())
+            .to_ascii_lowercase();
+        match requested.as_str() {
+            "auto" => Ok(vec![Self::helium()?, Self::chrome()?]),
+            "helium" => Ok(vec![Self::helium()?]),
+            "chrome" => Ok(vec![Self::chrome()?]),
+            other => bail!(
+                "unsupported CX_OLLAMA_COOKIE_SOURCE={other}; expected auto, helium, or chrome"
+            ),
+        }
+    }
+
+    fn from_env() -> Result<Option<Self>> {
+        let Some(cookie_db) = std::env::var_os("CX_OLLAMA_COOKIE_DB") else {
+            return Ok(None);
+        };
+        let keychain_service = std::env::var("CX_OLLAMA_KEYCHAIN_SERVICE")
+            .unwrap_or_else(|_| CHROME_KEYCHAIN_SERVICE.to_string());
+        let keychain_account = std::env::var("CX_OLLAMA_KEYCHAIN_ACCOUNT")
+            .unwrap_or_else(|_| CHROME_KEYCHAIN_ACCOUNT.to_string());
+        Ok(Some(Self {
+            name: "custom".to_string(),
+            cookie_db: PathBuf::from(cookie_db),
+            keychain_service,
+            keychain_account,
+        }))
+    }
+
     fn helium() -> Result<Self> {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .ok_or_else(|| anyhow!("HOME is not set"))?;
         Ok(Self {
+            name: "helium".to_string(),
             cookie_db: home.join(HELIUM_COOKIE_DB),
-            keychain_service: HELIUM_KEYCHAIN_SERVICE,
-            keychain_account: HELIUM_KEYCHAIN_ACCOUNT,
+            keychain_service: HELIUM_KEYCHAIN_SERVICE.to_string(),
+            keychain_account: HELIUM_KEYCHAIN_ACCOUNT.to_string(),
+        })
+    }
+
+    fn chrome() -> Result<Self> {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow!("HOME is not set"))?;
+        let profile = std::env::var("CX_OLLAMA_CHROME_PROFILE")
+            .unwrap_or_else(|_| CHROME_DEFAULT_PROFILE.to_string());
+        Ok(Self {
+            name: format!("chrome/{profile}"),
+            cookie_db: home.join(CHROME_ROOT).join(profile).join("Cookies"),
+            keychain_service: CHROME_KEYCHAIN_SERVICE.to_string(),
+            keychain_account: CHROME_KEYCHAIN_ACCOUNT.to_string(),
         })
     }
 }
@@ -96,7 +159,7 @@ fn read_ollama_cookies(source: &BrowserCookieSource) -> Result<Vec<(String, Stri
     if rows.is_empty() {
         bail!("no ollama.com cookies in {}", source.cookie_db.display());
     }
-    let password = read_keychain_password(source.keychain_service, source.keychain_account)?;
+    let password = read_keychain_password(&source.keychain_service, &source.keychain_account)?;
     let mut cookies = Vec::new();
     for row in rows {
         let value = decrypt_chromium_cookie(&row.host, &row.encrypted_value, password.as_bytes())
@@ -108,10 +171,7 @@ fn read_ollama_cookies(source: &BrowserCookieSource) -> Result<Vec<(String, Stri
 
 fn read_cookie_rows(path: &Path) -> Result<Vec<CookieRow>> {
     if !path.exists() {
-        bail!(
-            "Helium cookie DB not found at {}; is Helium installed?",
-            path.display()
-        );
+        bail!("cookie DB not found at {}", path.display());
     }
     // Helium holds a SQLite lock while running. Copy the DB (and WAL) to a
     // temp file so we can open it read-only without contending.
@@ -343,6 +403,9 @@ fn unix_now() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn settings_usage_parser_reads_percentages_and_resets() {
@@ -370,5 +433,44 @@ mod tests {
     fn duration_parser_accepts_hours_and_minutes() {
         assert_eq!(parse_duration_seconds("2 hours 5 minutes"), Some(7_500));
         assert_eq!(parse_duration_seconds("7 hours"), Some(25_200));
+    }
+
+    #[test]
+    fn chrome_source_uses_requested_profile() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("CX_OLLAMA_COOKIE_DB");
+        std::env::remove_var("CX_OLLAMA_COOKIE_SOURCE");
+        std::env::set_var("CX_OLLAMA_CHROME_PROFILE", "Profile 5");
+
+        let source = BrowserCookieSource::chrome().expect("chrome source");
+
+        assert_eq!(source.name, "chrome/Profile 5");
+        assert!(source
+            .cookie_db
+            .ends_with("Google/Chrome/Profile 5/Cookies"));
+
+        std::env::remove_var("CX_OLLAMA_CHROME_PROFILE");
+    }
+
+    #[test]
+    fn explicit_cookie_db_overrides_source_selection() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("CX_OLLAMA_COOKIE_DB", "/tmp/ollama-cookies");
+        std::env::set_var("CX_OLLAMA_KEYCHAIN_SERVICE", "Custom Storage");
+        std::env::set_var("CX_OLLAMA_KEYCHAIN_ACCOUNT", "Custom Account");
+        std::env::set_var("CX_OLLAMA_COOKIE_SOURCE", "helium");
+
+        let sources = BrowserCookieSource::configured_sources().expect("sources");
+
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].name, "custom");
+        assert_eq!(sources[0].cookie_db, PathBuf::from("/tmp/ollama-cookies"));
+        assert_eq!(sources[0].keychain_service, "Custom Storage");
+        assert_eq!(sources[0].keychain_account, "Custom Account");
+
+        std::env::remove_var("CX_OLLAMA_COOKIE_DB");
+        std::env::remove_var("CX_OLLAMA_KEYCHAIN_SERVICE");
+        std::env::remove_var("CX_OLLAMA_KEYCHAIN_ACCOUNT");
+        std::env::remove_var("CX_OLLAMA_COOKIE_SOURCE");
     }
 }

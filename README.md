@@ -357,6 +357,22 @@ export DEEPSEEK_API_KEY="sk-..."
 These files may contain credentials. Do not commit slot directories,
 target files with secret env values, `auth.json`, or real `env.conf` values.
 
+### Ollama Usage Cookies
+
+For `model_provider="ollama"` API-key slots, `cx status` tries to read real
+Ollama Cloud usage from browser cookies. By default it tries Helium first and
+then Google Chrome's `Default` profile.
+
+Set these in the slot `env.conf` to use a specific Chrome profile:
+
+```sh
+export CX_OLLAMA_COOKIE_SOURCE="chrome"
+export CX_OLLAMA_CHROME_PROFILE="Profile 5"
+```
+
+For a fully explicit source, set `CX_OLLAMA_COOKIE_DB` and optionally
+`CX_OLLAMA_KEYCHAIN_SERVICE` / `CX_OLLAMA_KEYCHAIN_ACCOUNT`.
+
 ## Environment Variables
 
 - `CX_PROFILE_MANAGER_DIR`: profile-manager directory. Defaults to

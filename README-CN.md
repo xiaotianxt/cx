@@ -287,6 +287,22 @@ cx completions bash > ~/.local/share/bash-completion/completions/cx
 ```
 
 release formula 会为 Homebrew 用户自动安装这些 completions。
+
+### Ollama 用量 Cookie
+
+`model_provider="ollama"` 的 API-key slot 在 `cx status` 中会尝试从浏览器
+cookie 读取真实 Ollama Cloud 用量。默认顺序是 Helium，然后 Google Chrome 的
+`Default` profile。
+
+如果要指定 Chrome profile，在该 slot 的 `env.conf` 中设置：
+
+```sh
+export CX_OLLAMA_COOKIE_SOURCE="chrome"
+export CX_OLLAMA_CHROME_PROFILE="Profile 5"
+```
+
+如果要完全指定来源，可以设置 `CX_OLLAMA_COOKIE_DB`，并按需设置
+`CX_OLLAMA_KEYCHAIN_SERVICE` / `CX_OLLAMA_KEYCHAIN_ACCOUNT`。
 生成的脚本会补全 cx 命令、launcher flags、本地 slot 名、target 名和本地缓存的 Codex model 名。
 动态候选只读本地文件，不会调用在线用量接口。
 

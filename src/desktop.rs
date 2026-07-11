@@ -16,7 +16,9 @@ use crate::run;
 use crate::slot;
 use crate::target::TargetSpec;
 
-const DEFAULT_DESKTOP_BIN: &str = "/Applications/Codex.app/Contents/MacOS/Codex";
+const DEFAULT_DESKTOP_BIN: &str = "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT";
+const LEGACY_DESKTOP_BIN: &str = "/Applications/Codex.app/Contents/MacOS/Codex";
+const DESKTOP_PROCESS_NAMES: [&str; 2] = ["ChatGPT", "Codex"];
 
 #[derive(Debug, Clone)]
 struct DesktopLaunchSpec {
@@ -88,18 +90,18 @@ pub fn launch(args: DesktopArgs) -> Result<()> {
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
-        let mut child = command.spawn().context("run Codex Desktop")?;
+        let mut child = command.spawn().context("run ChatGPT Desktop")?;
         spawn_desktop_session_watcher(&paths, &spec, launch_started_unix_ms, child.id());
-        let status = child.wait().context("wait for Codex Desktop")?;
+        let status = child.wait().context("wait for ChatGPT Desktop")?;
         if !status.success() {
-            anyhow::bail!("Codex Desktop exited with {status}");
+            anyhow::bail!("ChatGPT Desktop exited with {status}");
         }
     } else {
         command
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let child = command.spawn().context("launch Codex Desktop")?;
+        let child = command.spawn().context("launch ChatGPT Desktop")?;
         spawn_desktop_session_watcher(&paths, &spec, launch_started_unix_ms, child.id());
         eprintln!("cx desktop pid: {}", child.id());
     }
@@ -150,7 +152,7 @@ fn ensure_no_running_desktop(allow_parallel: bool, running: Option<RunningDeskto
     };
 
     anyhow::bail!(
-        "Codex Desktop is already running ({}). Quit it before running `cx desktop`, or pass --allow-parallel to bypass this guard.",
+        "ChatGPT Desktop is already running ({}). Quit it before running `cx desktop`, or pass --allow-parallel to bypass this guard.",
         running.display()
     );
 }
@@ -178,25 +180,46 @@ impl RunningDesktop {
 
 #[cfg(target_os = "macos")]
 fn running_desktop_process() -> Result<Option<RunningDesktop>> {
+    running_desktop_process_with(pgrep_exact)
+}
+
+fn running_desktop_process_with<F>(mut pgrep: F) -> Result<Option<RunningDesktop>>
+where
+    F: FnMut(&str) -> Result<Vec<u32>>,
+{
+    let mut pids = Vec::new();
+    for process_name in DESKTOP_PROCESS_NAMES {
+        pids.extend(pgrep(process_name)?);
+    }
+    pids.sort_unstable();
+    pids.dedup();
+
+    if pids.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(RunningDesktop { pids }))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn pgrep_exact(process_name: &str) -> Result<Vec<u32>> {
     let output = Command::new("/usr/bin/pgrep")
-        .args(["-x", "Codex"])
+        .args(["-x", process_name])
         .output()
-        .context("check for running Codex Desktop")?;
+        .context("check for running ChatGPT Desktop")?;
 
     if output.status.success() {
-        return Ok(Some(RunningDesktop {
-            pids: parse_pgrep_pids(&output.stdout),
-        }));
+        return Ok(parse_pgrep_pids(&output.stdout));
     }
     if output.status.code() == Some(1) {
-        return Ok(None);
+        return Ok(Vec::new());
     }
 
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if stderr.is_empty() {
-        anyhow::bail!("failed to check for running Codex Desktop");
+        anyhow::bail!("failed to check for running ChatGPT Desktop process `{process_name}`");
     }
-    anyhow::bail!("failed to check for running Codex Desktop: {stderr}");
+    anyhow::bail!("failed to check for running ChatGPT Desktop process `{process_name}`: {stderr}");
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -219,20 +242,28 @@ fn resolve_desktop_bin(override_path: Option<&Path>) -> Result<PathBuf> {
         return Ok(normalize_desktop_bin(PathBuf::from(path)));
     }
 
-    let path = PathBuf::from(DEFAULT_DESKTOP_BIN);
-    if path.exists() {
+    let default_paths = [
+        PathBuf::from(DEFAULT_DESKTOP_BIN),
+        PathBuf::from(LEGACY_DESKTOP_BIN),
+    ];
+    if let Some(path) = default_paths.into_iter().find(|path| path.exists()) {
         return Ok(path);
     }
 
     anyhow::bail!(
-        "Codex Desktop executable not found at {}; install it with `brew install --cask codex-app` or pass --app-bin",
-        DEFAULT_DESKTOP_BIN
+        "ChatGPT Desktop executable not found; checked {} and {}; install it with `brew install --cask codex-app` or pass --app-bin",
+        DEFAULT_DESKTOP_BIN,
+        LEGACY_DESKTOP_BIN
     );
 }
 
 fn normalize_desktop_bin(path: PathBuf) -> PathBuf {
     if path.extension().and_then(|value| value.to_str()) == Some("app") {
-        path.join("Contents/MacOS/Codex")
+        let Some(executable_name) = path.file_stem().filter(|name| !name.is_empty()) else {
+            return path;
+        };
+        let executable_name = executable_name.to_os_string();
+        path.join("Contents/MacOS").join(executable_name)
     } else {
         path
     }
@@ -349,7 +380,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn app_bundle_path_normalizes_to_executable() {
+    fn default_desktop_bin_uses_current_chatgpt_bundle() {
+        assert_eq!(
+            DEFAULT_DESKTOP_BIN,
+            "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"
+        );
+    }
+
+    #[test]
+    fn chatgpt_app_bundle_path_normalizes_to_executable() {
+        assert_eq!(
+            normalize_desktop_bin(PathBuf::from("/Applications/ChatGPT.app")),
+            PathBuf::from("/Applications/ChatGPT.app/Contents/MacOS/ChatGPT")
+        );
+    }
+
+    #[test]
+    fn legacy_codex_app_bundle_path_normalizes_to_executable() {
         assert_eq!(
             normalize_desktop_bin(PathBuf::from("/Applications/Codex.app")),
             PathBuf::from("/Applications/Codex.app/Contents/MacOS/Codex")
@@ -367,8 +414,30 @@ mod tests {
         .unwrap_err();
 
         let message = format!("{err:#}");
-        assert!(message.contains("Codex Desktop is already running"));
+        assert!(message.contains("ChatGPT Desktop is already running"));
         assert!(message.contains("--allow-parallel"));
+    }
+
+    #[test]
+    fn running_desktop_probe_checks_current_and_legacy_process_names() {
+        let mut probed = Vec::new();
+        let running = running_desktop_process_with(|process_name| {
+            probed.push(process_name.to_string());
+            Ok(match process_name {
+                "ChatGPT" => vec![456],
+                "Codex" => vec![123, 456],
+                _ => Vec::new(),
+            })
+        })
+        .unwrap();
+
+        assert_eq!(probed, vec!["ChatGPT", "Codex"]);
+        assert_eq!(
+            running,
+            Some(RunningDesktop {
+                pids: vec![123, 456]
+            })
+        );
     }
 
     #[test]

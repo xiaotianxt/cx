@@ -12,7 +12,7 @@ cx 是一个本地 Codex 入口：负责启动 Codex、处理 stdin pipe、管�
 - `cx stats`：从本地 `state_5.sqlite` 汇总 Codex token 消耗。
 - `cx prime`：按本地使用规律提前触发极短请求，启动 5h 额度窗口。
 - `cx add` / `cx login` / `cx remove`：管理独立 slot。
-- `cx desktop`：通过选中的 slot 启动 Codex Desktop。
+- `cx desktop`：通过选中的 slot 启动 ChatGPT Desktop。
 - `cx --slot <name>` / `cx --target <name>`：强制使用指定 slot 或 target 启动。
 - `cx completions`：生成 shell completion，支持动态补全 slot 和 model。
 
@@ -202,7 +202,7 @@ cx add bus6 --rotate
 cx login bus6
 ```
 
-用同一套 slot 隔离启动 Codex Desktop：
+用同一套 slot 隔离启动 ChatGPT Desktop：
 
 ```bash
 cx desktop
@@ -214,10 +214,11 @@ cx desktop --target research
 这样 Desktop 进程会读取这个 slot 的 `auth.json` 和账号状态。默认会通过 Desktop 的
 `--open-project` 参数打开当前工作目录，让这个 slot 的 Desktop 项目列表和启动它的 shell
 项目保持一致。slot 的 `env.conf` 会注入到 Desktop 进程；`overrides.conf` 不会传给
-Electron。默认情况下，如果已经有 Codex Desktop 进程在运行，`cx desktop` 会拒绝继续启动，
+Electron。默认情况下，如果已经有 ChatGPT Desktop 进程在运行，`cx desktop` 会拒绝继续启动，
 因为第二次启动可能复用旧 Electron 实例，导致新的 slot 环境没有生效。切换 slot 前请先退出
-Codex Desktop；如果你明确要测试并行实例，可以传 `--allow-parallel`。如果 Desktop 安装在
-其他位置，可以用 `--app-bin` 或 `CX_CODEX_DESKTOP_BIN` 指定。
+ChatGPT Desktop；如果你明确要测试并行实例，可以传 `--allow-parallel`。默认安装路径同时兼容
+当前的 `ChatGPT.app` 和旧版 `Codex.app`。如果 Desktop 安装在其他位置，可以用 `--app-bin`
+或 `CX_CODEX_DESKTOP_BIN` 指定。
 
 从当前 `~/.codex` 复制登录态：
 

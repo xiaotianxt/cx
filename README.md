@@ -16,7 +16,7 @@ live usage.
 - `cx prime`: plan and run tiny quota-window priming requests.
 - `cx add` / `cx login` / `cx remove`: manage isolated Codex slots.
 - `cx select`: print the best slot name for scripts.
-- `cx desktop`: launch Codex Desktop through a selected slot.
+- `cx desktop`: launch ChatGPT Desktop through a selected slot.
 - `cx --slot <name>` / `cx --target <name>`: force a launch through that slot
   or target.
 - `cx completions`: generate launcher shell completions with dynamic slot names.
@@ -244,7 +244,7 @@ cx add bus6 --rotate
 cx login bus6
 ```
 
-Launch Codex Desktop with the same slot isolation:
+Launch ChatGPT Desktop with the same slot isolation:
 
 ```bash
 cx desktop
@@ -258,12 +258,13 @@ account state. The current working directory is opened with Desktop's
 `--open-project` argument by default, which keeps the slot's Desktop project
 list aligned with the shell project that launched it. `env.conf` values are
 passed to the Desktop process; slot `overrides.conf` values are not forwarded to
-Electron. By default, `cx desktop` refuses to launch while another Codex Desktop
+Electron. By default, `cx desktop` refuses to launch while another ChatGPT Desktop
 process is running, because a second launch may reuse the old Electron instance
-and ignore the new slot environment. Quit Codex Desktop before switching slots,
+and ignore the new slot environment. Quit ChatGPT Desktop before switching slots,
 or pass `--allow-parallel` when you intentionally want to test parallel
-instances. If Codex Desktop is installed somewhere else, use `--app-bin` or
-`CX_CODEX_DESKTOP_BIN`.
+instances. The default installation paths support both the current `ChatGPT.app`
+name and the legacy `Codex.app` name. If ChatGPT Desktop is installed somewhere
+else, use `--app-bin` or `CX_CODEX_DESKTOP_BIN`.
 
 Copy the current `~/.codex` auth state into a slot:
 

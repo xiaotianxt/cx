@@ -221,12 +221,6 @@ pub fn read_slot_auth(slot_dir: &Path, base_codex_home: Option<&Path>) -> Result
     })
 }
 
-/// Read provider from overrides.conf only, without touching keychain or auth.json.
-/// Used by the legacy cross-slot session adapter.
-pub fn read_slot_provider(slot_dir: &Path) -> Result<Option<String>> {
-    slot::read_override_string(slot_dir, "model_provider")
-}
-
 pub fn refresh_slot_auth(
     slot_dir: &Path,
     client: &Client,

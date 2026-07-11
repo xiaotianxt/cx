@@ -21,13 +21,9 @@ use crate::envfile;
 use crate::keychain;
 use crate::paths;
 use crate::paths::ManagerPaths;
-use crate::resume_id::ExplicitResumeId;
 use crate::selector;
 use crate::slot;
 use crate::target::TargetSpec;
-use crate::terminal_resume;
-use crate::terminal_resume::ResumeCandidate;
-use crate::terminal_resume::TerminalKey;
 
 const BYPASS_SUBCOMMANDS: &[&str] = &[
     "login",
@@ -62,7 +58,6 @@ const ARG_MANAGER_DIR: &str = "manager-dir";
 const ARG_CODEX_BIN: &str = "codex-bin";
 const ARG_CX_QUIET: &str = "cx-quiet";
 const ARG_CX_DEBUG: &str = "cx-debug";
-const ARG_NEW_SESSION: &str = "new";
 const ARG_CODEX_ARGS: &str = "codex-args";
 
 pub(crate) fn launcher_command() -> ClapCommand {
@@ -70,7 +65,7 @@ pub(crate) fn launcher_command() -> ClapCommand {
         .about("Launch Codex through a local cx slot")
         .override_usage("cx [CX_OPTIONS] [-- CODEX_ARGS]...")
         .after_help(
-            "Codex arguments must follow `--`. Examples:\n  cx --slot dia1 -- resume THREAD\n  echo prompt | cx -- summarize this",
+            "Codex arguments must follow `--`. Example:\n  echo prompt | cx -- summarize this",
         )
         .arg(
             Arg::new(ARG_SLOT)
@@ -112,12 +107,6 @@ pub(crate) fn launcher_command() -> ClapCommand {
                 .long(ARG_CX_DEBUG)
                 .action(ArgAction::SetTrue)
                 .help("Print slot selection details"),
-        )
-        .arg(
-            Arg::new(ARG_NEW_SESSION)
-                .long(ARG_NEW_SESSION)
-                .action(ArgAction::SetTrue)
-                .help("Start a fresh Codex session instead of auto-resuming this terminal"),
         );
     command.arg(
         Arg::new(ARG_CODEX_ARGS)
@@ -138,7 +127,6 @@ struct RunOptions {
     codex_bin: Option<PathBuf>,
     quiet: bool,
     debug: bool,
-    new_session: bool,
     codex_args: Vec<OsString>,
 }
 
@@ -150,14 +138,6 @@ pub(crate) struct LauncherArgsSplit {
 pub(crate) struct RuntimeSelection {
     pub slot: String,
     pub target: Option<TargetSpec>,
-}
-
-#[derive(Debug, Clone)]
-struct TerminalResumeLaunch {
-    cwd: PathBuf,
-    key: Option<TerminalKey>,
-    auto_candidate: Option<ResumeCandidate>,
-    direct_launch: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -199,12 +179,6 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
     let paths = ManagerPaths::new(options.manager_dir.clone())?;
     crate::upgrade::run_startup(&paths)?;
     let real_codex = resolve_codex_bin(options.codex_bin.as_deref())?;
-    let launch_cwd = std::env::current_dir().context("resolve current directory")?;
-    let direct_launch = options.codex_args.is_empty();
-    let explicit_resume = explicit_resume_id(&options.codex_args);
-    let terminal_key = (direct_launch || explicit_resume.is_some())
-        .then(terminal_resume::current_terminal_key)
-        .flatten();
     if std::env::var_os("CODEX_HOME").is_some()
         && options.slot.is_none()
         && options.target.is_none()
@@ -221,29 +195,6 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
         return exec_real_codex(&real_codex, options.codex_args);
     }
 
-    let auto_resume_state_hint = if direct_launch
-        && !options.new_session
-        && std::env::var_os("CX_NO_AUTO_RESUME").is_none()
-        && options.target.is_none()
-    {
-        terminal_key
-            .as_ref()
-            .map(|key| terminal_resume::load_resume_state(&paths, key, &launch_cwd))
-            .transpose()?
-            .flatten()
-    } else {
-        None
-    };
-    let auto_resume_candidate = if direct_launch
-        && !options.new_session
-        && std::env::var_os("CX_NO_AUTO_RESUME").is_none()
-        && options.target.is_none()
-    {
-        auto_resume_candidate_for_launch(&paths, &launch_cwd, auto_resume_state_hint.as_ref())?
-    } else {
-        None
-    };
-
     let target = crate::target::load_optional_target(&paths, options.target.as_deref())?;
     let candidates = if let Some(target) = &target {
         target.slots_or_rotation(&paths)?
@@ -251,12 +202,8 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
         slot::load_rotation(&paths)?
     };
     if candidates.is_empty() && options.slot.is_none() {
-        let mut codex_args = options.codex_args;
-        append_auto_resume_args_if_missing(
-            &mut codex_args,
-            auto_resume_session_for_selected_slot(auto_resume_candidate.as_ref(), "default"),
-        );
-        return exec_real_codex(&real_codex, codex_args);
+        let spec = build_default_command_spec(&paths, real_codex, options.codex_args.clone())?;
+        return exec_codex_spec(options, spec);
     }
 
     let selected_slot = if let Some(slot) = options.slot.clone() {
@@ -270,8 +217,7 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
             usage_query_options(),
             &mut progress,
         )?;
-        let selected = auto_resume_result_from_results(auto_resume_candidate.as_ref(), &results)
-            .or_else(|| choose_launch_result(&results));
+        let selected = choose_launch_result(&results);
         if options.debug || std::env::var_os("CX_SLOT_DEBUG").is_some() {
             crate::output::print_report(
                 &results,
@@ -290,12 +236,6 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
         &selected_slot,
         target.as_ref(),
         options,
-        TerminalResumeLaunch {
-            cwd: launch_cwd,
-            key: terminal_key,
-            auto_candidate: auto_resume_candidate,
-            direct_launch,
-        },
     )
 }
 
@@ -414,6 +354,32 @@ pub(crate) fn build_slot_command_spec(
     })
 }
 
+fn build_default_command_spec(
+    paths: &ManagerPaths,
+    real_codex: PathBuf,
+    codex_args: Vec<OsString>,
+) -> Result<CodexCommandSpec> {
+    let runtime_overrides =
+        crate::runtime_provider::resolve(&paths.base_codex_home.join("config.toml"), &[])?;
+    let mut envs = BTreeMap::new();
+    insert_sqlite_home_env(&mut envs, paths.shared_sqlite_home())?;
+    let mut args = Vec::new();
+    for override_line in runtime_overrides {
+        args.push(OsString::from("-c"));
+        args.push(OsString::from(override_line));
+    }
+    args.extend(codex_args);
+    Ok(CodexCommandSpec {
+        program: real_codex,
+        codex_home: paths.base_codex_home.clone(),
+        envs,
+        args,
+        slot: "default".to_string(),
+        target_name: None,
+        launch_context: CodexLaunchContext::Slot,
+    })
+}
+
 pub(crate) fn inject_keychain_access_token(
     slot_dir: &Path,
     selected_slot: &str,
@@ -428,140 +394,27 @@ fn exec_slot_codex(
     selected_slot: &str,
     target: Option<&TargetSpec>,
     options: RunOptions,
-    resume_launch: TerminalResumeLaunch,
 ) -> Result<()> {
-    let mut spec = build_slot_command_spec(
+    let spec = build_slot_command_spec(
         paths,
         real_codex.to_path_buf(),
         selected_slot,
         target,
-        options.codex_args,
+        options.codex_args.clone(),
     )?;
-    let explicit_resume = explicit_resume_id(&spec.args);
-    let explicit_resume = if let Some(resume_id) = explicit_resume {
-        let prepared = crate::session_scrub::prepare_cross_slot_resume(
-            paths,
-            selected_slot,
-            resume_id.as_str(),
-        )?;
-        if prepared.scrubbed {
-            replace_explicit_resume_id(&mut spec.args, resume_id.as_str(), &prepared.session_id);
-            if !options.quiet {
-                eprintln!(
-                    "cx resume scrubbed: {} -> {} for slot {}",
-                    resume_id.as_str(),
-                    prepared.session_id,
-                    selected_slot
-                );
-            }
-            Some(ExplicitResumeId::parse(prepared.session_id))
-        } else {
-            Some(resume_id)
-        }
-    } else {
-        None
-    };
-    let auto_resume_session_id =
-        auto_resume_session_for_selected_slot(resume_launch.auto_candidate.as_ref(), selected_slot);
-    let resumed_id = append_auto_resume_args_if_missing(&mut spec.args, auto_resume_session_id);
+    exec_codex_spec(options, spec)
+}
 
-    if resume_launch.direct_launch || explicit_resume.is_some() {
-        if let Some(key) = resume_launch.key.as_ref() {
-            let launch_started_unix_ms = terminal_resume::now_unix_ms();
-            let _ = terminal_resume::spawn_session_watcher(
-                paths,
-                &spec.codex_home,
-                selected_slot,
-                &resume_launch.cwd,
-                key,
-                launch_started_unix_ms,
-                std::process::id(),
-            );
-        }
-    }
-
-    print_launch(
-        &spec,
-        resumed_id.as_ref().map(ExplicitResumeId::as_str),
-        options.quiet,
-    );
+fn exec_codex_spec(options: RunOptions, spec: CodexCommandSpec) -> Result<()> {
+    print_launch(&spec, options.quiet);
     exec(spec.into_command())
-}
-
-fn append_resume_args(args: &mut Vec<OsString>, session_id: &str) {
-    args.push(OsString::from("resume"));
-    args.push(OsString::from(session_id));
-}
-
-fn replace_explicit_resume_id(args: &mut [OsString], old_session_id: &str, new_session_id: &str) {
-    let mut index = 0;
-    while index < args.len() {
-        let arg_text = args[index].to_string_lossy();
-        if arg_text.starts_with('-') {
-            index += match codex_option_kind(arg_text.as_ref()) {
-                CodexOptionKind::Flag | CodexOptionKind::Unknown => 1,
-                CodexOptionKind::Value => 2,
-            };
-            continue;
-        }
-        if arg_text == "resume" {
-            if let Some(value) = args.get_mut(index + 1) {
-                if value == old_session_id {
-                    *value = OsString::from(new_session_id);
-                }
-            }
-        }
-        return;
-    }
-}
-
-fn append_auto_resume_args_if_missing(
-    args: &mut Vec<OsString>,
-    auto_session_id: Option<&str>,
-) -> Option<ExplicitResumeId> {
-    if let Some(resume_id) = explicit_resume_id(args) {
-        return Some(resume_id);
-    }
-    let session_id = auto_session_id?;
-    append_resume_args(args, session_id);
-    Some(ExplicitResumeId::parse(session_id))
-}
-
-fn auto_resume_session_for_selected_slot<'a>(
-    candidate: Option<&'a ResumeCandidate>,
-    selected_slot: &str,
-) -> Option<&'a str> {
-    candidate
-        .filter(|candidate| candidate.slot == selected_slot)
-        .map(|candidate| candidate.session_id.as_str())
-}
-
-fn auto_resume_result_from_results<'a>(
-    candidate: Option<&'a ResumeCandidate>,
-    results: &'a [crate::usage::SlotResult],
-) -> Option<&'a crate::usage::SlotResult> {
-    let candidate = candidate?;
-    results
-        .iter()
-        .find(|result| result.slot == candidate.slot && result.is_available())
-}
-
-fn auto_resume_candidate_for_launch(
-    paths: &ManagerPaths,
-    cwd: &Path,
-    hint: Option<&terminal_resume::ResumeState>,
-) -> Result<Option<ResumeCandidate>> {
-    if terminal_resume::has_active_session_in_cwd(paths, cwd) {
-        return Ok(None);
-    }
-    terminal_resume::latest_cwd_resume_candidate(paths, cwd, hint)
 }
 
 fn choose_launch_result(results: &[crate::usage::SlotResult]) -> Option<&crate::usage::SlotResult> {
     selector::choose_result(results)
 }
 
-fn print_launch(spec: &CodexCommandSpec, resumed_id: Option<&str>, quiet: bool) {
+fn print_launch(spec: &CodexCommandSpec, quiet: bool) {
     if quiet {
         return;
     }
@@ -570,9 +423,6 @@ fn print_launch(spec: &CodexCommandSpec, resumed_id: Option<&str>, quiet: bool) 
     }
     if let Some(target) = spec.target_name() {
         eprintln!("codex target: {target}");
-    }
-    if let Some(resumed_id) = resumed_id {
-        eprintln!("codex resume: {resumed_id}");
     }
 }
 
@@ -680,88 +530,6 @@ fn first_forwarded_non_option(args: &[OsString]) -> Option<String> {
     None
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CodexOptionKind {
-    Flag,
-    Value,
-    Unknown,
-}
-
-pub(crate) fn codex_option_kind(arg: &str) -> CodexOptionKind {
-    if arg.contains('=') {
-        let name = arg.split_once('=').map(|(name, _)| name).unwrap_or(arg);
-        return match name {
-            "--config"
-            | "--enable"
-            | "--disable"
-            | "--remote-auth-token-env"
-            | "--image"
-            | "--model"
-            | "--local-provider"
-            | "--profile"
-            | "--sandbox"
-            | "--cd"
-            | "--add-dir"
-            | "--ask-for-approval" => CodexOptionKind::Flag,
-            _ => CodexOptionKind::Unknown,
-        };
-    }
-
-    match arg {
-        "--oss" | "--dangerously-bypass-approvals-and-sandbox" | "--search" | "--no-alt-screen" => {
-            CodexOptionKind::Flag
-        }
-        "-c"
-        | "--config"
-        | "--enable"
-        | "--disable"
-        | "--remote-auth-token-env"
-        | "-i"
-        | "--image"
-        | "-m"
-        | "--model"
-        | "--local-provider"
-        | "-p"
-        | "--profile"
-        | "-s"
-        | "--sandbox"
-        | "--add-dir"
-        | "-a"
-        | "--ask-for-approval" => CodexOptionKind::Value,
-        _ => CodexOptionKind::Unknown,
-    }
-}
-
-pub(crate) fn explicit_resume_id(args: &[OsString]) -> Option<ExplicitResumeId> {
-    let mut index = 0;
-    while index < args.len() {
-        let arg = &args[index];
-        let arg_text = arg.to_string_lossy();
-        if arg_text.starts_with('-') {
-            match codex_option_kind(arg_text.as_ref()) {
-                CodexOptionKind::Flag => {
-                    index += 1;
-                }
-                CodexOptionKind::Value => {
-                    index += 2;
-                }
-                CodexOptionKind::Unknown => {
-                    index += 1;
-                }
-            }
-            continue;
-        }
-        if arg_text == "resume" {
-            return args
-                .get(index + 1)
-                .filter(|value| !value.to_string_lossy().starts_with('-'))
-                .map(|value| ExplicitResumeId::parse(value.to_string_lossy().to_string()));
-        }
-        return None;
-    }
-    None
-}
-
 pub(crate) fn usage_timeout() -> f32 {
     std::env::var("CX_SLOT_USAGE_TIMEOUT")
         .ok()
@@ -792,7 +560,7 @@ fn parse_run_args(args: Vec<OsString>) -> Result<RunOptions> {
         }
         Err(err) => {
             return Err(anyhow::anyhow!(
-                "{err}\nCodex arguments now require `--`; for example: `cx -- resume THREAD`."
+                "{err}\nCodex arguments now require `--`; for example: `cx -- summarize this`."
             ));
         }
     };
@@ -804,7 +572,6 @@ fn parse_run_args(args: Vec<OsString>) -> Result<RunOptions> {
         codex_bin: matches.get_one::<PathBuf>(ARG_CODEX_BIN).cloned(),
         quiet: matches.get_flag(ARG_CX_QUIET),
         debug: matches.get_flag(ARG_CX_DEBUG),
-        new_session: matches.get_flag(ARG_NEW_SESSION),
         codex_args: matches
             .get_many::<OsString>(ARG_CODEX_ARGS)
             .map(|values| values.cloned().collect())
@@ -904,17 +671,8 @@ mod tests {
     }
 
     #[test]
-    fn new_flag_disables_launcher_auto_resume_policy() {
-        let options = parse_run_args(vec![OsString::from("--new")]).unwrap();
-
-        assert!(options.new_session);
-        assert!(options.codex_args.is_empty());
-    }
-
-    #[test]
     fn codex_args_require_separator() {
-        let err =
-            parse_run_args(vec![OsString::from("resume"), OsString::from("thread-1")]).unwrap_err();
+        let err = parse_run_args(vec![OsString::from("summarize")]).unwrap_err();
 
         assert!(format!("{err:#}").contains("Codex arguments now require `--`"));
     }
@@ -937,91 +695,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_resume_id_skips_root_overrides() {
-        let args = vec![
-            OsString::from("-c"),
-            OsString::from("model=\"gpt-5.5\""),
-            OsString::from("resume"),
-            OsString::from("019dfdd3-debc-7da2-88fc-b15b73f5e138"),
-        ];
-
-        assert_eq!(
-            explicit_resume_id(&args),
-            Some(ExplicitResumeId::AppThreadOrCodexSession(String::from(
-                "019dfdd3-debc-7da2-88fc-b15b73f5e138"
-            )))
-        );
-    }
-
-    #[test]
-    fn auto_resume_args_append_session_without_slot_gate() {
-        let mut args = vec![OsString::from("-m"), OsString::from("gpt-5.5")];
-
-        let resumed = append_auto_resume_args_if_missing(&mut args, Some("thread-1"));
-
-        assert_eq!(
-            resumed,
-            Some(ExplicitResumeId::AppThreadOrCodexSession(String::from(
-                "thread-1"
-            )))
-        );
-        assert_eq!(
-            args,
-            vec![
-                OsString::from("-m"),
-                OsString::from("gpt-5.5"),
-                OsString::from("resume"),
-                OsString::from("thread-1"),
-            ]
-        );
-    }
-
-    #[test]
-    fn explicit_resume_args_win_over_auto_resume() {
-        let mut args = vec![OsString::from("resume"), OsString::from("thread-explicit")];
-
-        let resumed = append_auto_resume_args_if_missing(&mut args, Some("thread-auto"));
-
-        assert_eq!(
-            resumed,
-            Some(ExplicitResumeId::AppThreadOrCodexSession(String::from(
-                "thread-explicit"
-            )))
-        );
-        assert_eq!(
-            args,
-            vec![OsString::from("resume"), OsString::from("thread-explicit"),]
-        );
-    }
-
-    #[test]
-    fn explicit_resume_id_can_be_replaced_after_scrub() {
-        let mut args = vec![
-            OsString::from("-m"),
-            OsString::from("gpt-5.5"),
-            OsString::from("resume"),
-            OsString::from("old-session"),
-        ];
-
-        replace_explicit_resume_id(&mut args, "old-session", "new-session");
-
-        assert_eq!(
-            args,
-            vec![
-                OsString::from("-m"),
-                OsString::from("gpt-5.5"),
-                OsString::from("resume"),
-                OsString::from("new-session"),
-            ]
-        );
-    }
-
-    #[test]
     fn plain_slot_selection_still_uses_usage_score() {
-        let state = crate::terminal_resume::test_resume_state(
-            "dia7",
-            PathBuf::from("/tmp/cx-run-test-project"),
-        );
         let results = vec![
             crate::usage::SlotResult::new(
                 "bus1",
@@ -1035,7 +709,7 @@ mod tests {
                 1,
                 crate::usage::SlotStatus::Available,
                 10.0,
-                "resume",
+                "lower score",
             ),
         ];
 
@@ -1043,164 +717,6 @@ mod tests {
             choose_launch_result(&results).map(|result| result.slot.as_str()),
             Some("bus1")
         );
-        assert_eq!(state.slot, "dia7");
-    }
-
-    #[test]
-    fn auto_resume_prefers_recorded_slot_when_available() {
-        let candidate = ResumeCandidate {
-            slot: "ollama".to_string(),
-            cwd: PathBuf::from("/tmp/cx-run-test-project"),
-            session_id: "session-1".to_string(),
-            rollout_path: None,
-        };
-        let results = vec![
-            crate::usage::SlotResult::new(
-                "dia4",
-                0,
-                crate::usage::SlotStatus::Available,
-                95.0,
-                "fresh",
-            ),
-            crate::usage::SlotResult::new(
-                "ollama",
-                1,
-                crate::usage::SlotStatus::ExternalProvider,
-                100.0,
-                "external provider slot",
-            ),
-        ];
-
-        assert_eq!(
-            auto_resume_result_from_results(Some(&candidate), &results)
-                .map(|result| result.slot.as_str()),
-            Some("ollama"),
-        );
-    }
-
-    #[test]
-    fn auto_resume_does_not_prefer_missing_recorded_slot() {
-        let candidate = ResumeCandidate {
-            slot: "ollama".to_string(),
-            cwd: PathBuf::from("/tmp/cx-run-test-project"),
-            session_id: "session-1".to_string(),
-            rollout_path: None,
-        };
-        let results = vec![crate::usage::SlotResult::new(
-            "ollama",
-            0,
-            crate::usage::SlotStatus::Missing,
-            -1.0,
-            "missing slot home",
-        )];
-
-        assert!(auto_resume_result_from_results(Some(&candidate), &results).is_none());
-    }
-
-    #[test]
-    fn auto_resume_does_not_cross_slots() {
-        let candidate = ResumeCandidate {
-            slot: "ollama".to_string(),
-            cwd: PathBuf::from("/tmp/cx-run-test-project"),
-            session_id: "session-1".to_string(),
-            rollout_path: None,
-        };
-        let mut args = Vec::new();
-        let auto_session_id = auto_resume_session_for_selected_slot(Some(&candidate), "dia4");
-
-        let resumed = append_auto_resume_args_if_missing(&mut args, auto_session_id);
-
-        assert_eq!(resumed, None);
-        assert!(args.is_empty());
-    }
-
-    #[test]
-    fn no_rotation_fallback_only_auto_resumes_default_slot() {
-        let slot_candidate = ResumeCandidate {
-            slot: "ollama".to_string(),
-            cwd: PathBuf::from("/tmp/cx-run-test-project"),
-            session_id: "slot-session".to_string(),
-            rollout_path: None,
-        };
-        let default_candidate = ResumeCandidate {
-            slot: "default".to_string(),
-            cwd: PathBuf::from("/tmp/cx-run-test-project"),
-            session_id: "default-session".to_string(),
-            rollout_path: None,
-        };
-
-        assert_eq!(
-            auto_resume_session_for_selected_slot(Some(&slot_candidate), "default"),
-            None,
-        );
-        assert_eq!(
-            auto_resume_session_for_selected_slot(Some(&default_candidate), "default"),
-            Some("default-session"),
-        );
-    }
-
-    #[test]
-    fn active_session_blocks_auto_resume_candidate() {
-        let paths = test_paths("auto-resume-active-block");
-        let cwd = paths.base_codex_home.join("project");
-        let state = crate::terminal_resume::test_resume_state("dia7", cwd.clone());
-        let watch_request =
-            crate::terminal_resume::test_write_watch_request(&paths, &cwd, std::process::id())
-                .unwrap();
-
-        assert!(auto_resume_candidate_for_launch(&paths, &cwd, Some(&state))
-            .unwrap()
-            .is_none());
-
-        let _ = fs::remove_file(watch_request);
-        let _ = fs::remove_dir_all(&paths.manager_dir);
-        let _ = fs::remove_dir_all(&paths.base_codex_home);
-    }
-
-    #[test]
-    fn active_desktop_session_blocks_auto_resume_candidate() {
-        let paths = test_paths("auto-resume-desktop-active-block");
-        let cwd = paths.base_codex_home.join("project");
-        let state = crate::terminal_resume::test_resume_state("dia7", cwd.clone());
-        let watch_request = crate::terminal_resume::test_write_desktop_watch_request(
-            &paths,
-            &cwd,
-            std::process::id(),
-        )
-        .unwrap();
-
-        assert!(auto_resume_candidate_for_launch(&paths, &cwd, Some(&state))
-            .unwrap()
-            .is_none());
-
-        let _ = fs::remove_file(watch_request);
-        let _ = fs::remove_dir_all(&paths.manager_dir);
-        let _ = fs::remove_dir_all(&paths.base_codex_home);
-    }
-
-    #[test]
-    fn active_session_in_other_cwd_does_not_block_auto_resume_candidate() {
-        let paths = test_paths("auto-resume-other-cwd");
-        let cwd = paths.base_codex_home.join("project");
-        let other_cwd = paths.base_codex_home.join("other-project");
-        let state = crate::terminal_resume::test_resume_state("dia7", cwd.clone());
-        let watch_request = crate::terminal_resume::test_write_watch_request(
-            &paths,
-            &other_cwd,
-            std::process::id(),
-        )
-        .unwrap();
-
-        let candidate = auto_resume_candidate_for_launch(&paths, &cwd, Some(&state))
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(candidate.slot, "dia7");
-        assert_eq!(candidate.session_id, "session-1");
-
-        let _ = fs::remove_file(watch_request);
-        let _ = fs::remove_dir_all(&paths.manager_dir);
-        let _ = fs::remove_dir_all(&paths.base_codex_home);
     }
 
     #[test]
@@ -1228,6 +744,85 @@ mod tests {
         assert_eq!(PathBuf::from(sqlite_home), paths.shared_sqlite_home());
         assert_ne!(PathBuf::from(sqlite_home), paths.base_codex_home);
         assert!(paths.shared_sqlite_home().is_dir());
+
+        let _ = fs::remove_dir_all(&paths.manager_dir);
+        let _ = fs::remove_dir_all(&paths.base_codex_home);
+    }
+
+    #[test]
+    fn default_command_uses_shared_sqlite_and_cx_runtime() {
+        let paths = test_paths("default-cx-runtime");
+        fs::create_dir_all(&paths.base_codex_home).unwrap();
+        fs::write(
+            paths.base_codex_home.join("config.toml"),
+            "model = \"gpt-5.4\"\n",
+        )
+        .unwrap();
+
+        let spec = build_default_command_spec(
+            &paths,
+            PathBuf::from("/bin/codex"),
+            vec![OsString::from("summarize"), OsString::from("this")],
+        )
+        .unwrap();
+        let args = spec
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>();
+
+        assert_eq!(spec.codex_home, paths.base_codex_home);
+        assert_eq!(
+            spec.envs.get(CODEX_SQLITE_HOME).map(String::as_str),
+            Some(paths.shared_sqlite_home().to_string_lossy().as_ref())
+        );
+        assert!(args
+            .iter()
+            .any(|arg| arg.contains("model_provider = \"cx\"")));
+        assert_eq!(args[args.len() - 2..], ["summarize", "this"]);
+
+        let _ = fs::remove_dir_all(&paths.base_codex_home);
+    }
+
+    #[test]
+    fn slot_command_normalizes_custom_provider_to_cx_runtime() {
+        let paths = test_paths("cx-runtime-provider");
+        fs::create_dir_all(&paths.base_codex_home).unwrap();
+        fs::create_dir_all(paths.slot_home("pku")).unwrap();
+        fs::create_dir_all(paths.slot_dir("pku")).unwrap();
+        fs::write(
+            paths.base_codex_home.join("config.toml"),
+            "model = \"gpt-5.4\"\n",
+        )
+        .unwrap();
+        fs::write(
+            paths.slot_dir("pku").join("overrides.conf"),
+            concat!(
+                "model = \"GLM-5.2\"\n",
+                "model_provider = \"pku\"\n",
+                "model_providers.pku = { name = \"PKU\", base_url = \"https://example.test/v1\", wire_api = \"responses\", env_key = \"OPENAI_API_KEY\", requires_openai_auth = false }\n"
+            ),
+        )
+        .unwrap();
+
+        let spec =
+            build_slot_command_spec(&paths, PathBuf::from("/bin/codex"), "pku", None, Vec::new())
+                .unwrap();
+        let args = spec
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>();
+
+        assert!(args
+            .iter()
+            .any(|arg| arg.contains("model_provider = \"cx\"")));
+        assert!(args
+            .iter()
+            .any(|arg| arg.starts_with("model_providers.cx = {")));
+        assert!(args
+            .iter()
+            .any(|arg| arg.contains("https://example.test/v1")));
 
         let _ = fs::remove_dir_all(&paths.manager_dir);
         let _ = fs::remove_dir_all(&paths.base_codex_home);

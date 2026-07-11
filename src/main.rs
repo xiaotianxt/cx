@@ -12,16 +12,13 @@ mod keychain;
 mod output;
 mod paths;
 mod prime;
-mod resume_id;
 mod run;
 mod runtime_provider;
 mod selector;
-mod session_scrub;
 mod slot;
 mod sqlite_merge;
 mod stats;
 mod target;
-mod terminal_resume;
 mod transfer;
 mod upgrade;
 mod usage;
@@ -56,9 +53,6 @@ fn entry() -> Result<()> {
         return desktop_proxy::run(raw_args.into_iter().skip(1).collect());
     }
     let first_arg = raw_args.get(1).and_then(|arg| arg.to_str());
-    if first_arg == Some(terminal_resume::WATCH_SESSION_ARG) {
-        return terminal_resume::run_internal_watcher(raw_args.into_iter().skip(2).collect());
-    }
     if !is_management_entry_arg(first_arg) {
         return cx::run_from_args(raw_args.into_iter().skip(1).collect());
     }

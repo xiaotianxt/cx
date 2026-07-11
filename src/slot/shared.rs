@@ -218,7 +218,6 @@ const CODEX_SLOT_PRIVATE_RESOURCES: &[&str] = &[
     "logs_2.sqlite-wal",
     "profile-manager",
     "cxrun",
-    "cx-scrubbed-sessions",
     "archived_sessions",
     "attachments",
     "bin",

@@ -86,14 +86,12 @@ pub fn launch(args: DesktopArgs) -> Result<()> {
     eprintln!("cx desktop workspace: {}", spec.workspace_root.display());
 
     let mut command = spec.command();
-    let launch_started_unix_ms = crate::terminal_resume::now_unix_ms();
     if args.wait {
         command
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit());
         let mut child = command.spawn().context("run ChatGPT Desktop")?;
-        spawn_desktop_session_watcher(&paths, &spec, launch_started_unix_ms, child.id());
         let status = child.wait().context("wait for ChatGPT Desktop")?;
         if !status.success() {
             anyhow::bail!("ChatGPT Desktop exited with {status}");
@@ -104,30 +102,10 @@ pub fn launch(args: DesktopArgs) -> Result<()> {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let child = command.spawn().context("launch ChatGPT Desktop")?;
-        spawn_desktop_session_watcher(&paths, &spec, launch_started_unix_ms, child.id());
         eprintln!("cx desktop pid: {}", child.id());
     }
 
     Ok(())
-}
-
-fn spawn_desktop_session_watcher(
-    paths: &ManagerPaths,
-    spec: &DesktopLaunchSpec,
-    launch_started_unix_ms: u128,
-    launch_pid: u32,
-) {
-    let key = crate::terminal_resume::current_terminal_key()
-        .unwrap_or_else(|| crate::terminal_resume::desktop_process_key(launch_pid));
-    let _ignored = crate::terminal_resume::spawn_session_watcher(
-        paths,
-        &spec.codex_home,
-        spec.slot(),
-        &spec.workspace_root,
-        &key,
-        launch_started_unix_ms,
-        launch_pid,
-    );
 }
 
 fn ensure_desktop_not_running(allow_parallel: bool) -> Result<()> {

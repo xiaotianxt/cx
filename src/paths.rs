@@ -62,10 +62,6 @@ impl ManagerPaths {
         self.base_codex_home.join("sqlite")
     }
 
-    pub fn slot_sqlite_home(&self, slot: &str) -> PathBuf {
-        self.slot_home(slot).join("sqlite")
-    }
-
     pub fn target_file(&self, target: &str) -> PathBuf {
         self.targets_dir.join(format!("{target}.toml"))
     }

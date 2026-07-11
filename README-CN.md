@@ -154,7 +154,7 @@ cx stats --json --refresh-prices
 cx stats --calibrate
 ```
 
-`cx stats` 读取 Codex 本地维护的 `state_5.sqlite`；如果 rollout JSONL 存在，就按选中
+`cx stats` 读取共享的 `~/.codex/sqlite/state_5.sqlite`；如果 rollout JSONL 存在，就按选中
 range 聚合 timestamped `token_count` delta。rollout 缺失或无法解析时，才回退到
 `threads.updated_at` 上的 `threads.tokens_used`。rollout 解析结果会缓存在
 `stats-rollout-cache.sqlite`，用文件 fingerprint 失效，热路径不会反复全量扫描 JSONL。
@@ -167,8 +167,7 @@ pricing 表时用 `--refresh-prices`。校准是显式触发的，因为它需�
 `cx stats --json` 输出 schema v2，并默认保持 token-only，完全不输出成本字段；
 `cx stats --json --refresh-prices` 会增加 `priceEstimate`，并在 period、slot、model 上输出
 成本字段。cx 自己拥有的 `price-cache.json`、`stats-calibration.json` 和
-`stats-rollout-cache.sqlite` 都位于 profile-manager 目录下。cx 不会改写 Codex 上游的
-`state_5.sqlite`。
+`stats-rollout-cache.sqlite` 都位于 profile-manager 目录下。stats 只读 Codex 状态数据库。
 
 在可预测的高强度工作前提前启动 5h 额度窗口：
 
@@ -180,7 +179,7 @@ cx prime status
 cx prime uninstall
 ```
 
-`cx prime plan` 会读取本地各 slot 的 `state_5.sqlite` 和 rollout token cache，推断最近
+`cx prime plan` 会读取共享的 `state_5.sqlite` 和 rollout token cache，推断最近
 高负载工作最常出现的本地小时，然后按 lead time 向前平移，默认提前 210 分钟。
 `cx prime install` 会写入 macOS LaunchAgent，使用精确的 `StartCalendarInterval` 时间点。
 cx 进程不会常驻后台；到点时由 launchd 拉起 `cx prime run`，Mac 睡眠期间错过的 calendar
@@ -213,12 +212,27 @@ cx desktop --target research
 `cx desktop` 会直接启动 Desktop 可执行文件，并把 `CODEX_HOME` 设为选中的 slot home；
 这样 Desktop 进程会读取这个 slot 的 `auth.json` 和账号状态。默认会通过 Desktop 的
 `--open-project` 参数打开当前工作目录，让这个 slot 的 Desktop 项目列表和启动它的 shell
-项目保持一致。slot 的 `env.conf` 会注入到 Desktop 进程；`overrides.conf` 不会传给
-Electron。默认情况下，如果已经有 ChatGPT Desktop 进程在运行，`cx desktop` 会拒绝继续启动，
+项目保持一致。所有 slot 都使用同一个 `~/.codex/sqlite`，因此 Desktop 和 CLI 读取的是同一份
+完整本地索引。CX 还会把 Desktop 默认的当前-provider 列表筛选改为所有 provider。具体
+transport 与认证配置在启动时统一映射到稳定的运行身份 `cx`，因此新会话不再记录
+slot 专属的 provider 名称。
+
+slot 的 `env.conf` 会注入到 Desktop 进程；`overrides.conf` 不会传给 Electron。默认情况下，
+如果已经有 ChatGPT Desktop 进程在运行，`cx desktop` 会拒绝继续启动，
 因为第二次启动可能复用旧 Electron 实例，导致新的 slot 环境没有生效。切换 slot 前请先退出
 ChatGPT Desktop；如果你明确要测试并行实例，可以传 `--allow-parallel`。默认安装路径同时兼容
 当前的 `ChatGPT.app` 和旧版 `Codex.app`。如果 Desktop 安装在其他位置，可以用 `--app-bin`
 或 `CX_CODEX_DESKTOP_BIN` 指定。
+
+从曾经使用 per-slot SQLite 的版本升级时，CX 会把各 slot 遗留数据库合并到
+`~/.codex/sqlite`。重复 thread 采用更新时间较新的索引行，并补齐缺失的关联行、memory 和 goal。
+旧的 per-slot 数据库会原地保留作为迁移备份；版本化 marker 会把它们移出启动热路径，正常启动
+不再打开或扫描这些旧库。如果仍在运行的旧进程又写入了遗留行，请先退出该进程，再显式重跑：
+
+```bash
+cx merge-sqlite --dry-run
+cx merge-sqlite
+```
 
 从当前 `~/.codex` 复制登录态：
 
@@ -337,7 +351,7 @@ export DEEPSEEK_API_KEY="sk-..."
 ## 升级
 
 cx 会针对已经公开发布过的版本创建的一次性 profile-manager 布局问题做启动修复。
-当前修复覆盖 stats cache schema、slot sqlite 位置，以及 `v0.4.1` 之前移除运行时留下的状态。
+当前修复覆盖 stats cache schema、per-slot 到共享 SQLite 的迁移，以及 `v0.4.1` 之前移除运行时留下的状态。
 
 公开版本范围和具体修复行为见 [Startup Upgrade Repairs](docs/upgrades.md)。
 

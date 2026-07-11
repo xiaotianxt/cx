@@ -56,6 +56,12 @@ impl ManagerPaths {
         self.slot_dir(slot).join("home")
     }
 
+    /// Shared SQLite index directory used by all slots so that Desktop and CLI
+    /// see threads from every provider. Lives at `~/.codex/sqlite`.
+    pub fn shared_sqlite_home(&self) -> PathBuf {
+        self.base_codex_home.join("sqlite")
+    }
+
     pub fn slot_sqlite_home(&self, slot: &str) -> PathBuf {
         self.slot_home(slot).join("sqlite")
     }

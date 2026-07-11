@@ -19,6 +19,11 @@ wrappers with a single Rust binary.
 - `selector`: parallel query orchestration and final slot choice.
 - `stats`: local usage reporting. Internally this separates SQLite reads,
   rollout calibration, pricing/cache handling, and aggregation.
+- `sqlite_merge`: consolidation of legacy per-slot state, memories,
+  and goals into the shared `~/.codex/sqlite` directory.
+- `runtime_provider`: maps each slot's concrete provider configuration onto the
+  stable `cx` runtime identity used in persisted conversations.
+- `desktop_proxy`: proxies the bundled app-server so Desktop lists all providers.
 - `envfile`: small parser/writer for `env.conf`.
 - `install`: copy the current `cx` binary into a bin directory.
 - `upgrade`: one-time startup repairs for profile-manager layouts created by

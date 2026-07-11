@@ -9,6 +9,7 @@ use std::time::UNIX_EPOCH;
 
 use anyhow::Context;
 use anyhow::Result;
+use rusqlite::Connection;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -31,6 +32,22 @@ const BASE_ITEMS: &[&str] = &[
     "keychain.conf",
     "models_cache.json",
     "session_index.jsonl",
+    "sessions",
+    "sqlite",
+    "version.json",
+];
+
+const BASE_COPY_ITEMS: &[&str] = &[
+    "auth.json",
+    "accounts",
+    "current",
+    "config.toml",
+    "AGENTS.md",
+    "installation_id",
+    "keychain.conf",
+    "models_cache.json",
+    "session_index.jsonl",
+    "sessions",
     "version.json",
 ];
 
@@ -51,7 +68,7 @@ const SLOT_HOME_FILES: &[&str] = &[
     ".codex-global-state.json.bak",
 ];
 
-const SLOT_HOME_DIRS: &[&str] = &["sqlite"];
+const SLOT_HOME_DIRS: &[&str] = &[];
 
 #[derive(Debug, Serialize, Deserialize)]
 struct TransferManifest {
@@ -81,7 +98,17 @@ pub fn export_with_paths(paths: &ManagerPaths, args: TransferExportArgs) -> Resu
         )
     })?;
 
-    let base_items = copy_named_items(&paths.base_codex_home, bundle.base_dir(), BASE_ITEMS, true)?;
+    let mut base_items = copy_named_items(
+        &paths.base_codex_home,
+        bundle.base_dir(),
+        BASE_COPY_ITEMS,
+        true,
+    )?;
+    let sqlite_home = paths.shared_sqlite_home();
+    if sqlite_home.is_dir() {
+        snapshot_sqlite_home(&sqlite_home, &bundle.base_dir().join("sqlite"))?;
+        base_items.push("sqlite".to_string());
+    }
     let manager_items = copy_named_items(
         &paths.manager_dir,
         bundle.profile_manager_dir(),
@@ -275,6 +302,41 @@ fn copy_named_items(
         }
     }
     Ok(copied)
+}
+
+fn snapshot_sqlite_home(source: &Path, dest: &Path) -> Result<()> {
+    if dest.exists() {
+        remove_path(dest)?;
+    }
+    fs::create_dir_all(dest).with_context(|| format!("create {}", dest.display()))?;
+    for entry in fs::read_dir(source).with_context(|| format!("read {}", source.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let file_name_text = file_name.to_string_lossy();
+        if file_name_text.ends_with("-wal") || file_name_text.ends_with("-shm") {
+            continue;
+        }
+        let destination = dest.join(&file_name);
+        if path.extension().and_then(|extension| extension.to_str()) == Some("sqlite") {
+            let conn =
+                Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                    .with_context(|| format!("open {} for transfer snapshot", path.display()))?;
+            conn.execute("VACUUM INTO ?1", [destination.display().to_string()])
+                .with_context(|| {
+                    format!(
+                        "snapshot SQLite database {} to {}",
+                        path.display(),
+                        destination.display()
+                    )
+                })?;
+            let permissions = fs::metadata(&path)?.permissions();
+            fs::set_permissions(&destination, permissions)?;
+        } else {
+            copy_entry(&path, &destination, true)?;
+        }
+    }
+    Ok(())
 }
 
 fn import_named_items(
@@ -716,6 +778,36 @@ mod tests {
         );
         assert!(!dest.slot_home("deepseek").join("auth.json").exists());
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sqlite_snapshot_captures_wal_transactions_without_sidecars() {
+        let root = temp_root("sqlite-wal-snapshot");
+        let source = root.join("source");
+        let dest = root.join("dest");
+        fs::create_dir_all(&source).unwrap();
+        let source_db = source.join("state_5.sqlite");
+        let conn = Connection::open(&source_db).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE threads (id TEXT PRIMARY KEY);
+             INSERT INTO threads VALUES ('from-wal');",
+        )
+        .unwrap();
+
+        snapshot_sqlite_home(&source, &dest).unwrap();
+
+        let snapshot = Connection::open(dest.join("state_5.sqlite")).unwrap();
+        let id: String = snapshot
+            .query_row("SELECT id FROM threads", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(id, "from-wal");
+        assert!(!dest.join("state_5.sqlite-wal").exists());
+        assert!(!dest.join("state_5.sqlite-shm").exists());
+
+        drop(conn);
         let _ = fs::remove_dir_all(root);
     }
 

@@ -5,6 +5,7 @@ mod completion;
 mod cx;
 mod daemon;
 mod desktop;
+mod desktop_proxy;
 mod envfile;
 mod install;
 mod keychain;
@@ -13,9 +14,11 @@ mod paths;
 mod prime;
 mod resume_id;
 mod run;
+mod runtime_provider;
 mod selector;
 mod session_scrub;
 mod slot;
+mod sqlite_merge;
 mod stats;
 mod target;
 mod terminal_resume;
@@ -49,6 +52,9 @@ fn main() -> ExitCode {
 
 fn entry() -> Result<()> {
     let raw_args = std::env::args_os().collect::<Vec<_>>();
+    if desktop_proxy::enabled() {
+        return desktop_proxy::run(raw_args.into_iter().skip(1).collect());
+    }
     let first_arg = raw_args.get(1).and_then(|arg| arg.to_str());
     if first_arg == Some(terminal_resume::WATCH_SESSION_ARG) {
         return terminal_resume::run_internal_watcher(raw_args.into_iter().skip(2).collect());
@@ -251,6 +257,34 @@ fn entry() -> Result<()> {
                     selector::query_slots_with_progress(&paths, &slots, options, &mut progress)?;
                 let selected = selector::choose_result(&results).map(|result| result.slot.clone());
                 output::print_report(&results, selected.as_deref(), false)?;
+            }
+        }
+        Command::MergeSqlite(args) => {
+            let paths = paths::ManagerPaths::new(args.manager_dir.clone())?;
+            let report = sqlite_merge::merge_slot_databases(&paths, args.dry_run)?;
+            if report.dry_run {
+                println!(
+                    "dry run: would merge {} slot database(s) into {}",
+                    report.sources.len(),
+                    report.shared_sqlite_home.display()
+                );
+                for slot in &report.sources {
+                    println!("  {slot}");
+                }
+                println!("source thread rows: {}", report.source_threads);
+                println!("current shared threads: {}", report.shared_threads);
+            } else {
+                println!(
+                    "merged {} slot database(s) into {}",
+                    report.sources.len(),
+                    report.shared_sqlite_home.display()
+                );
+                for slot in &report.sources {
+                    println!("  {slot}");
+                }
+                println!("source thread rows: {}", report.source_threads);
+                println!("shared unique threads: {}", report.shared_threads);
+                println!("per-slot databases retained as migration backups");
             }
         }
         Command::Install(args) => {

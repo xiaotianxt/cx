@@ -11,6 +11,7 @@ use anyhow::Result;
 use toml::Value as TomlValue;
 
 use crate::cli::DesktopArgs;
+use crate::desktop_proxy;
 use crate::envfile;
 use crate::paths::ManagerPaths;
 use crate::run;
@@ -354,15 +355,19 @@ fn build_desktop_launch_spec(
     let target_overrides = target
         .map(|t| t.overrides().iter().cloned())
         .unwrap_or_default();
-    let all_overrides: Vec<String> = overrides.into_iter().chain(target_overrides).collect();
-    if !all_overrides.is_empty() {
-        materialize_slot_config_toml(&slot_home, &all_overrides)?;
-    }
+    let mut all_overrides: Vec<String> = overrides.into_iter().chain(target_overrides).collect();
+    let runtime_overrides = crate::runtime_provider::resolve(
+        &paths.base_codex_home.join("config.toml"),
+        &all_overrides,
+    )?;
+    all_overrides.extend(runtime_overrides);
+    materialize_slot_config_toml(&slot_home, &all_overrides)?;
     let target_name = target.map(|target| target.name().to_string());
     if let Some(target) = target {
         envs.extend(target.env().clone());
     }
-    let sqlite_home = paths.slot_sqlite_home(selected_slot);
+    inject_desktop_codex_proxy(&app_bin, &mut envs)?;
+    let sqlite_home = paths.shared_sqlite_home();
     fs::create_dir_all(&sqlite_home)
         .with_context(|| format!("create sqlite home {}", sqlite_home.display()))?;
     envs.insert(
@@ -384,6 +389,27 @@ fn build_desktop_launch_spec(
         slot: selected_slot.to_string(),
         target_name,
     })
+}
+
+fn inject_desktop_codex_proxy(app_bin: &Path, envs: &mut BTreeMap<String, String>) -> Result<()> {
+    let cx_exe = std::env::current_exe().context("resolve cx executable")?;
+    let contents_dir = app_bin
+        .parent()
+        .and_then(Path::parent)
+        .with_context(|| format!("resolve app bundle from {}", app_bin.display()))?;
+    let real_codex = contents_dir.join("Resources/codex");
+
+    envs.insert(
+        desktop_proxy::CODEX_CLI_PATH_ENV.to_string(),
+        cx_exe.display().to_string(),
+    );
+    envs.insert(desktop_proxy::ENABLE_ENV.to_string(), "1".to_string());
+    envs.insert(
+        desktop_proxy::REAL_CODEX_ENV.to_string(),
+        real_codex.display().to_string(),
+    );
+    envs.insert(desktop_proxy::FORCE_CLI_ENV.to_string(), "1".to_string());
+    Ok(())
 }
 
 fn ensure_open_project_arg(mut args: Vec<OsString>, workspace_root: &Path) -> Vec<OsString> {
@@ -578,10 +604,23 @@ mod tests {
         assert_eq!(spec.envs.get("TARGET_ONLY"), Some(&"target".to_string()));
         assert_eq!(spec.envs.get("SHARED"), Some(&"target".to_string()));
         assert_eq!(
-            spec.envs.get(run::CODEX_SQLITE_HOME),
-            Some(&paths.slot_sqlite_home("bus1").display().to_string())
+            spec.envs.get(desktop_proxy::ENABLE_ENV),
+            Some(&"1".to_string())
         );
-        assert!(paths.slot_sqlite_home("bus1").is_dir());
+        assert_eq!(
+            spec.envs.get(desktop_proxy::FORCE_CLI_ENV),
+            Some(&"1".to_string())
+        );
+        assert!(spec.envs.contains_key(desktop_proxy::CODEX_CLI_PATH_ENV));
+        assert_eq!(
+            spec.envs.get(desktop_proxy::REAL_CODEX_ENV),
+            Some(&"/Resources/codex".to_string())
+        );
+        assert_eq!(
+            spec.envs.get(run::CODEX_SQLITE_HOME),
+            Some(&paths.shared_sqlite_home().display().to_string())
+        );
+        assert!(paths.shared_sqlite_home().is_dir());
         let command = spec.command();
         let command_sqlite_home = command
             .get_envs()
@@ -593,7 +632,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             command_sqlite_home,
-            paths.slot_sqlite_home("bus1").display().to_string()
+            paths.shared_sqlite_home().display().to_string()
         );
         assert_eq!(command.get_current_dir(), Some(cwd.as_path()));
         assert_eq!(spec.target_name(), Some("work"));
@@ -665,6 +704,45 @@ mod tests {
                 cwd.as_os_str().to_os_string(),
             ]
         );
+    }
+
+    #[test]
+    fn desktop_spec_materializes_cx_runtime_provider() {
+        let root = temp_root("desktop-cx-runtime-provider");
+        let base = root.join(".codex");
+        let manager = base.join("profile-manager");
+        let cwd = root.join("work");
+        let paths = ManagerPaths::from_roots(base, manager);
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(paths.slot_home("pku")).unwrap();
+        fs::write(
+            paths.base_codex_home.join("config.toml"),
+            "model = \"gpt-5.4\"\n",
+        )
+        .unwrap();
+        fs::write(
+            paths.slot_dir("pku").join("overrides.conf"),
+            concat!(
+                "model = \"GLM-5.2\"\n",
+                "model_provider = \"pku\"\n",
+                "model_providers.pku = { name = \"PKU\", base_url = \"https://example.test/v1\", wire_api = \"responses\", env_key = \"OPENAI_API_KEY\", requires_openai_auth = false }\n"
+            ),
+        )
+        .unwrap();
+
+        build_desktop_launch_spec(
+            &paths,
+            PathBuf::from("/tmp/Codex"),
+            "pku",
+            None,
+            &cwd,
+            Vec::new(),
+        )
+        .unwrap();
+        let materialized = fs::read_to_string(paths.slot_home("pku").join("config.toml")).unwrap();
+
+        assert!(materialized.contains("model_provider = \"cx\""));
+        assert!(materialized.contains("[model_providers.cx]"));
     }
 
     #[test]

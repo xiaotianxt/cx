@@ -1330,22 +1330,7 @@ fn launch_agent_path() -> Result<PathBuf> {
 }
 
 fn state_db_paths(paths: &ManagerPaths) -> Result<Vec<PathBuf>> {
-    let mut dbs = Vec::new();
-    dbs.push(paths.base_codex_home.join(STATE_DB));
-    if paths.slots_dir.is_dir() {
-        for entry in fs::read_dir(&paths.slots_dir)
-            .with_context(|| format!("read {}", paths.slots_dir.display()))?
-        {
-            let entry = entry?;
-            if !entry.file_type()?.is_dir() {
-                continue;
-            }
-            dbs.push(entry.path().join("home/sqlite").join(STATE_DB));
-        }
-    }
-    dbs.sort();
-    dbs.dedup();
-    Ok(dbs)
+    Ok(vec![paths.shared_sqlite_home().join(STATE_DB)])
 }
 
 fn cache_path(paths: &ManagerPaths, relative: impl AsRef<Path>) -> PathBuf {

@@ -51,6 +51,8 @@ pub enum Command {
     Target(TargetArgs),
     /// Validate the local profile-manager layout.
     Doctor(DoctorArgs),
+    /// Merge per-slot SQLite indexes into the shared ~/.codex/sqlite database.
+    MergeSqlite(MergeSqliteArgs),
     /// Install cx into ~/.local/bin.
     Install(InstallArgs),
     /// Generate launcher shell completion scripts.
@@ -1029,4 +1031,15 @@ pub struct InstallArgs {
     /// Replace an existing cx binary.
     #[arg(long)]
     pub force: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct MergeSqliteArgs {
+    /// Profile-manager directory. Defaults to ~/.codex/profile-manager.
+    #[arg(long, value_hint = clap::ValueHint::DirPath)]
+    pub manager_dir: Option<PathBuf>,
+
+    /// Show what would be merged without writing.
+    #[arg(long)]
+    pub dry_run: bool,
 }

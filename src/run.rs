@@ -302,7 +302,7 @@ pub fn run_from_args(args: Vec<OsString>) -> Result<()> {
 pub fn exec_slot_login(paths: &ManagerPaths, args: LoginArgs) -> Result<()> {
     let real_codex = resolve_codex_bin(args.codex_bin.as_deref())?;
     let slot_home = paths.slot_home(&args.slot);
-    let sqlite_home = paths.slot_sqlite_home(&args.slot);
+    let sqlite_home = paths.shared_sqlite_home();
     ensure_sqlite_home(&sqlite_home)?;
     let mut command = Command::new(real_codex);
     command.env("CODEX_HOME", slot_home);
@@ -389,7 +389,10 @@ pub(crate) fn build_slot_command_spec(
         overrides.extend(target.overrides().iter().cloned());
         envs.extend(target.env().clone());
     }
-    insert_sqlite_home_env(&mut envs, paths.slot_sqlite_home(selected_slot))?;
+    let runtime_overrides =
+        crate::runtime_provider::resolve(&paths.base_codex_home.join("config.toml"), &overrides)?;
+    overrides.extend(runtime_overrides);
+    insert_sqlite_home_env(&mut envs, paths.shared_sqlite_home())?;
 
     inject_keychain_access_token(&slot_dir, selected_slot, &mut envs)?;
 
@@ -1201,8 +1204,8 @@ mod tests {
     }
 
     #[test]
-    fn slot_command_spec_injects_slot_sqlite_home() {
-        let paths = test_paths("slot-sqlite-home");
+    fn slot_command_spec_injects_shared_sqlite_home() {
+        let paths = test_paths("shared-sqlite-home");
         fs::create_dir_all(&paths.base_codex_home).unwrap();
         fs::create_dir_all(paths.slot_home("dia4")).unwrap();
         fs::create_dir_all(paths.slot_dir("dia4")).unwrap();
@@ -1222,9 +1225,9 @@ mod tests {
         .unwrap();
         let sqlite_home = spec.envs.get(CODEX_SQLITE_HOME).unwrap();
 
-        assert_eq!(PathBuf::from(sqlite_home), paths.slot_sqlite_home("dia4"));
+        assert_eq!(PathBuf::from(sqlite_home), paths.shared_sqlite_home());
         assert_ne!(PathBuf::from(sqlite_home), paths.base_codex_home);
-        assert!(paths.slot_sqlite_home("dia4").is_dir());
+        assert!(paths.shared_sqlite_home().is_dir());
 
         let _ = fs::remove_dir_all(&paths.manager_dir);
         let _ = fs::remove_dir_all(&paths.base_codex_home);

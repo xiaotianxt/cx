@@ -187,7 +187,7 @@ cx stats --json --refresh-prices
 cx stats --calibrate
 ```
 
-`cx stats` reads Codex's local `state_5.sqlite` and, when rollout JSONL files
+`cx stats` reads the shared Codex `~/.codex/sqlite/state_5.sqlite` and, when rollout JSONL files
 are available, buckets timestamped `token_count` deltas by day for the selected
 range. If a rollout is missing or cannot be parsed, it falls back to bucketing
 `threads.tokens_used` by `threads.updated_at`. Rollout parsing is cached in
@@ -205,8 +205,8 @@ explicit because it scans rollout JSONL files.
 fields entirely. `cx stats --json --refresh-prices` adds a `priceEstimate` object
 plus per-period, per-slot, and per-model cost fields. cx-owned
 `price-cache.json`, `stats-calibration.json`, and `stats-rollout-cache.sqlite`
-live under the profile-manager directory. cx never rewrites Codex's upstream
-`state_5.sqlite`.
+live under the profile-manager directory. Stats reads the Codex state database
+without modifying it.
 
 Prime 5h quota windows before predictable heavy work:
 
@@ -218,7 +218,7 @@ cx prime status
 cx prime uninstall
 ```
 
-`cx prime plan` reads local `state_5.sqlite` files and the rollout token cache to
+`cx prime plan` reads the shared `state_5.sqlite` and the rollout token cache to
 infer the heaviest local work hours, then shifts those hours earlier by the
 configured lead time, 210 minutes by default. `cx prime install` writes a macOS
 LaunchAgent with exact `StartCalendarInterval` entries for those local times.
@@ -256,15 +256,35 @@ cx desktop --target research
 selected slot home, so the Desktop process reads that slot's `auth.json` and
 account state. The current working directory is opened with Desktop's
 `--open-project` argument by default, which keeps the slot's Desktop project
-list aligned with the shell project that launched it. `env.conf` values are
-passed to the Desktop process; slot `overrides.conf` values are not forwarded to
-Electron. By default, `cx desktop` refuses to launch while another ChatGPT Desktop
-process is running, because a second launch may reuse the old Electron instance
-and ignore the new slot environment. Quit ChatGPT Desktop before switching slots,
-or pass `--allow-parallel` when you intentionally want to test parallel
-instances. The default installation paths support both the current `ChatGPT.app`
-name and the legacy `Codex.app` name. If ChatGPT Desktop is installed somewhere
-else, use `--app-bin` or `CX_CODEX_DESKTOP_BIN`.
+list aligned with the shell project that launched it. Every slot uses the same
+`~/.codex/sqlite` directory, so Desktop and CLI see one complete local index.
+CX also changes Desktop's default thread-list filter from the active provider to
+all providers. At launch, CX exposes the selected slot's concrete transport and
+auth settings under one stable runtime provider id, `cx`. New threads therefore
+record `cx` instead of a slot-specific provider name.
+
+`env.conf` values are passed to the Desktop process; slot
+`overrides.conf` values are not forwarded to Electron. By default, `cx desktop`
+refuses to launch while another ChatGPT Desktop process is running, because a
+second launch may reuse the old Electron instance and ignore the new slot
+environment. Quit ChatGPT Desktop before switching slots, or pass
+`--allow-parallel` when you intentionally want to test parallel instances. The
+default installation paths support both the current `ChatGPT.app` name and the
+legacy `Codex.app` name. If ChatGPT Desktop is installed somewhere else, use
+`--app-bin` or `CX_CODEX_DESKTOP_BIN`.
+
+When upgrading from a release that kept SQLite per slot, CX merges those legacy
+indexes into `~/.codex/sqlite`. Duplicate threads use the newest indexed row;
+missing related rows, memories, and goals are added. The old per-slot databases
+remain in place as migration backups. A versioned marker retires those backups
+from the startup hot path, so normal launches do not reopen or scan them. If an
+older still-running process creates a new legacy row, rerun the migration
+explicitly after that process exits:
+
+```bash
+cx merge-sqlite --dry-run
+cx merge-sqlite
+```
 
 Copy the current `~/.codex` auth state into a slot:
 
@@ -390,8 +410,9 @@ For a fully explicit source, set `CX_OLLAMA_COOKIE_DB` and optionally
 ## Upgrades
 
 cx runs one-time startup repairs for profile-manager layouts created by already
-published versions. The current repair covers stats cache schemas, slot sqlite
-placement, and removed runtime state from tags through `v0.4.1`.
+published versions. The current repair covers stats cache schemas, migration
+from per-slot to shared SQLite, and removed runtime state from tags through
+`v0.4.1`.
 
 See [Startup Upgrade Repairs](docs/upgrades.md) for the public version matrix
 and repair behavior.

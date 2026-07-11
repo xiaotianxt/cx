@@ -38,17 +38,22 @@ struct StartupRepairReport {
 }
 
 pub(crate) fn run_startup(paths: &ManagerPaths) -> Result<()> {
-    run_startup_inner(paths, false)
-}
-
-pub(crate) fn run_after_import(paths: &ManagerPaths) -> Result<()> {
-    run_startup_inner(paths, true)
-}
-
-fn run_startup_inner(paths: &ManagerPaths, force: bool) -> Result<()> {
     if std::env::var_os("CX_DISABLE_STARTUP_REPAIR").is_some() {
         return Ok(());
     }
+    run_startup_inner(paths, false)?;
+    crate::sqlite_merge::run_startup_migration(paths, false)
+}
+
+pub(crate) fn run_after_import(paths: &ManagerPaths) -> Result<()> {
+    if std::env::var_os("CX_DISABLE_STARTUP_REPAIR").is_some() {
+        return Ok(());
+    }
+    run_startup_inner(paths, true)?;
+    crate::sqlite_merge::run_startup_migration(paths, true)
+}
+
+fn run_startup_inner(paths: &ManagerPaths, force: bool) -> Result<()> {
     if !force && startup_repair_marker(paths).exists() {
         return Ok(());
     }
@@ -433,11 +438,11 @@ mod tests {
 
         assert!(!slot_home.join("state_5.sqlite").exists());
         assert_eq!(
-            fs::read_to_string(paths.slot_sqlite_home("dia1").join("state_5.sqlite")).unwrap(),
+            fs::read_to_string(paths.slot_home("dia1").join("sqlite/state_5.sqlite")).unwrap(),
             "state"
         );
         assert_eq!(
-            fs::read_to_string(paths.slot_sqlite_home("dia1").join("state_5.sqlite-wal")).unwrap(),
+            fs::read_to_string(paths.slot_home("dia1").join("sqlite/state_5.sqlite-wal")).unwrap(),
             "wal"
         );
 

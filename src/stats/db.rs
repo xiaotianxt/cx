@@ -18,50 +18,15 @@ use super::STATE_DB;
 
 pub(super) fn state_db_paths(
     paths: &ManagerPaths,
-    slot_filters: &BTreeSet<String>,
+    _slot_filters: &BTreeSet<String>,
 ) -> Result<Vec<PathBuf>> {
-    let mut candidates = Vec::new();
-    candidates.push(paths.base_codex_home.join(STATE_DB));
-
-    if slot_filters.is_empty() {
-        if paths.slots_dir.is_dir() {
-            for entry in fs::read_dir(&paths.slots_dir)
-                .with_context(|| format!("read {}", paths.slots_dir.display()))?
-            {
-                let entry = entry?;
-                if entry.file_type()?.is_dir() {
-                    candidates.push(slot_home_state_db_path(entry.path().join("home")));
-                }
-            }
-        }
-    } else {
-        for slot in slot_filters {
-            candidates.push(slot_state_db_path(paths, slot));
-        }
+    let db_path = paths.shared_sqlite_home().join(STATE_DB);
+    if !db_path.exists() {
+        return Ok(Vec::new());
     }
-
-    let mut seen = BTreeSet::new();
-    let mut db_paths = Vec::new();
-    for candidate in candidates {
-        if !candidate.exists() {
-            continue;
-        }
-        let canonical = fs::canonicalize(&candidate)
-            .with_context(|| format!("resolve {}", candidate.display()))?;
-        if seen.insert(canonical.clone()) {
-            db_paths.push(canonical);
-        }
-    }
-    db_paths.sort();
-    Ok(db_paths)
-}
-
-fn slot_state_db_path(paths: &ManagerPaths, slot: &str) -> PathBuf {
-    slot_home_state_db_path(paths.slot_home(slot))
-}
-
-fn slot_home_state_db_path(slot_home: PathBuf) -> PathBuf {
-    slot_home.join("sqlite").join(STATE_DB)
+    Ok(vec![fs::canonicalize(&db_path).with_context(|| {
+        format!("resolve {}", db_path.display())
+    })?])
 }
 
 pub(super) fn read_threads(
@@ -215,10 +180,10 @@ mod tests {
     }
 
     #[test]
-    fn state_db_paths_finds_slot_sqlite_home_without_filter() {
-        let paths = temp_paths("slot-sqlite-no-filter");
-        let db_path = paths.slot_sqlite_home("dia1").join(STATE_DB);
-        fs::create_dir_all(db_path.parent().unwrap()).expect("create slot sqlite home");
+    fn state_db_paths_finds_shared_sqlite_home_without_filter() {
+        let paths = temp_paths("shared-sqlite-no-filter");
+        let db_path = paths.shared_sqlite_home().join(STATE_DB);
+        fs::create_dir_all(db_path.parent().unwrap()).expect("create shared sqlite home");
         fs::write(&db_path, "").expect("write slot state db");
 
         let db_paths = state_db_paths(&paths, &BTreeSet::new()).expect("find db paths");
@@ -230,10 +195,10 @@ mod tests {
     }
 
     #[test]
-    fn state_db_paths_finds_slot_sqlite_home_with_filter() {
-        let paths = temp_paths("slot-sqlite-filter");
-        let db_path = paths.slot_sqlite_home("dia1").join(STATE_DB);
-        fs::create_dir_all(db_path.parent().unwrap()).expect("create slot sqlite home");
+    fn state_db_paths_finds_shared_sqlite_home_with_filter() {
+        let paths = temp_paths("shared-sqlite-filter");
+        let db_path = paths.shared_sqlite_home().join(STATE_DB);
+        fs::create_dir_all(db_path.parent().unwrap()).expect("create shared sqlite home");
         fs::write(&db_path, "").expect("write slot state db");
 
         let db_paths = state_db_paths(&paths, &slot_filter("dia1")).expect("find db paths");
@@ -248,7 +213,8 @@ mod tests {
     fn reads_wal_database_when_sidecars_are_missing() {
         let paths = temp_paths("missing-wal-sidecars");
         fs::create_dir_all(&paths.base_codex_home).expect("create codex home");
-        let db_path = paths.base_codex_home.join(STATE_DB);
+        let db_path = paths.shared_sqlite_home().join(STATE_DB);
+        fs::create_dir_all(db_path.parent().unwrap()).expect("create sqlite home");
         {
             let conn = Connection::open(&db_path).expect("open writable db");
             conn.execute_batch(

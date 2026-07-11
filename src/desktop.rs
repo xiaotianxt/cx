@@ -289,8 +289,8 @@ fn materialize_slot_config_toml(slot_home: &Path, overrides: &[String]) -> Resul
     };
 
     for line in overrides {
-        let parsed: TomlValue = toml::from_str(line)
-            .with_context(|| format!("parse override line: {line}"))?;
+        let parsed: TomlValue =
+            toml::from_str(line).with_context(|| format!("parse override line: {line}"))?;
         if let Some(table) = parsed.as_table() {
             for (key, val) in table {
                 merge_toml_value(&mut value, key, val.clone());
@@ -298,8 +298,7 @@ fn materialize_slot_config_toml(slot_home: &Path, overrides: &[String]) -> Resul
         }
     }
 
-    let merged = toml::to_string_pretty(&value)
-        .with_context(|| "serialize merged config.toml")?;
+    let merged = toml::to_string_pretty(&value).with_context(|| "serialize merged config.toml")?;
 
     // Replace the symlink (or file) with a real file containing merged config.
     if fs::symlink_metadata(&config_path)

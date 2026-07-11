@@ -354,10 +354,7 @@ fn build_desktop_launch_spec(
     let target_overrides = target
         .map(|t| t.overrides().iter().cloned())
         .unwrap_or_default();
-    let all_overrides: Vec<String> = overrides
-        .into_iter()
-        .chain(target_overrides.into_iter())
-        .collect();
+    let all_overrides: Vec<String> = overrides.into_iter().chain(target_overrides).collect();
     if !all_overrides.is_empty() {
         materialize_slot_config_toml(&slot_home, &all_overrides)?;
     }

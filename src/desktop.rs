@@ -8,6 +8,7 @@ use std::process::Stdio;
 
 use anyhow::Context;
 use anyhow::Result;
+use toml::Value as TomlValue;
 
 use crate::cli::DesktopArgs;
 use crate::envfile;
@@ -269,6 +270,67 @@ fn normalize_desktop_bin(path: PathBuf) -> PathBuf {
     }
 }
 
+/// After `repair_slot_layout` re-symlinks `config.toml` to the global file,
+/// merge `overrides.conf` lines into a slot-private `config.toml` so the
+/// desktop app picks up custom model providers and settings.
+fn materialize_slot_config_toml(slot_home: &Path, overrides: &[String]) -> Result<()> {
+    let config_path = slot_home.join("config.toml");
+    let base_content = if config_path.exists() {
+        fs::read_to_string(&config_path)
+            .with_context(|| format!("read config.toml from {}", config_path.display()))?
+    } else {
+        String::new()
+    };
+
+    let mut value: TomlValue = if base_content.trim().is_empty() {
+        TomlValue::Table(Default::default())
+    } else {
+        toml::from_str(&base_content).with_context(|| "parse config.toml")?
+    };
+
+    for line in overrides {
+        let parsed: TomlValue = toml::from_str(line)
+            .with_context(|| format!("parse override line: {line}"))?;
+        if let Some(table) = parsed.as_table() {
+            for (key, val) in table {
+                merge_toml_value(&mut value, key, val.clone());
+            }
+        }
+    }
+
+    let merged = toml::to_string_pretty(&value)
+        .with_context(|| "serialize merged config.toml")?;
+
+    // Replace the symlink (or file) with a real file containing merged config.
+    if fs::symlink_metadata(&config_path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        fs::remove_file(&config_path)
+            .with_context(|| format!("remove symlink {}", config_path.display()))?;
+    }
+    fs::write(&config_path, merged)
+        .with_context(|| format!("write slot config.toml {}", config_path.display()))?;
+
+    Ok(())
+}
+
+fn merge_toml_value(target: &mut TomlValue, key: &str, value: TomlValue) {
+    if let Some(target_table) = target.as_table_mut() {
+        if let Some(existing) = target_table.get_mut(key) {
+            if let (Some(existing_table), Some(new_table)) =
+                (existing.as_table_mut(), value.as_table())
+            {
+                for (sub_key, sub_val) in new_table {
+                    existing_table.insert(sub_key.clone(), sub_val.clone());
+                }
+                return;
+            }
+        }
+        target_table.insert(key.to_string(), value);
+    }
+}
+
 fn build_desktop_launch_spec(
     paths: &ManagerPaths,
     app_bin: PathBuf,
@@ -289,6 +351,17 @@ fn build_desktop_launch_spec(
 
     let slot_dir = paths.slot_dir(selected_slot);
     let mut envs = envfile::read_env_file(&slot_dir.join("env.conf"))?;
+    let overrides = slot::read_override_lines(&slot_dir)?;
+    let target_overrides = target
+        .map(|t| t.overrides().iter().cloned())
+        .unwrap_or_default();
+    let all_overrides: Vec<String> = overrides
+        .into_iter()
+        .chain(target_overrides.into_iter())
+        .collect();
+    if !all_overrides.is_empty() {
+        materialize_slot_config_toml(&slot_home, &all_overrides)?;
+    }
     let target_name = target.map(|target| target.name().to_string());
     if let Some(target) = target {
         envs.extend(target.env().clone());

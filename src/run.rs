@@ -750,6 +750,39 @@ mod tests {
     }
 
     #[test]
+    fn slot_command_preserves_resume_id_without_materializing_a_copy() {
+        let paths = test_paths("resume-pass-through");
+        fs::create_dir_all(&paths.base_codex_home).unwrap();
+        fs::create_dir_all(paths.slot_home("dia4")).unwrap();
+        fs::create_dir_all(paths.slot_dir("dia4")).unwrap();
+        let session_id = "019dfdd3-debc-7da2-88fc-b15b73f5e138";
+
+        let spec = build_slot_command_spec(
+            &paths,
+            PathBuf::from("/bin/codex"),
+            "dia4",
+            None,
+            vec![OsString::from("resume"), OsString::from(session_id)],
+        )
+        .unwrap();
+        let args = spec
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy())
+            .collect::<Vec<_>>();
+
+        assert_eq!(args[args.len() - 2..], ["resume", session_id]);
+        assert!(!paths.shared_sqlite_home().join("state_5.sqlite").exists());
+        assert!(!paths
+            .slot_home("dia4")
+            .join("cx-scrubbed-sessions")
+            .exists());
+
+        let _ = fs::remove_dir_all(&paths.manager_dir);
+        let _ = fs::remove_dir_all(&paths.base_codex_home);
+    }
+
+    #[test]
     fn default_command_uses_shared_sqlite_and_cx_runtime() {
         let paths = test_paths("default-cx-runtime");
         fs::create_dir_all(&paths.base_codex_home).unwrap();

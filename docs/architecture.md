@@ -102,6 +102,10 @@ Unix so the final process is the real Codex binary with:
 - repeated target `set`/`overrides` lines, appended after slot overrides
 - the user's original Codex args
 
+Resume arguments follow the same path: CX forwards the original thread ID
+unchanged, and shared SQLite lets Codex resolve the canonical rollout path. CX
+does not copy or rewrite rollout JSONL files during resume.
+
 Target-specific execution resolves in this order:
 
 1. `--slot` wins when supplied.

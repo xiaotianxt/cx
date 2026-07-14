@@ -10,6 +10,9 @@ use rusqlite::OpenFlags;
 use crate::paths::ManagerPaths;
 
 const MIGRATION_ID: &str = "shared-sqlite-v1";
+const MIGRATION_SCHEMA_VERSION: u64 = 3;
+const SQLITE_SIDECARS: &[&str] = &["", "-shm", "-wal"];
+const LEGACY_LOG_DATABASE: &str = "logs_2.sqlite";
 const DATABASES: &[DatabaseSpec] = &[
     DatabaseSpec {
         file_name: "state_5.sqlite",
@@ -95,6 +98,7 @@ pub struct MergeReport {
     pub sources: Vec<String>,
     pub source_threads: u64,
     pub shared_threads: u64,
+    pub removed_legacy_files: usize,
     pub dry_run: bool,
 }
 
@@ -102,6 +106,7 @@ pub struct MergeReport {
 struct SlotSource {
     slot: String,
     sqlite_home: PathBuf,
+    remove_dir_when_empty: bool,
 }
 
 pub fn merge_slot_databases(paths: &ManagerPaths, dry_run: bool) -> Result<MergeReport> {
@@ -113,20 +118,28 @@ pub fn merge_slot_databases(paths: &ManagerPaths, dry_run: bool) -> Result<Merge
         .into_iter()
         .sum();
 
-    if !dry_run {
+    let (shared_threads, removed_legacy_files) = if !dry_run {
         fs::create_dir_all(paths.shared_sqlite_home())
             .with_context(|| format!("create {}", paths.shared_sqlite_home().display()))?;
         for database in DATABASES {
             merge_database_family(paths, &sources, *database)?;
         }
-    }
+        let shared_threads = count_threads(&paths.shared_sqlite_home().join("state_5.sqlite"))?;
+        let removed_legacy_files = cleanup_legacy_sources(paths, &sources)?;
+        (shared_threads, removed_legacy_files)
+    } else {
+        (
+            count_threads(&paths.shared_sqlite_home().join("state_5.sqlite"))?,
+            0,
+        )
+    };
 
-    let shared_threads = count_threads(&paths.shared_sqlite_home().join("state_5.sqlite"))?;
     let report = MergeReport {
         shared_sqlite_home: paths.shared_sqlite_home(),
-        sources: sources.into_iter().map(|source| source.slot).collect(),
+        sources: sources.iter().map(|source| source.slot.clone()).collect(),
         source_threads,
         shared_threads,
+        removed_legacy_files,
         dry_run,
     };
     if !dry_run {
@@ -149,11 +162,17 @@ pub fn run_startup_migration(paths: &ManagerPaths, force: bool) -> Result<()> {
     };
     if !report.sources.is_empty() {
         eprintln!(
-            "cx upgrade: merged {} legacy SQLite source{} into {} ({} unique threads)",
+            "cx upgrade: merged {} legacy SQLite source{} into {} ({} unique threads); removed {} legacy file{}",
             report.sources.len(),
             if report.sources.len() == 1 { "" } else { "s" },
             report.shared_sqlite_home.display(),
-            report.shared_threads
+            report.shared_threads,
+            report.removed_legacy_files,
+            if report.removed_legacy_files == 1 {
+                ""
+            } else {
+                "s"
+            },
         );
     }
     Ok(())
@@ -170,7 +189,7 @@ fn write_migration_marker(paths: &ManagerPaths, report: &MergeReport) -> Result<
     let marker = migration_marker(paths);
     fs::create_dir_all(marker.parent().expect("migration marker has parent"))?;
     let value = serde_json::json!({
-        "schemaVersion": 2,
+        "schemaVersion": MIGRATION_SCHEMA_VERSION,
         "migrationId": MIGRATION_ID,
         "sources": report.sources,
         "sourceThreads": report.source_threads,
@@ -190,17 +209,72 @@ fn migration_is_current(paths: &ManagerPaths) -> Result<bool> {
     };
     Ok(
         value.get("migrationId").and_then(|value| value.as_str()) == Some(MIGRATION_ID)
-            && value.get("schemaVersion").and_then(|value| value.as_u64()) == Some(2)
+            && value.get("schemaVersion").and_then(|value| value.as_u64())
+                == Some(MIGRATION_SCHEMA_VERSION)
             && paths.shared_sqlite_home().join("state_5.sqlite").is_file(),
     )
 }
 
+fn cleanup_legacy_sources(paths: &ManagerPaths, sources: &[SlotSource]) -> Result<usize> {
+    let shared_sqlite_home = paths.shared_sqlite_home();
+    let mut removed = 0;
+    for source in sources {
+        for database in DATABASES {
+            if shared_sqlite_home.join(database.file_name).is_file() {
+                removed += remove_database_family(&source.sqlite_home, database.file_name)?;
+            }
+        }
+        // Per-slot logs are bounded diagnostics, not conversation state. They
+        // are not merged because their integer row ids are database-local. Once
+        // shared state exists, the legacy diagnostics are obsolete and the next
+        // Codex process will create the shared log database if needed.
+        if shared_sqlite_home.join("state_5.sqlite").is_file() {
+            removed += remove_database_family(&source.sqlite_home, LEGACY_LOG_DATABASE)?;
+        }
+        if source.remove_dir_when_empty && directory_is_empty(&source.sqlite_home)? {
+            fs::remove_dir(&source.sqlite_home)
+                .with_context(|| format!("remove {}", source.sqlite_home.display()))?;
+        }
+    }
+    Ok(removed)
+}
+
+fn remove_database_family(directory: &Path, database: &str) -> Result<usize> {
+    let mut removed = 0;
+    for suffix in SQLITE_SIDECARS {
+        let path = directory.join(format!("{database}{suffix}"));
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(err).with_context(|| format!("stat {}", path.display())),
+        };
+        if metadata.file_type().is_dir() {
+            anyhow::bail!(
+                "refusing to remove legacy SQLite directory {}",
+                path.display()
+            );
+        }
+        fs::remove_file(&path).with_context(|| format!("remove {}", path.display()))?;
+        removed += 1;
+    }
+    Ok(removed)
+}
+
+fn directory_is_empty(path: &Path) -> Result<bool> {
+    Ok(fs::read_dir(path)
+        .with_context(|| format!("read {}", path.display()))?
+        .next()
+        .transpose()?
+        .is_none())
+}
+
 fn discover_slot_sources(paths: &ManagerPaths) -> Result<Vec<SlotSource>> {
     let mut sources = Vec::new();
-    if paths.base_codex_home.join("state_5.sqlite").is_file() {
+    if has_legacy_database(&paths.base_codex_home) {
         sources.push(SlotSource {
             slot: "legacy-base".to_string(),
             sqlite_home: paths.base_codex_home.clone(),
+            remove_dir_when_empty: false,
         });
     }
     if !paths.slots_dir.is_dir() {
@@ -213,17 +287,34 @@ fn discover_slot_sources(paths: &ManagerPaths) -> Result<Vec<SlotSource>> {
         if !entry.file_type()?.is_dir() {
             continue;
         }
-        let sqlite_home = entry.path().join("home/sqlite");
-        if !sqlite_home.join("state_5.sqlite").is_file() {
+        let slot = entry.file_name().to_string_lossy().to_string();
+        let slot_home = entry.path().join("home");
+        if has_legacy_database(&slot_home) {
+            sources.push(SlotSource {
+                slot: format!("{slot} (legacy root)"),
+                sqlite_home: slot_home.clone(),
+                remove_dir_when_empty: false,
+            });
+        }
+        let sqlite_home = slot_home.join("sqlite");
+        if !has_legacy_database(&sqlite_home) {
             continue;
         }
         sources.push(SlotSource {
-            slot: entry.file_name().to_string_lossy().to_string(),
+            slot,
             sqlite_home,
+            remove_dir_when_empty: true,
         });
     }
     sources.sort_by(|left, right| left.slot.cmp(&right.slot));
     Ok(sources)
+}
+
+fn has_legacy_database(directory: &Path) -> bool {
+    DATABASES
+        .iter()
+        .any(|database| directory.join(database.file_name).is_file())
+        || directory.join(LEGACY_LOG_DATABASE).is_file()
 }
 
 fn count_threads(path: &Path) -> Result<u64> {
@@ -582,6 +673,7 @@ mod tests {
             [],
         )
         .unwrap();
+        drop(conn);
 
         let report = merge_slot_databases(&paths, false).unwrap();
 
@@ -603,6 +695,7 @@ mod tests {
             INSERT INTO threads VALUES ('old', '/tmp/old.jsonl', 1, 1, 'cli', 'old');",
         )
         .unwrap();
+        drop(conn);
         create_state_db(
             &paths.slot_home("zzz-new").join("sqlite/state_5.sqlite"),
             &[("new", "cx", 2_000)],
@@ -633,63 +726,98 @@ mod tests {
 
         assert!(report.dry_run);
         assert_eq!(report.source_threads, 1);
+        assert_eq!(report.removed_legacy_files, 0);
         assert!(!paths.shared_sqlite_home().join("state_5.sqlite").exists());
+        assert!(paths
+            .slot_home("pku")
+            .join("sqlite/state_5.sqlite")
+            .exists());
         assert!(!migration_marker(&paths).exists());
         let _ = fs::remove_dir_all(&paths.base_codex_home);
     }
 
     #[test]
-    fn startup_marker_retires_legacy_sources_from_the_hot_path() {
-        let paths = temp_paths("source-changed");
-        let source = paths.slot_home("pku").join("sqlite/state_5.sqlite");
-        create_state_db(&source, &[("aaa", "pku", 1_000)]);
-        merge_slot_databases(&paths, false).unwrap();
-        assert!(migration_is_current(&paths).unwrap());
+    fn merge_removes_legacy_databases_and_sidecars() {
+        let paths = temp_paths("cleanup");
+        let source_dir = paths.slot_home("pku").join("sqlite");
+        create_state_db(&source_dir.join("state_5.sqlite"), &[("aaa", "pku", 1_000)]);
+        fs::write(source_dir.join("state_5.sqlite-shm"), []).unwrap();
+        fs::write(source_dir.join("state_5.sqlite-wal"), []).unwrap();
+        fs::write(source_dir.join("logs_2.sqlite"), []).unwrap();
+        fs::write(source_dir.join("logs_2.sqlite-shm"), []).unwrap();
+        fs::write(source_dir.join("logs_2.sqlite-wal"), []).unwrap();
+        let report = merge_slot_databases(&paths, false).unwrap();
 
-        let conn = Connection::open(&source).unwrap();
-        conn.execute(
-            "INSERT INTO threads
-             (id, rollout_path, created_at, updated_at, source, model_provider, updated_at_ms, preview)
-             VALUES ('bbb', '/tmp/bbb.jsonl', 2, 2, 'cli', 'pku', 2000, 'pku')",
-            [],
-        )
-        .unwrap();
-        drop(conn);
-
+        assert_eq!(report.removed_legacy_files, 6);
+        assert!(!source_dir.exists());
         assert!(migration_is_current(&paths).unwrap());
-        run_startup_migration(&paths, false).unwrap();
-        assert!(migration_is_current(&paths).unwrap());
-        let conn = Connection::open(paths.shared_sqlite_home().join("state_5.sqlite")).unwrap();
-        let count: i64 = conn
-            .query_row("SELECT count(*) FROM threads", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(count, 1);
-
-        run_startup_migration(&paths, true).unwrap();
-        let count: i64 = conn
-            .query_row("SELECT count(*) FROM threads", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(count, 2);
 
         let _ = fs::remove_dir_all(&paths.base_codex_home);
     }
 
     #[test]
-    fn startup_does_not_remerge_when_existing_thread_is_updated() {
-        let paths = temp_paths("source-metadata-changed");
+    fn cleanup_preserves_unknown_files_in_legacy_sqlite_directory() {
+        let paths = temp_paths("cleanup-unknown");
+        let source_dir = paths.slot_home("pku").join("sqlite");
+        let source = source_dir.join("state_5.sqlite");
+        create_state_db(&source, &[("aaa", "pku", 1_000)]);
+        fs::write(source_dir.join("keep.me"), "private").unwrap();
+
+        merge_slot_databases(&paths, false).unwrap();
+
+        assert!(!source.exists());
+        assert_eq!(
+            fs::read_to_string(source_dir.join("keep.me")).unwrap(),
+            "private"
+        );
+
+        let _ = fs::remove_dir_all(&paths.base_codex_home);
+    }
+
+    #[test]
+    fn cleanup_removes_direct_slot_database_without_removing_slot_home() {
+        let paths = temp_paths("cleanup-slot-root");
+        let slot_home = paths.slot_home("pku");
+        create_state_db(&slot_home.join("state_5.sqlite"), &[("aaa", "pku", 1_000)]);
+        fs::write(slot_home.join("auth.json"), "{}\n").unwrap();
+
+        let report = merge_slot_databases(&paths, false).unwrap();
+
+        assert_eq!(report.sources, vec!["pku (legacy root)"]);
+        assert!(!slot_home.join("state_5.sqlite").exists());
+        assert_eq!(
+            fs::read_to_string(slot_home.join("auth.json")).unwrap(),
+            "{}\n"
+        );
+
+        let _ = fs::remove_dir_all(&paths.base_codex_home);
+    }
+
+    #[test]
+    fn older_marker_schema_reruns_migration_before_cleanup() {
+        let paths = temp_paths("old-marker");
         let source = paths.slot_home("pku").join("sqlite/state_5.sqlite");
         create_state_db(&source, &[("aaa", "pku", 1_000)]);
-        merge_slot_databases(&paths, false).unwrap();
-        assert!(migration_is_current(&paths).unwrap());
-
-        let conn = Connection::open(&source).unwrap();
-        conn.execute(
-            "UPDATE threads SET updated_at = 2, updated_at_ms = 2000 WHERE id = 'aaa'",
-            [],
+        create_state_db(
+            &paths.shared_sqlite_home().join("state_5.sqlite"),
+            &[("aaa", "pku", 1_000)],
+        );
+        let marker = migration_marker(&paths);
+        fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        fs::write(
+            &marker,
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "migrationId": MIGRATION_ID,
+            }))
+            .unwrap(),
         )
         .unwrap();
-        drop(conn);
 
+        assert!(!migration_is_current(&paths).unwrap());
+        run_startup_migration(&paths, false).unwrap();
+
+        assert!(!source.exists());
         assert!(migration_is_current(&paths).unwrap());
         let _ = fs::remove_dir_all(&paths.base_codex_home);
     }

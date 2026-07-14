@@ -24,13 +24,15 @@ The public tags checked for these repairs are `v0.1.2` through `v0.4.41`.
 | `v0.1.2` through `v0.4.1` | `price-cache.json` may omit the current `schemaVersion`. | Adds the current schema marker when the file shape matches cx's price cache. |
 | `v0.1.6` through `v0.4.1` | `stats-calibration.json` may use the first cx-owned file schema. | Updates the schema marker when the file shape matches cx's calibration cache. |
 | Up to `v0.3.7` | Slot homes may contain sqlite files directly under `<slot>/home`. | Moves real sqlite files into `<slot>/home/sqlite`; removes root-level sqlite symlinks. |
-| Up to `v0.4.41` | Each slot may have an independent SQLite index and provider-filtered history. | Merges state, memories, and goals into `~/.codex/sqlite`, then retires retained per-slot backups from the startup hot path. |
+| Up to `v0.4.41` | Each slot may have an independent SQLite index and provider-filtered history. | Merges state, memories, and goals into `~/.codex/sqlite`, then removes the migrated per-slot databases and obsolete diagnostic logs. |
 | `v0.1.11` through `v0.4.1` | Removed foreground runtime state may remain under `<profile-manager>/serve`. | Moves inactive state into `<profile-manager>/state/retired-runtime/runtime-surface-removal-v1`. |
 | `v0.2.3` through `v0.4.1` | Removed background runtime launch state may keep trying to start after the binary is upgraded. | Unloads the old macOS LaunchAgent when present, then retires the plist and `<profile-manager>/service`. |
 
 ## Review Notes
 
 - The repair is idempotent and quiet when no local files need work.
+- Close Codex and Desktop processes launched by older CX versions before the
+  shared SQLite migration so they cannot keep writing to retired databases.
 - The repair archives removed runtime state instead of deleting it, because those
   directories may contain logs or local token files.
 - `cx transfer import` runs the repair after copying a bundle so older bundles

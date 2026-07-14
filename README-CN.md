@@ -226,8 +226,9 @@ ChatGPT Desktop；如果你明确要测试并行实例，可以传 `--allow-para
 
 从曾经使用 per-slot SQLite 的版本升级时，CX 会把各 slot 遗留数据库合并到
 `~/.codex/sqlite`。重复 thread 采用更新时间较新的索引行，并补齐缺失的关联行、memory 和 goal。
-旧的 per-slot 数据库会原地保留作为迁移备份；版本化 marker 会把它们移出启动热路径，正常启动
-不再打开或扫描这些旧库。如果仍在运行的旧进程又写入了遗留行，请先退出该进程，再显式重跑：
+合并成功后，CX 会删除已经迁移的 per-slot 数据库及其 SQLite sidecar，也会删除不属于会话历史的
+旧 per-slot 诊断日志。运行迁移前，请先退出由旧版 CX 启动的 Codex 和 Desktop 进程，
+避免它们继续写入已经退役的 per-slot 数据库：
 
 ```bash
 cx merge-sqlite --dry-run

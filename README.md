@@ -275,11 +275,11 @@ legacy `Codex.app` name. If ChatGPT Desktop is installed somewhere else, use
 
 When upgrading from a release that kept SQLite per slot, CX merges those legacy
 indexes into `~/.codex/sqlite`. Duplicate threads use the newest indexed row;
-missing related rows, memories, and goals are added. The old per-slot databases
-remain in place as migration backups. A versioned marker retires those backups
-from the startup hot path, so normal launches do not reopen or scan them. If an
-older still-running process creates a new legacy row, rerun the migration
-explicitly after that process exits:
+missing related rows, memories, and goals are added. After a successful merge,
+CX removes the migrated per-slot databases and their SQLite sidecars, including
+obsolete per-slot diagnostic logs that are not part of conversation history.
+Close Codex and Desktop processes launched by older CX versions before running
+the migration so they cannot write to a retired per-slot database:
 
 ```bash
 cx merge-sqlite --dry-run

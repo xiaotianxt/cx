@@ -20,7 +20,8 @@ wrappers with a single Rust binary.
 - `stats`: local usage reporting. Internally this separates SQLite reads,
   rollout calibration, pricing/cache handling, and aggregation.
 - `sqlite_merge`: consolidation of legacy per-slot state, memories,
-  and goals into the shared `~/.codex/sqlite` directory.
+  and goals into the shared `~/.codex/sqlite` directory, followed by cleanup of
+  the successfully retired database files.
 - `runtime_provider`: maps each slot's concrete provider configuration onto the
   stable `cx` runtime identity used in persisted conversations.
 - `desktop_proxy`: proxies the bundled app-server so Desktop lists all providers.

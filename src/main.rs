@@ -278,7 +278,10 @@ fn entry() -> Result<()> {
                 }
                 println!("source thread rows: {}", report.source_threads);
                 println!("shared unique threads: {}", report.shared_threads);
-                println!("per-slot databases retained as migration backups");
+                println!(
+                    "removed legacy SQLite files: {}",
+                    report.removed_legacy_files
+                );
             }
         }
         Command::Install(args) => {

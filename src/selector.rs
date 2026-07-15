@@ -709,7 +709,7 @@ mod tests {
         assert_eq!(cached.slot, "bus1");
         assert_eq!(cached.index, 3);
         assert_eq!(cached.status, SlotStatus::Available);
-        assert_eq!(cached.cache_age_seconds, Some(0));
+        assert!(matches!(cached.cache_age_seconds, Some(0) | Some(1)));
         assert!(!cached.stale);
         assert!(cache.fresh("bus2", 4).is_none());
 

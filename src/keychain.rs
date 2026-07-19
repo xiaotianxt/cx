@@ -132,12 +132,7 @@ where
     F: FnOnce(&str, &str) -> Result<Option<String>>,
     G: Fn(&str) -> bool,
 {
-    if envs.contains_key("CODEX_ACCESS_TOKEN")
-        || envs.contains_key("CODEX_API_KEY")
-        || envs.contains_key("OPENAI_API_KEY")
-        || parent_env_var_present("CODEX_API_KEY")
-        || parent_env_var_present("OPENAI_API_KEY")
-    {
+    if auth_env_conflicts(envs, &parent_env_var_present) {
         anyhow::bail!(
             "slot {}: CODEX_ACCESS_TOKEN, CODEX_API_KEY, or OPENAI_API_KEY already set in env.conf/target, or CODEX_API_KEY/OPENAI_API_KEY already set in parent environment; remove one auth source (keychain.conf is also present)",
             slot
@@ -158,6 +153,18 @@ where
     }
     envs.insert("CODEX_ACCESS_TOKEN".to_string(), pat);
     Ok(())
+}
+
+fn auth_env_conflicts<G>(envs: &BTreeMap<String, String>, parent_env_var_present: &G) -> bool
+where
+    G: Fn(&str) -> bool,
+{
+    ["CODEX_ACCESS_TOKEN", "CODEX_API_KEY", "OPENAI_API_KEY"]
+        .into_iter()
+        .any(|key| envs.contains_key(key))
+        || ["CODEX_API_KEY", "OPENAI_API_KEY"]
+            .into_iter()
+            .any(parent_env_var_present)
 }
 
 fn parent_auth_env_var_present(key: &str) -> bool {
@@ -340,29 +347,8 @@ pub fn pat_add(
     if args.slot != "default" && !slot_dir.is_dir() {
         anyhow::bail!("slot directory does not exist: {}", slot_dir.display());
     }
-
-    // Guard: warn if auth.json has OAuth refresh_token
-    if !args.force {
-        let auth_path = if args.slot == "default" {
-            paths.base_codex_home.join("auth.json")
-        } else {
-            paths.slot_home(&args.slot).join("auth.json")
-        };
-        if let Ok(content) = std::fs::read_to_string(&auth_path) {
-            if let Ok(auth) = serde_json::from_str::<serde_json::Value>(&content) {
-                let has_refresh = auth
-                    .get("tokens")
-                    .and_then(|t| t.get("refresh_token"))
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|v| !v.is_empty());
-                if has_refresh {
-                    anyhow::bail!(
-                        "slot {} has OAuth auth.json with refresh_token; adding PAT will make it a launch-only slot. OAuth refresh will be unused for this slot. Use --force to proceed.",
-                        args.slot
-                    );
-                }
-            }
-        }
+    if args.force {
+        eprintln!("cx: --force is no longer needed; usable auth.json remains primary");
     }
 
     let pat = fetch_pat_from_keychain(&args.service, &args.account)?.with_context(|| {
@@ -392,6 +378,7 @@ pub fn pat_add(
         "pat bound: slot {} -> {}/{}",
         args.slot, args.service, args.account
     );
+    println!("  priority: usable auth.json first, PAT fallback second");
     println!("  email: {}", metadata.email.as_deref().unwrap_or("(none)"));
     println!("  account_id: {}", metadata.account_id);
     println!("  fedramp: {}", metadata.fedramp);

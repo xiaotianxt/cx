@@ -650,6 +650,51 @@ mod tests {
     }
 
     #[test]
+    fn desktop_spec_prefers_oauth_auth_json_over_keychain_pat() {
+        let root = temp_root("desktop-oauth-before-keychain-pat");
+        let base = root.join(".codex");
+        let manager = base.join("profile-manager");
+        let cwd = root.join("work");
+        let paths = ManagerPaths::from_roots(base, manager);
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(paths.slot_home("bus1")).unwrap();
+        fs::write(
+            paths.slot_home("bus1").join("auth.json"),
+            serde_json::json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": "header.e30.signature",
+                    "access_token": "oauth-access",
+                    "refresh_token": "oauth-refresh"
+                },
+                "last_refresh": "2026-01-01T00:00:00Z"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            paths.slot_dir("bus1").join("keychain.conf"),
+            "service=cx-test-missing\naccount=missing@example.com\n",
+        )
+        .unwrap();
+
+        let spec = build_desktop_launch_spec(
+            &paths,
+            PathBuf::from("/tmp/Codex"),
+            "bus1",
+            None,
+            &cwd,
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert!(spec
+            .envs
+            .get("CODEX_ACCESS_TOKEN")
+            .is_none_or(String::is_empty));
+    }
+
+    #[test]
     fn desktop_spec_does_not_forward_codex_overrides_to_electron() {
         let root = temp_root("desktop_spec_does_not_forward_codex_overrides_to_electron");
         let base = root.join(".codex");

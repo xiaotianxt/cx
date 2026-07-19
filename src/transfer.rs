@@ -123,7 +123,7 @@ pub fn export_with_paths(paths: &ManagerPaths, args: TransferExportArgs) -> Resu
     println!("slots: {}", slots.join(", "));
     println!("warning: bundle contains live Codex credentials; keep it private");
     println!(
-        "warning: keychain.conf entries are local Keychain references; recreate matching Keychain items on the destination before launching PAT-backed slots"
+        "warning: keychain.conf entries are local PAT fallback references; recreate matching Keychain items on the destination before relying on PAT fallback"
     );
     Ok(())
 }
@@ -162,7 +162,7 @@ pub fn import_with_paths(paths: &ManagerPaths, args: TransferImportArgs) -> Resu
     println!("slots: {}", manifest.slots.join(", "));
     println!("run `cx doctor` to verify the destination layout");
     println!(
-        "if imported slots use keychain.conf, create the referenced Keychain items on this machine before launching them"
+        "if imported slots use keychain.conf, create the referenced Keychain items on this machine before relying on PAT fallback"
     );
     Ok(())
 }

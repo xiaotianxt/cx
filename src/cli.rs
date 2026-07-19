@@ -785,7 +785,7 @@ impl PatCommand {
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum PatCommand {
-    /// Bind a Keychain PAT reference to a slot and hydrate metadata.
+    /// Bind a Keychain PAT fallback to a slot and hydrate metadata.
     Add(PatAddArgs),
     /// Verify the Keychain entry exists and the PAT is valid.
     Check(PatCheckArgs),
@@ -811,8 +811,8 @@ pub struct PatAddArgs {
     #[arg(long)]
     pub account: String,
 
-    /// Force binding even if auth.json with a refresh_token exists.
-    #[arg(long)]
+    /// Deprecated compatibility flag; retained only until 0.5.
+    #[arg(long, hide = true)]
     pub force: bool,
 }
 

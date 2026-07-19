@@ -119,6 +119,24 @@ impl UsageChecker {
         let slot_envs = envfile::read_env_file(&slot_dir.join("env.conf")).unwrap_or_default();
         let mut account_label = auth.account_label();
         if auth.access_token.is_none() {
+            let opaque_auth_name = match auth.kind {
+                auth::SlotAuthKind::AgentIdentity => Some("Agent Identity"),
+                auth::SlotAuthKind::BedrockApiKey => Some("Bedrock API key"),
+                auth::SlotAuthKind::Unknown
+                | auth::SlotAuthKind::Chatgpt
+                | auth::SlotAuthKind::ApiKey
+                | auth::SlotAuthKind::PersonalAccessToken => None,
+            };
+            if let Some(auth_name) = opaque_auth_name {
+                return Ok(SlotResult::new(
+                    slot,
+                    index,
+                    SlotStatus::ExternalProvider,
+                    100.0,
+                    format!("{auth_name} auth (usage unavailable)"),
+                )
+                .with_account_label(account_label));
+            }
             if auth.api_key.is_some() {
                 // Ollama Cloud slots: scrape ollama.com/settings via Helium
                 // browser cookies for real usage data. Falls back to a plain

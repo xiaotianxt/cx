@@ -102,6 +102,16 @@ Unix so the final process is the real Codex binary with:
 - repeated target `set`/`overrides` lines, appended after slot overrides
 - the user's original Codex args
 
+Authentication selection is owned by cx before `exec`. A locally usable
+`auth.json` is primary. Its structure is checked against the current Codex auth
+modes and required credential fields. The Keychain PAT credential is read only
+when `auth.json` is missing, malformed, mismatched with its declared auth mode,
+or contains an expired ChatGPT access token without a refresh token. When the
+fallback is selected, cx injects the PAT as `CODEX_ACCESS_TOKEN`. It does not
+perform a live OAuth validity probe on the launch path; Codex owns OAuth
+refresh. When `auth.json` is selected, inherited auth environment variables are
+masked, while competing slot/target auth variables are rejected.
+
 Resume arguments follow the same path: CX forwards the original thread ID
 unchanged, and shared SQLite lets Codex resolve the canonical rollout path. CX
 does not copy or rewrite rollout JSONL files during resume.

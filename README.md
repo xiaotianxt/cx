@@ -47,6 +47,23 @@ Each slot is an isolated `CODEX_HOME`:
       env.conf
 ```
 
+When a slot has both `auth.json` and a Keychain-backed `keychain.conf`, cx uses
+the first usable source in this order:
+
+1. `auth.json`
+2. the Keychain PAT as a fallback
+
+The launch check is local and deterministic and mirrors Codex's current
+`AuthDotJson` shapes. ChatGPT auth must include a decodable ID token, access and
+refresh-token fields, and a valid `last_refresh`; an expired access token also
+needs a non-empty refresh token. API key, stored PAT, Agent Identity, and
+Bedrock modes require their corresponding credential fields. A missing,
+malformed, mode-mismatched, or locally unusable `auth.json` activates the PAT
+fallback. cx does not add a live auth probe to the launch hot path; Codex
+remains responsible for refreshing OAuth credentials. When `auth.json` wins,
+cx masks inherited auth environment variables and rejects competing auth
+variables explicitly configured by the slot or target.
+
 For ChatGPT-authenticated slots, cx calls the same usage endpoint used by Codex:
 
 ```text

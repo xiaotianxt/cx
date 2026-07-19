@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::fs::OpenOptions;
@@ -9,11 +10,11 @@ use std::time::UNIX_EPOCH;
 
 use anyhow::Context;
 use anyhow::Result;
-use base64::engine::general_purpose::URL_SAFE;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use reqwest::blocking::Client;
 use reqwest::StatusCode;
+use serde::Deserialize;
 use serde_json::json;
 use serde_json::Value;
 use time::format_description::well_known::Rfc3339;
@@ -29,6 +30,7 @@ const CHATGPT_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SlotAuth {
+    pub kind: SlotAuthKind,
     pub access_token: Option<String>,
     pub refresh_token: Option<String>,
     pub account_id: Option<String>,
@@ -36,6 +38,17 @@ pub struct SlotAuth {
     pub fedramp: bool,
     pub api_key: Option<String>,
     pub provider: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SlotAuthKind {
+    #[default]
+    Unknown,
+    Chatgpt,
+    ApiKey,
+    PersonalAccessToken,
+    AgentIdentity,
+    BedrockApiKey,
 }
 
 impl SlotAuth {
@@ -53,6 +66,14 @@ impl SlotAuth {
         }
         if self.api_key.is_some() {
             return Some("api_key".to_string());
+        }
+        match self.kind {
+            SlotAuthKind::AgentIdentity => return Some("agent_identity".to_string()),
+            SlotAuthKind::BedrockApiKey => return Some("bedrock_api_key".to_string()),
+            SlotAuthKind::Unknown
+            | SlotAuthKind::Chatgpt
+            | SlotAuthKind::ApiKey
+            | SlotAuthKind::PersonalAccessToken => {}
         }
         self.provider
             .as_deref()
@@ -88,80 +109,301 @@ fn resolve_auth_path(slot_dir: &Path, base_codex_home: Option<&Path>) -> Result<
     Ok(slot_auth)
 }
 
-pub fn read_slot_auth(slot_dir: &Path, base_codex_home: Option<&Path>) -> Result<SlotAuth> {
-    let provider = slot::read_override_string(slot_dir, "model_provider")?;
+#[derive(Debug)]
+enum AuthJsonDocument {
+    Missing,
+    Parsed(Value),
+    Malformed { path: PathBuf, message: String },
+}
 
-    // Read OPENAI_API_KEY from env.conf (takes precedence) and auth.json (fallback).
-    let envs = envfile::read_env_file(&slot_dir.join("env.conf")).unwrap_or_default();
-    let env_api_key = envs.get("OPENAI_API_KEY").cloned();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthJsonUsability {
+    Usable,
+    Missing,
+    Malformed,
+    UnsupportedMode,
+    InvalidCredentials,
+    ExpiredWithoutRefresh,
+}
 
-    // keychain.conf is authoritative for PAT-backed slots. Do not fall back to
-    // auth.json here, or usage selection can disagree with launch behavior.
-    if let Some(conf) = keychain::read_keychain_conf(slot_dir)? {
-        let Some(pat) = keychain::fetch_pat_from_keychain(&conf.service, &conf.account)? else {
-            eprintln!(
-                "cx: Keychain entry {}/{} not found for PAT slot",
-                conf.service, conf.account
-            );
-            return Ok(SlotAuth {
-                provider,
-                ..SlotAuth::default()
-            });
-        };
-        if !keychain::is_pat(&pat) {
-            eprintln!(
-                "cx: Keychain entry {}/{} does not contain a PAT",
-                conf.service, conf.account
-            );
-            return Ok(SlotAuth {
-                provider,
-                ..SlotAuth::default()
-            });
-        }
-        let client = reqwest::blocking::Client::builder()
-            .timeout(keychain::whoami_timeout())
-            .build();
-        let hydrate_result = match &client {
-            Ok(client) => keychain::read_or_hydrate_metadata(slot_dir, &pat, &envs, client),
-            Err(err) => Err(anyhow::anyhow!("build whoami client: {err}")),
-        };
-        match hydrate_result {
-            Ok(Some(metadata)) => {
-                return Ok(SlotAuth {
-                    access_token: Some(pat),
-                    refresh_token: None,
-                    account_id: Some(metadata.account_id),
-                    email: metadata.email,
-                    fedramp: metadata.fedramp,
-                    api_key: None,
-                    provider,
-                });
-            }
-            Ok(None) => {}
-            Err(err) => {
-                eprintln!("cx: slot PAT unavailable ({err:#})");
-            }
-        }
-        return Ok(SlotAuth {
-            provider,
-            ..SlotAuth::default()
-        });
+impl fmt::Display for AuthJsonUsability {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Usable => "usable",
+            Self::Missing => "missing",
+            Self::Malformed => "malformed",
+            Self::UnsupportedMode => "unsupported or invalid auth mode",
+            Self::InvalidCredentials => "missing or invalid credentials",
+            Self::ExpiredWithoutRefresh => "expired access token without a refresh token",
+        })
     }
+}
 
-    // OAuth fallback: read auth.json (existing logic).
+pub(crate) fn prepare_auth_json_env(slot: &str, envs: &mut BTreeMap<String, String>) -> Result<()> {
+    prepare_auth_json_env_with_parent_env(slot, envs, |key| {
+        std::env::var_os(key).is_some_and(|value| !value.is_empty())
+    })
+}
+
+fn prepare_auth_json_env_with_parent_env<G>(
+    slot: &str,
+    envs: &mut BTreeMap<String, String>,
+    parent_env_var_present: G,
+) -> Result<()>
+where
+    G: Fn(&str) -> bool,
+{
+    let auth_keys = ["CODEX_ACCESS_TOKEN", "CODEX_API_KEY", "OPENAI_API_KEY"];
+    if auth_keys.into_iter().any(|key| envs.contains_key(key)) {
+        anyhow::bail!(
+            "slot {slot}: usable auth.json is primary, but CODEX_ACCESS_TOKEN, CODEX_API_KEY, or OPENAI_API_KEY is also set in env.conf/target; remove the competing auth source"
+        );
+    }
+    for key in auth_keys {
+        if parent_env_var_present(key) {
+            envs.insert(key.to_string(), String::new());
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+enum AuthJsonMode {
+    #[serde(rename = "apikey")]
+    ApiKey,
+    #[serde(rename = "chatgpt")]
+    Chatgpt,
+    #[serde(rename = "chatgptAuthTokens")]
+    ChatgptAuthTokens,
+    #[serde(rename = "headers")]
+    Headers,
+    #[serde(rename = "agentIdentity")]
+    AgentIdentity,
+    #[serde(rename = "personalAccessToken")]
+    PersonalAccessToken,
+    #[serde(rename = "bedrockApiKey")]
+    BedrockApiKey,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexAuthJson {
+    #[serde(default)]
+    auth_mode: Option<AuthJsonMode>,
+    #[serde(default, rename = "OPENAI_API_KEY")]
+    api_key: Option<String>,
+    #[serde(default)]
+    tokens: Option<CodexTokenData>,
+    #[serde(default)]
+    last_refresh: Option<String>,
+    #[serde(default)]
+    agent_identity: Option<CodexAgentIdentity>,
+    #[serde(default)]
+    personal_access_token: Option<String>,
+    #[serde(default)]
+    bedrock_api_key: Option<CodexBedrockApiKey>,
+}
+
+impl CodexAuthJson {
+    fn resolved_mode(&self) -> AuthJsonMode {
+        self.auth_mode.unwrap_or_else(|| {
+            if self.personal_access_token.is_some() {
+                AuthJsonMode::PersonalAccessToken
+            } else if self.bedrock_api_key.is_some() {
+                AuthJsonMode::BedrockApiKey
+            } else if self.api_key.is_some() {
+                AuthJsonMode::ApiKey
+            } else {
+                AuthJsonMode::Chatgpt
+            }
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexTokenData {
+    id_token: String,
+    access_token: String,
+    refresh_token: String,
+    #[serde(default, rename = "account_id")]
+    _account_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum CodexAgentIdentity {
+    Jwt(String),
+    Record(CodexAgentIdentityRecord),
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexAgentIdentityRecord {
+    agent_runtime_id: String,
+    agent_private_key: String,
+    account_id: String,
+    chatgpt_user_id: String,
+    plan_type: String,
+    #[serde(rename = "chatgpt_account_is_fedramp")]
+    _chatgpt_account_is_fedramp: bool,
+    #[serde(default, rename = "email")]
+    _email: Option<String>,
+    #[serde(default, rename = "task_id")]
+    _task_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexAgentIdentityClaims {
+    iss: String,
+    aud: String,
+    #[serde(rename = "iat")]
+    _iat: u64,
+    exp: u64,
+    agent_runtime_id: String,
+    agent_private_key: String,
+    account_id: String,
+    chatgpt_user_id: String,
+    plan_type: String,
+    #[serde(rename = "chatgpt_account_is_fedramp")]
+    _chatgpt_account_is_fedramp: bool,
+    #[serde(default, rename = "email")]
+    _email: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexBedrockApiKey {
+    api_key: String,
+    region: String,
+}
+
+fn read_auth_json_document(
+    slot_dir: &Path,
+    base_codex_home: Option<&Path>,
+) -> Result<AuthJsonDocument> {
     let auth_path = resolve_auth_path(slot_dir, base_codex_home)?;
     if !auth_path.exists() {
-        return Ok(SlotAuth {
-            api_key: env_api_key,
-            provider,
-            ..SlotAuth::default()
-        });
+        return Ok(AuthJsonDocument::Missing);
     }
 
     let content =
         fs::read_to_string(&auth_path).with_context(|| format!("read {}", auth_path.display()))?;
-    let auth: Value =
-        serde_json::from_str(&content).with_context(|| format!("parse {}", auth_path.display()))?;
+    match serde_json::from_str(&content) {
+        Ok(document) => Ok(AuthJsonDocument::Parsed(document)),
+        Err(err) => Ok(AuthJsonDocument::Malformed {
+            path: auth_path,
+            message: err.to_string(),
+        }),
+    }
+}
+
+fn chatgpt_auth_json_usability(auth: &CodexAuthJson) -> AuthJsonUsability {
+    let Some(tokens) = auth.tokens.as_ref() else {
+        return AuthJsonUsability::InvalidCredentials;
+    };
+    let last_refresh_is_valid = auth
+        .last_refresh
+        .as_deref()
+        .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+        .is_some();
+    if decode_jwt_payload(&tokens.id_token).is_none()
+        || tokens.access_token.trim().is_empty()
+        || !last_refresh_is_valid
+    {
+        return AuthJsonUsability::InvalidCredentials;
+    }
+    if access_token_is_expired(&tokens.access_token) && tokens.refresh_token.trim().is_empty() {
+        return AuthJsonUsability::ExpiredWithoutRefresh;
+    }
+    AuthJsonUsability::Usable
+}
+
+fn agent_identity_is_usable(identity: Option<&CodexAgentIdentity>) -> bool {
+    match identity {
+        Some(CodexAgentIdentity::Jwt(jwt)) => decode_jwt_payload(jwt)
+            .and_then(|claims| serde_json::from_value::<CodexAgentIdentityClaims>(claims).ok())
+            .is_some_and(|claims| {
+                !claims.iss.trim().is_empty()
+                    && !claims.aud.trim().is_empty()
+                    && claims.exp > unix_seconds().max(0) as u64
+                    && !claims.agent_runtime_id.trim().is_empty()
+                    && !claims.agent_private_key.trim().is_empty()
+                    && !claims.account_id.trim().is_empty()
+                    && !claims.chatgpt_user_id.trim().is_empty()
+                    && !claims.plan_type.trim().is_empty()
+            }),
+        Some(CodexAgentIdentity::Record(record)) => {
+            !record.agent_runtime_id.trim().is_empty()
+                && !record.agent_private_key.trim().is_empty()
+                && !record.account_id.trim().is_empty()
+                && !record.chatgpt_user_id.trim().is_empty()
+                && !record.plan_type.trim().is_empty()
+        }
+        None => false,
+    }
+}
+
+fn credential_usability(is_usable: bool) -> AuthJsonUsability {
+    if is_usable {
+        AuthJsonUsability::Usable
+    } else {
+        AuthJsonUsability::InvalidCredentials
+    }
+}
+
+fn parsed_auth_json_usability(document: &Value) -> AuthJsonUsability {
+    let Ok(auth) = serde_json::from_value::<CodexAuthJson>(document.clone()) else {
+        return AuthJsonUsability::InvalidCredentials;
+    };
+    if auth
+        .last_refresh
+        .as_deref()
+        .is_some_and(|value| OffsetDateTime::parse(value, &Rfc3339).is_err())
+        || auth
+            .tokens
+            .as_ref()
+            .is_some_and(|tokens| decode_jwt_payload(&tokens.id_token).is_none())
+    {
+        return AuthJsonUsability::InvalidCredentials;
+    }
+    match auth.resolved_mode() {
+        AuthJsonMode::ApiKey => {
+            credential_usability(auth.api_key.is_some_and(|value| !value.trim().is_empty()))
+        }
+        AuthJsonMode::Chatgpt | AuthJsonMode::ChatgptAuthTokens => {
+            chatgpt_auth_json_usability(&auth)
+        }
+        AuthJsonMode::PersonalAccessToken => credential_usability(
+            auth.personal_access_token
+                .is_some_and(|value| value.starts_with("at-") && value.len() > 3),
+        ),
+        AuthJsonMode::AgentIdentity => {
+            credential_usability(agent_identity_is_usable(auth.agent_identity.as_ref()))
+        }
+        AuthJsonMode::BedrockApiKey => {
+            credential_usability(auth.bedrock_api_key.is_some_and(|bedrock| {
+                !bedrock.api_key.trim().is_empty() && !bedrock.region.trim().is_empty()
+            }))
+        }
+        AuthJsonMode::Headers => AuthJsonUsability::UnsupportedMode,
+    }
+}
+
+pub(crate) fn auth_json_usability(
+    slot_dir: &Path,
+    base_codex_home: Option<&Path>,
+) -> Result<AuthJsonUsability> {
+    Ok(match read_auth_json_document(slot_dir, base_codex_home)? {
+        AuthJsonDocument::Parsed(document) => parsed_auth_json_usability(&document),
+        AuthJsonDocument::Missing => AuthJsonUsability::Missing,
+        AuthJsonDocument::Malformed { .. } => AuthJsonUsability::Malformed,
+    })
+}
+
+fn slot_auth_from_document(
+    auth: &Value,
+    env_api_key: Option<String>,
+    provider: Option<String>,
+) -> SlotAuth {
+    let parsed = serde_json::from_value::<CodexAuthJson>(auth.clone()).ok();
+    let mode = parsed.as_ref().map(CodexAuthJson::resolved_mode);
     let tokens = auth.get("tokens").and_then(Value::as_object);
     let raw_id_token = tokens
         .and_then(|tokens| tokens.get("id_token"))
@@ -177,7 +419,13 @@ pub fn read_slot_auth(slot_dir: &Path, base_codex_home: Option<&Path>) -> Result
         .and_then(|tokens| tokens.get("access_token"))
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
-        .map(str::to_string);
+        .map(str::to_string)
+        .or_else(|| match mode {
+            Some(AuthJsonMode::PersonalAccessToken) => parsed
+                .as_ref()
+                .and_then(|auth| auth.personal_access_token.clone()),
+            _ => None,
+        });
     let refresh_token = tokens
         .and_then(|tokens| tokens.get("refresh_token"))
         .and_then(Value::as_str)
@@ -199,7 +447,7 @@ pub fn read_slot_auth(slot_dir: &Path, base_codex_home: Option<&Path>) -> Result
             auth.as_object()
                 .and_then(|auth| email_from_object(Some(auth)))
         })
-        .or_else(|| find_email(&auth));
+        .or_else(|| find_email(auth));
     let fedramp = id_token
         .and_then(|id_token| id_token.get("chatgpt_account_is_fedramp"))
         .and_then(Value::as_bool)
@@ -210,7 +458,15 @@ pub fn read_slot_auth(slot_dir: &Path, base_codex_home: Option<&Path>) -> Result
         .filter(|value| !value.is_empty())
         .map(str::to_string);
 
-    Ok(SlotAuth {
+    SlotAuth {
+        kind: match mode {
+            Some(AuthJsonMode::ApiKey) => SlotAuthKind::ApiKey,
+            Some(AuthJsonMode::Chatgpt | AuthJsonMode::ChatgptAuthTokens) => SlotAuthKind::Chatgpt,
+            Some(AuthJsonMode::PersonalAccessToken) => SlotAuthKind::PersonalAccessToken,
+            Some(AuthJsonMode::AgentIdentity) => SlotAuthKind::AgentIdentity,
+            Some(AuthJsonMode::BedrockApiKey) => SlotAuthKind::BedrockApiKey,
+            Some(AuthJsonMode::Headers) | None => SlotAuthKind::Unknown,
+        },
         access_token,
         refresh_token,
         account_id,
@@ -218,7 +474,109 @@ pub fn read_slot_auth(slot_dir: &Path, base_codex_home: Option<&Path>) -> Result
         fedramp,
         api_key: env_api_key.or(json_api_key),
         provider,
+    }
+}
+
+fn slot_auth_from_pat(
+    slot_dir: &Path,
+    pat: String,
+    envs: &BTreeMap<String, String>,
+    provider: Option<String>,
+) -> Result<SlotAuth> {
+    if !keychain::is_pat(&pat) {
+        anyhow::bail!("PAT credential does not contain a PAT (expected `at-` prefix)");
+    }
+    let client = reqwest::blocking::Client::builder()
+        .timeout(keychain::whoami_timeout())
+        .build()
+        .with_context(|| "build PAT metadata client")?;
+    let metadata = keychain::read_or_hydrate_metadata(slot_dir, &pat, envs, &client)
+        .with_context(|| "load PAT metadata")?
+        .with_context(|| "PAT metadata unavailable")?;
+    Ok(SlotAuth {
+        kind: SlotAuthKind::PersonalAccessToken,
+        access_token: Some(pat),
+        refresh_token: None,
+        account_id: Some(metadata.account_id),
+        email: metadata.email,
+        fedramp: metadata.fedramp,
+        api_key: None,
+        provider,
     })
+}
+
+fn read_pat_slot_auth(
+    slot_dir: &Path,
+    envs: &std::collections::BTreeMap<String, String>,
+    provider: Option<String>,
+) -> Result<Option<SlotAuth>> {
+    let Some(conf) = keychain::read_keychain_conf(slot_dir)? else {
+        return Ok(None);
+    };
+    let pat =
+        keychain::fetch_pat_from_keychain(&conf.service, &conf.account)?.with_context(|| {
+            format!(
+                "PAT fallback Keychain entry {}/{} not found",
+                conf.service, conf.account
+            )
+        })?;
+    slot_auth_from_pat(slot_dir, pat, envs, provider)
+        .with_context(|| {
+            format!(
+                "PAT fallback Keychain entry {}/{} is unusable",
+                conf.service, conf.account
+            )
+        })
+        .map(Some)
+}
+
+pub fn read_slot_auth(slot_dir: &Path, base_codex_home: Option<&Path>) -> Result<SlotAuth> {
+    let provider = slot::read_override_string(slot_dir, "model_provider")?;
+
+    // Read OPENAI_API_KEY from env.conf (takes precedence) and auth.json (fallback).
+    let envs = envfile::read_env_file(&slot_dir.join("env.conf")).unwrap_or_default();
+    let env_api_key = envs.get("OPENAI_API_KEY").cloned();
+
+    let auth_json = read_auth_json_document(slot_dir, base_codex_home)?;
+    let auth_json_usability = match &auth_json {
+        AuthJsonDocument::Missing => AuthJsonUsability::Missing,
+        AuthJsonDocument::Parsed(document) => parsed_auth_json_usability(document),
+        AuthJsonDocument::Malformed { .. } => AuthJsonUsability::Malformed,
+    };
+    if auth_json_usability == AuthJsonUsability::Usable {
+        let AuthJsonDocument::Parsed(document) = &auth_json else {
+            anyhow::bail!("internal auth selection error: usable auth.json was not parsed");
+        };
+        let auth = slot_auth_from_document(document, env_api_key, provider);
+        if auth.kind == SlotAuthKind::PersonalAccessToken {
+            let pat = auth
+                .access_token
+                .clone()
+                .with_context(|| "usable PAT auth.json is missing its PAT")?;
+            return slot_auth_from_pat(slot_dir, pat, &envs, auth.provider);
+        }
+        return Ok(auth);
+    }
+
+    if let Some(auth) = read_pat_slot_auth(slot_dir, &envs, provider.clone())
+        .with_context(|| format!("auth.json status: {auth_json_usability}; PAT fallback failed"))?
+    {
+        return Ok(auth);
+    }
+
+    match auth_json {
+        AuthJsonDocument::Missing => Ok(SlotAuth {
+            api_key: env_api_key,
+            provider,
+            ..SlotAuth::default()
+        }),
+        AuthJsonDocument::Parsed(document) => {
+            Ok(slot_auth_from_document(&document, env_api_key, provider))
+        }
+        AuthJsonDocument::Malformed { path, message } => {
+            anyhow::bail!("parse {}: {message}", path.display())
+        }
+    }
 }
 
 pub fn refresh_slot_auth(
@@ -308,11 +666,12 @@ pub fn access_token_is_expired(access_token: &str) -> bool {
 }
 
 fn decode_jwt_payload(token: &str) -> Option<Value> {
-    let payload = token.split('.').nth(1)?;
-    let bytes = URL_SAFE_NO_PAD
-        .decode(payload)
-        .or_else(|_| URL_SAFE.decode(payload))
-        .ok()?;
+    let mut parts = token.split('.');
+    let (header, payload, signature) = (parts.next()?, parts.next()?, parts.next()?);
+    if header.is_empty() || payload.is_empty() || signature.is_empty() {
+        return None;
+    }
+    let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
 
@@ -534,6 +893,16 @@ mod tests {
     }
 
     #[test]
+    fn usable_auth_json_masks_parent_access_token() {
+        let mut envs = BTreeMap::new();
+
+        prepare_auth_json_env_with_parent_env("dia4", &mut envs, |key| key == "CODEX_ACCESS_TOKEN")
+            .unwrap();
+
+        assert_eq!(envs.get("CODEX_ACCESS_TOKEN"), Some(&String::new()));
+    }
+
+    #[test]
     fn read_slot_auth_extracts_email_from_id_token_object() {
         let slot_dir = temp_slot_dir("id-token-object");
         fs::write(
@@ -615,22 +984,247 @@ mod tests {
     }
 
     #[test]
-    fn read_slot_auth_does_not_fallback_to_oauth_when_keychain_entry_is_missing() {
+    fn auth_json_usability_rejects_mode_credential_mismatch() {
+        let slot_dir = temp_slot_dir("auth-mode-credential-mismatch");
+        fs::write(
+            slot_dir.join("home/auth.json"),
+            json!({
+                "auth_mode": "apikey",
+                "tokens": {
+                    "id_token": jwt(json!({})),
+                    "access_token": "oauth-access",
+                    "refresh_token": "oauth-refresh"
+                },
+                "last_refresh": "2026-01-01T00:00:00Z"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            auth_json_usability(&slot_dir, None).unwrap(),
+            AuthJsonUsability::InvalidCredentials
+        );
+        let _ = fs::remove_dir_all(slot_dir);
+    }
+
+    #[test]
+    fn auth_json_usability_treats_malformed_json_as_invalid() {
+        let slot_dir = temp_slot_dir("malformed-auth-json");
+        fs::write(slot_dir.join("home/auth.json"), "{not-json").unwrap();
+
+        assert_eq!(
+            auth_json_usability(&slot_dir, None).unwrap(),
+            AuthJsonUsability::Malformed
+        );
+        let _ = fs::remove_dir_all(slot_dir);
+    }
+
+    #[test]
+    fn auth_json_usability_rejects_expired_access_token_without_refresh_token() {
+        let slot_dir = temp_slot_dir("expired-auth-without-refresh");
+        fs::write(
+            slot_dir.join("home/auth.json"),
+            json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": jwt(json!({})),
+                    "access_token": jwt(json!({ "exp": 0 })),
+                    "refresh_token": ""
+                },
+                "last_refresh": "2026-01-01T00:00:00Z"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            auth_json_usability(&slot_dir, None).unwrap(),
+            AuthJsonUsability::ExpiredWithoutRefresh
+        );
+        let _ = fs::remove_dir_all(slot_dir);
+    }
+
+    #[test]
+    fn auth_json_usability_accepts_expired_access_token_with_refresh_token() {
+        let slot_dir = temp_slot_dir("expired-auth-with-refresh");
+        fs::write(
+            slot_dir.join("home/auth.json"),
+            json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": jwt(json!({})),
+                    "access_token": jwt(json!({ "exp": 0 })),
+                    "refresh_token": "oauth-refresh"
+                },
+                "last_refresh": "2026-01-01T00:00:00Z"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            auth_json_usability(&slot_dir, None).unwrap(),
+            AuthJsonUsability::Usable
+        );
+        let _ = fs::remove_dir_all(slot_dir);
+    }
+
+    #[test]
+    fn auth_json_usability_accepts_other_codex_auth_modes() {
+        let documents = [
+            json!({
+                "auth_mode": "apikey",
+                "OPENAI_API_KEY": "sk-test"
+            }),
+            json!({
+                "auth_mode": "personalAccessToken",
+                "personal_access_token": "at-test"
+            }),
+            json!({
+                "auth_mode": "agentIdentity",
+                "agent_identity": {
+                    "agent_runtime_id": "runtime-test",
+                    "agent_private_key": "private-key-test",
+                    "account_id": "account-test",
+                    "chatgpt_user_id": "user-test",
+                    "email": null,
+                    "plan_type": "business",
+                    "chatgpt_account_is_fedramp": false
+                }
+            }),
+            json!({
+                "auth_mode": "bedrockApiKey",
+                "bedrock_api_key": {
+                    "api_key": "bedrock-test",
+                    "region": "us-east-1"
+                }
+            }),
+        ];
+
+        for document in &documents {
+            assert_eq!(
+                parsed_auth_json_usability(document),
+                AuthJsonUsability::Usable,
+                "document: {document}"
+            );
+        }
+        let kinds = documents
+            .iter()
+            .map(|document| slot_auth_from_document(document, None, None).kind)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            kinds,
+            [
+                SlotAuthKind::ApiKey,
+                SlotAuthKind::PersonalAccessToken,
+                SlotAuthKind::AgentIdentity,
+                SlotAuthKind::BedrockApiKey,
+            ]
+        );
+        assert_eq!(
+            slot_auth_from_document(&documents[1], None, None)
+                .access_token
+                .as_deref(),
+            Some("at-test")
+        );
+    }
+
+    #[test]
+    fn read_slot_auth_preserves_opaque_codex_auth_modes() {
+        let cases = [
+            (
+                "agent-identity-slot-auth",
+                json!({
+                    "auth_mode": "agentIdentity",
+                    "agent_identity": {
+                        "agent_runtime_id": "runtime-test",
+                        "agent_private_key": "private-key-test",
+                        "account_id": "account-test",
+                        "chatgpt_user_id": "user-test",
+                        "email": null,
+                        "plan_type": "business",
+                        "chatgpt_account_is_fedramp": false
+                    }
+                }),
+                SlotAuthKind::AgentIdentity,
+            ),
+            (
+                "bedrock-slot-auth",
+                json!({
+                    "auth_mode": "bedrockApiKey",
+                    "bedrock_api_key": {
+                        "api_key": "bedrock-test",
+                        "region": "us-east-1"
+                    }
+                }),
+                SlotAuthKind::BedrockApiKey,
+            ),
+        ];
+
+        for (name, document, expected_kind) in cases {
+            let slot_dir = temp_slot_dir(name);
+            fs::write(slot_dir.join("home/auth.json"), document.to_string()).unwrap();
+
+            let auth = read_slot_auth(&slot_dir, None).unwrap();
+
+            assert_eq!(auth.kind, expected_kind);
+            let _ = fs::remove_dir_all(slot_dir);
+        }
+    }
+
+    #[test]
+    fn read_slot_auth_hydrates_stored_pat_from_cached_metadata() {
+        let slot_dir = temp_slot_dir("stored-pat-slot-auth");
+        fs::write(
+            slot_dir.join("home/auth.json"),
+            json!({
+                "auth_mode": "personalAccessToken",
+                "personal_access_token": "at-test"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            slot_dir.join("keychain-meta.json"),
+            serde_json::to_string(&keychain::SlotAuthMetadata {
+                email: Some("pat@example.com".to_string()),
+                account_id: "account-pat".to_string(),
+                fedramp: false,
+                authapi_base_url: "https://auth.openai.com/api/accounts".to_string(),
+                pat_fingerprint: keychain::pat_fingerprint("at-test"),
+                cached_at: "2099-01-01T00:00:00Z".to_string(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let auth = read_slot_auth(&slot_dir, None).unwrap();
+
+        assert_eq!(auth.kind, SlotAuthKind::PersonalAccessToken);
+        assert_eq!(auth.access_token.as_deref(), Some("at-test"));
+        assert_eq!(auth.account_id.as_deref(), Some("account-pat"));
+        let _ = fs::remove_dir_all(slot_dir);
+    }
+
+    #[test]
+    fn read_slot_auth_prefers_oauth_when_keychain_entry_is_missing() {
         let slot_dir = temp_slot_dir("missing-keychain-pat");
         fs::write(
             slot_dir.join("keychain.conf"),
             "service=cx-test-missing\naccount=missing@example.com\n",
         )
         .unwrap();
-        fs::write(slot_dir.join("env.conf"), "OPENAI_API_KEY=sk-test\n").unwrap();
         fs::write(
             slot_dir.join("home/auth.json"),
             json!({
                 "tokens": {
+                    "id_token": jwt(json!({})),
                     "access_token": "old-access",
                     "refresh_token": "old-refresh",
                     "account_id": "acc_old"
-                }
+                },
+                "last_refresh": "2026-01-01T00:00:00Z"
             })
             .to_string(),
         )
@@ -638,10 +1232,34 @@ mod tests {
 
         let auth = read_slot_auth(&slot_dir, None).unwrap();
 
-        assert_eq!(auth.access_token, None);
-        assert_eq!(auth.refresh_token, None);
-        assert_eq!(auth.account_id, None);
+        assert_eq!(auth.access_token, Some("old-access".to_string()));
+        assert_eq!(auth.refresh_token, Some("old-refresh".to_string()));
+        assert_eq!(auth.account_id, Some("acc_old".to_string()));
         assert_eq!(auth.api_key, None);
+        let _ = fs::remove_dir_all(slot_dir);
+    }
+
+    #[test]
+    fn read_slot_auth_reports_unavailable_pat_fallback_for_invalid_auth_json() {
+        let slot_dir = temp_slot_dir("invalid-auth-missing-pat-fallback");
+        fs::write(
+            slot_dir.join("keychain.conf"),
+            "service=cx-test-missing\naccount=missing@example.com\n",
+        )
+        .unwrap();
+        fs::write(
+            slot_dir.join("home/auth.json"),
+            json!({
+                "auth_mode": "chatgpt",
+                "tokens": {}
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let err = read_slot_auth(&slot_dir, None).unwrap_err();
+
+        assert!(format!("{err:#}").contains("PAT fallback Keychain entry"));
         let _ = fs::remove_dir_all(slot_dir);
     }
 

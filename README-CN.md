@@ -38,6 +38,21 @@ cx 是一个本地 Codex 入口：负责启动 Codex、处理 stdin pipe、管�
       env.conf
 ```
 
+当一个 slot 同时存在 `auth.json` 和由 Keychain 支持的 `keychain.conf` 时，
+cx 按以下顺序使用第一个可用的认证来源：
+
+1. `auth.json`
+2. Keychain PAT（仅作为 fallback）
+
+启动时的判定完全在本地完成，并与 Codex 当前的 `AuthDotJson` 结构保持一致。
+ChatGPT 认证必须包含可解码的 ID token、access/refresh token 字段和合法的
+`last_refresh`；access token 已过期时还必须有非空 refresh token。API key、
+auth.json 内 PAT、Agent Identity 和 Bedrock 模式则必须带各自对应的凭据字段。
+`auth.json` 缺失、JSON 损坏、认证模式与凭据不匹配，或凭据在本地已确定不可用
+时，cx 才启用 PAT fallback。cx 不会在启动热路径中增加在线认证探测；OAuth
+刷新仍由 Codex 负责。`auth.json` 胜出时，cx 会屏蔽从父进程继承的认证环境
+变量；slot 或 target 显式配置的竞争认证变量则会触发清晰报错。
+
 ChatGPT 登录型 slot 会直接请求 Codex 当前使用的用量接口：
 
 ```text

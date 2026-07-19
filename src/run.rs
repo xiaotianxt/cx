@@ -16,6 +16,7 @@ use clap::ArgAction;
 use clap::Command as ClapCommand;
 use clap::ValueHint;
 
+use crate::auth;
 use crate::cli::LoginArgs;
 use crate::envfile;
 use crate::keychain;
@@ -385,7 +386,14 @@ pub(crate) fn inject_keychain_access_token(
     selected_slot: &str,
     envs: &mut BTreeMap<String, String>,
 ) -> Result<()> {
+    let base_codex_home = (selected_slot == "default").then_some(slot_dir);
+    let auth_json_usability = auth::auth_json_usability(slot_dir, base_codex_home)?;
+    if auth_json_usability == auth::AuthJsonUsability::Usable {
+        auth::prepare_auth_json_env(selected_slot, envs)?;
+        return Ok(());
+    }
     keychain::inject_pat_env_from_keychain(slot_dir, selected_slot, envs)
+        .with_context(|| format!("auth.json status: {auth_json_usability}; PAT fallback failed"))
 }
 
 fn exec_slot_codex(
@@ -888,6 +896,176 @@ mod tests {
         .unwrap_err();
 
         assert!(format!("{err:#}").contains("OPENAI_API_KEY"));
+
+        let _ = fs::remove_dir_all(&paths.manager_dir);
+        let _ = fs::remove_dir_all(&paths.base_codex_home);
+    }
+
+    #[test]
+    fn slot_command_spec_prefers_oauth_auth_json_over_keychain_pat() {
+        let paths = test_paths("oauth-before-keychain-pat");
+        fs::create_dir_all(&paths.base_codex_home).unwrap();
+        fs::create_dir_all(paths.slot_home("dia4")).unwrap();
+        fs::write(
+            paths.slot_home("dia4").join("auth.json"),
+            serde_json::json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": "header.e30.signature",
+                    "access_token": "oauth-access",
+                    "refresh_token": "oauth-refresh"
+                },
+                "last_refresh": "2026-01-01T00:00:00Z"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            paths.slot_dir("dia4").join("keychain.conf"),
+            "service=cx-test-missing\naccount=missing@example.com\n",
+        )
+        .unwrap();
+
+        let spec = build_slot_command_spec(
+            &paths,
+            PathBuf::from("/bin/codex"),
+            "dia4",
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert!(spec
+            .envs
+            .get("CODEX_ACCESS_TOKEN")
+            .is_none_or(String::is_empty));
+
+        let _ = fs::remove_dir_all(&paths.manager_dir);
+        let _ = fs::remove_dir_all(&paths.base_codex_home);
+    }
+
+    #[test]
+    fn default_slot_command_spec_prefers_oauth_auth_json_over_keychain_pat() {
+        let paths = test_paths("default-oauth-before-keychain-pat");
+        fs::create_dir_all(&paths.base_codex_home).unwrap();
+        fs::write(
+            paths.base_codex_home.join("auth.json"),
+            serde_json::json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": "header.e30.signature",
+                    "access_token": "oauth-access",
+                    "refresh_token": "oauth-refresh"
+                },
+                "last_refresh": "2026-01-01T00:00:00Z"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            paths.base_codex_home.join("keychain.conf"),
+            "service=cx-test-missing\naccount=missing@example.com\n",
+        )
+        .unwrap();
+
+        let spec = build_slot_command_spec(
+            &paths,
+            PathBuf::from("/bin/codex"),
+            "default",
+            None,
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert!(spec
+            .envs
+            .get("CODEX_ACCESS_TOKEN")
+            .is_none_or(String::is_empty));
+
+        let _ = fs::remove_dir_all(&paths.manager_dir);
+        let _ = fs::remove_dir_all(&paths.base_codex_home);
+    }
+
+    #[test]
+    fn slot_command_spec_rejects_auth_env_that_would_override_auth_json() {
+        let paths = test_paths("oauth-auth-env-conflict");
+        fs::create_dir_all(&paths.base_codex_home).unwrap();
+        fs::create_dir_all(paths.slot_home("dia4")).unwrap();
+        fs::write(
+            paths.slot_home("dia4").join("auth.json"),
+            serde_json::json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": "header.e30.signature",
+                    "access_token": "oauth-access",
+                    "refresh_token": "oauth-refresh"
+                },
+                "last_refresh": "2026-01-01T00:00:00Z"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            paths.slot_dir("dia4").join("keychain.conf"),
+            "service=codex-pat\naccount=test@example.com\n",
+        )
+        .unwrap();
+        fs::write(
+            paths.slot_dir("dia4").join("env.conf"),
+            "CODEX_ACCESS_TOKEN=at-env\n",
+        )
+        .unwrap();
+
+        let err = build_slot_command_spec(
+            &paths,
+            PathBuf::from("/bin/codex"),
+            "dia4",
+            None,
+            Vec::new(),
+        )
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("usable auth.json is primary"));
+
+        let _ = fs::remove_dir_all(&paths.manager_dir);
+        let _ = fs::remove_dir_all(&paths.base_codex_home);
+    }
+
+    #[test]
+    fn slot_command_spec_uses_pat_fallback_for_invalid_auth_json() {
+        let paths = test_paths("invalid-oauth-uses-pat-fallback");
+        fs::create_dir_all(&paths.base_codex_home).unwrap();
+        fs::create_dir_all(paths.slot_home("dia4")).unwrap();
+        fs::write(
+            paths.slot_home("dia4").join("auth.json"),
+            serde_json::json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "access_token": "oauth-access",
+                    "refresh_token": "oauth-refresh"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            paths.slot_dir("dia4").join("keychain.conf"),
+            "service=cx-test-missing\naccount=missing@example.com\n",
+        )
+        .unwrap();
+
+        let err = build_slot_command_spec(
+            &paths,
+            PathBuf::from("/bin/codex"),
+            "dia4",
+            None,
+            Vec::new(),
+        )
+        .unwrap_err();
+
+        let message = format!("{err:#}");
+        assert!(message.contains("auth.json status: missing or invalid credentials"));
+        assert!(message.contains("Keychain entry cx-test-missing/missing@example.com not found"));
 
         let _ = fs::remove_dir_all(&paths.manager_dir);
         let _ = fs::remove_dir_all(&paths.base_codex_home);

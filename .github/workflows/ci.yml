@@ -4,35 +4,45 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
 
 jobs:
-  build:
+  check:
     runs-on: macos-latest
-
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          cache-bin: false
-
-      - name: Verify arm64 runner
-        run: test "$(uname -m)" = "arm64"
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Only main writes a cache; PRs restore main's instead of starting cold
+          # on a cache scoped to their own branch, which would never be reused.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Format
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
-      - name: Build
-        run: cargo build --release
-
+      # Tests and the CLI smoke check share the debug profile, so no release
+      # build here: release artifacts are never reused by `cargo test`, and the
+      # release workflow builds what actually ships.
       - name: Test
-        run: cargo test
+        run: cargo test --locked
 
-      - name: Verify CLI
-        run: cargo run --release -- --help
+      - name: Smoke test CLI
+        run: cargo run --quiet -- --help
